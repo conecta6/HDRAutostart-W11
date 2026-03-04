@@ -43,6 +43,8 @@ extern "C" {
 #pragma comment(lib, "dxva2.lib")
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")
 
+#define APP_VERSION "0.1"
+
 // =============================================================================
 // Localisation
 // =============================================================================
@@ -736,7 +738,7 @@ static DWORD WINAPI MonitorThread(LPVOID)
 #define IDC_DEL    102
 #define IDC_CLOSE2 103
 
-struct ListDlgData { std::vector<std::string>* items; bool isFolder; };
+struct ListDlgData { std::vector<std::string>* items; bool isFolder; HFONT hFont = nullptr; };
 
 static void Populate(HWND lb, std::vector<std::string>* items)
 {
@@ -766,21 +768,40 @@ static LRESULT CALLBACK ListDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_CREATE: {
         d = (ListDlgData*)((CREATESTRUCTA*)lp)->lpCreateParams;
         SetWindowLongPtrA(hwnd, GWLP_USERDATA, (LONG_PTR)d);
+
+        // DPI-aware dimensions
+        typedef UINT(WINAPI* PFN_GetDpiForWindow)(HWND);
+        static auto pfnDpi = (PFN_GetDpiForWindow)GetProcAddress(GetModuleHandleA("user32.dll"), "GetDpiForWindow");
+        UINT dpi = pfnDpi ? pfnDpi(hwnd) : 96;
+        auto S = [&](int v){ return MulDiv(v, (int)dpi, 96); };
+
+        // System message font (DPI-aware)
+        NONCLIENTMETRICSA ncm = {}; ncm.cbSize = sizeof(ncm);
+        SystemParametersInfoA(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
+        d->hFont = CreateFontIndirectA(&ncm.lfMessageFont);
+
         RECT rc;  GetClientRect(hwnd, &rc);
-        int bw = 90, bh = 26, gap = 8;
+        int gap = S(8), bw = S(90), bh = S(28);
         int lbH = rc.bottom - bh - gap * 3;
-        CreateWindowExA(WS_EX_CLIENTEDGE, "LISTBOX", nullptr,
+
+        HWND lb = CreateWindowExA(WS_EX_CLIENTEDGE, "LISTBOX", nullptr,
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
             gap, gap, rc.right - gap * 2, lbH,
             hwnd, (HMENU)IDC_LBOX, nullptr, nullptr);
+        SendMessageA(lb, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+
         int y = lbH + gap * 2;
-        CreateWindowA("BUTTON", L->btnAdd,    WS_CHILD | WS_VISIBLE,
+        HWND bAdd = CreateWindowA("BUTTON", L->btnAdd,    WS_CHILD | WS_VISIBLE,
             gap,                 y, bw, bh, hwnd, (HMENU)IDC_ADD,    nullptr, nullptr);
-        CreateWindowA("BUTTON", L->btnRemove, WS_CHILD | WS_VISIBLE,
+        HWND bDel = CreateWindowA("BUTTON", L->btnRemove, WS_CHILD | WS_VISIBLE,
             gap + bw + gap,      y, bw, bh, hwnd, (HMENU)IDC_DEL,    nullptr, nullptr);
-        CreateWindowA("BUTTON", L->btnClose,  WS_CHILD | WS_VISIBLE,
+        HWND bCls = CreateWindowA("BUTTON", L->btnClose,  WS_CHILD | WS_VISIBLE,
             rc.right - bw - gap, y, bw, bh, hwnd, (HMENU)IDC_CLOSE2, nullptr, nullptr);
-        Populate(GetDlgItem(hwnd, IDC_LBOX), d->items);
+        SendMessageA(bAdd, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+        SendMessageA(bDel, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+        SendMessageA(bCls, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+
+        Populate(lb, d->items);
         return 0;
     }
 
@@ -842,7 +863,10 @@ static LRESULT CALLBACK ListDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
 
     case WM_CLOSE:   DestroyWindow(hwnd); return 0;
-    case WM_DESTROY: delete d;            return 0;
+    case WM_DESTROY:
+        if (d && d->hFont) DeleteObject(d->hFont);
+        delete d;
+        return 0;
     }
     return DefWindowProcA(hwnd, msg, wp, lp);
 }
@@ -853,11 +877,19 @@ static void ShowListDialog(const char* title,
 {
     ListDlgData* data = new ListDlgData{items, isFolder};
     HINSTANCE hInst   = (HINSTANCE)GetModuleHandleA(nullptr);
+
+    // Get system DPI to size the window properly
+    typedef UINT(WINAPI* PFN_GetDpiForSystem)();
+    static auto pfnDpiSys = (PFN_GetDpiForSystem)GetProcAddress(GetModuleHandleA("user32.dll"), "GetDpiForSystem");
+    UINT dpi = pfnDpiSys ? pfnDpiSys() : 96;
+    int W = MulDiv(640, (int)dpi, 96);
+    int H = MulDiv(460, (int)dpi, 96);
+
     HWND hw = CreateWindowExA(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        WS_EX_TOPMOST,
         "HDRAutostartListDlg", title,
-        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, 440, 320,
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT, W, H,
         nullptr, nullptr, hInst, data);
     if (hw) SetForegroundWindow(hw);
     else    delete data;
@@ -869,6 +901,7 @@ static void ShowListDialog(const char* title,
 #define ID_TRAY_FOLDERS   200
 #define ID_TRAY_WHITELIST 201
 #define ID_TRAY_BLACKLIST 202
+#define ID_TRAY_ABOUT     199
 #define ID_TRAY_STARTUP   203
 #define ID_TRAY_EXIT      204
 #define ID_TRAY_GITHUB    205
@@ -898,7 +931,7 @@ static bool g_browserHdrOn = false;  // managed by TIMER_BROWSER
 
 static void UpdateTray(bool on)
 {
-    strncpy_s(g_nid.szTip, on ? L->tipOn : L->tipOff, _TRUNCATE);
+    snprintf(g_nid.szTip, sizeof(g_nid.szTip), "%s  v" APP_VERSION, on ? L->tipOn : L->tipOff);
     g_nid.hIcon = on ? g_icoOn : g_icoOff;
     Shell_NotifyIconA(NIM_MODIFY, &g_nid);
 }
@@ -959,6 +992,8 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_TRAYICON:
         if (lp == WM_RBUTTONUP || lp == WM_CONTEXTMENU) {
             HMENU m = CreatePopupMenu();
+            AppendMenuA(m, MF_STRING | MF_DISABLED | MF_GRAYED, ID_TRAY_ABOUT, "HDRAutostart v" APP_VERSION);
+            AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
             AppendMenuA(m, MF_STRING, ID_TRAY_FOLDERS,   L->menuFolders);
             AppendMenuA(m, MF_STRING, ID_TRAY_WHITELIST, L->menuWhitelist);
             AppendMenuA(m, MF_STRING, ID_TRAY_BLACKLIST, L->menuBlacklist);
@@ -1099,7 +1134,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     g_nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
     g_nid.hIcon            = g_icoOff;
-    strncpy_s(g_nid.szTip, L->tipOff, _TRUNCATE);
+    snprintf(g_nid.szTip, sizeof(g_nid.szTip), "%s  v" APP_VERSION, L->tipOff);
     if (!Shell_NotifyIconA(NIM_ADD, &g_nid))
         SetTimer(g_trayWnd, TIMER_TRAY_RETRY, 1000, nullptr);  // shell not ready yet
 
