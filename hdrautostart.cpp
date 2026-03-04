@@ -54,6 +54,7 @@ struct Lang {
     const char *menuKTC;
     const char *ktcOff, *ktcAuto, *ktcLow, *ktcStd, *ktcHigh;
     const char *menuKTCSDR;
+    const char *menuGithub;
 };
 
 static const Lang kES = {
@@ -64,7 +65,8 @@ static const Lang kES = {
     "HDRAutostart \x97 HDR activo", "HDRAutostart \x97 HDR inactivo",
     "Local Dimming HDR (KTC)",
     "Desactivado", "Auto", "Bajo", "Est\xe1ndar", "Alto",
-    "Local Dimming SDR (KTC)"
+    "Local Dimming SDR (KTC)",
+    "GitHub"
 };
 static const Lang kEN = {
     "Monitored folders...", "Always enable HDR...", "Never enable HDR...",
@@ -74,7 +76,8 @@ static const Lang kEN = {
     "HDRAutostart \x97 HDR active", "HDRAutostart \x97 HDR inactive",
     "Local Dimming HDR (KTC)",
     "Off", "Auto", "Low", "Standard", "High",
-    "Local Dimming SDR (KTC)"
+    "Local Dimming SDR (KTC)",
+    "GitHub"
 };
 static const Lang* L = &kEN;
 
@@ -868,6 +871,7 @@ static void ShowListDialog(const char* title,
 #define ID_TRAY_BLACKLIST 202
 #define ID_TRAY_STARTUP   203
 #define ID_TRAY_EXIT      204
+#define ID_TRAY_GITHUB    205
 #define ID_KTC_OFF          299
 #define ID_KTC_AUTO         300
 #define ID_KTC_LOW          301
@@ -988,6 +992,8 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             UINT startFlag = MF_STRING | (IsInStartup() ? MF_CHECKED : 0u);
             AppendMenuA(m, startFlag, ID_TRAY_STARTUP, L->menuStartup);
             AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
+            AppendMenuA(m, MF_STRING, ID_TRAY_GITHUB, L->menuGithub);
+            AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
             AppendMenuA(m, MF_STRING, ID_TRAY_EXIT, L->menuExit);
 
             POINT pt;  GetCursorPos(&pt);
@@ -1018,6 +1024,9 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case ID_KTC_SDR_LOW:      { EnterCriticalSection(&g_cfgLock); g_cfg.ktcSdrLocalDimming=2; LeaveCriticalSection(&g_cfgLock); SaveConfig(); } break;
         case ID_KTC_SDR_STANDARD: { EnterCriticalSection(&g_cfgLock); g_cfg.ktcSdrLocalDimming=3; LeaveCriticalSection(&g_cfgLock); SaveConfig(); } break;
         case ID_KTC_SDR_HIGH:     { EnterCriticalSection(&g_cfgLock); g_cfg.ktcSdrLocalDimming=4; LeaveCriticalSection(&g_cfgLock); SaveConfig(); } break;
+        case ID_TRAY_GITHUB:
+            ShellExecuteA(nullptr, "open", "https://github.com/conecta6/HDRAutostart-W11", nullptr, nullptr, SW_SHOWNORMAL);
+            break;
         case ID_TRAY_EXIT:
             KillTimer(hwnd, TIMER_BROWSER);
             SetEvent(g_stopEvent);

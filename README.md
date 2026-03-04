@@ -53,7 +53,9 @@ Add `.exe` files that should never trigger HDR. Useful for launchers (e.g. `Epic
 
 #### KTC Local Dimming (KTC monitors only)
 
-If you have a KTC monitor that supports DDC/CI, you can have HDRAutostart automatically set the Local Dimming level when HDR activates:
+HDRAutostart sends DDC/CI commands to KTC monitors to control Local Dimming automatically when HDR switches on or off. There are two independent settings — one for each mode:
+
+**Local Dimming HDR (KTC)** — level applied when HDR is active (e.g. while playing a game):
 
 | Setting | VCP value | Description |
 |---|---|---|
@@ -61,11 +63,23 @@ If you have a KTC monitor that supports DDC/CI, you can have HDRAutostart automa
 | **Auto** | 1 | Monitor controls dimming automatically |
 | **Low** | 2 | Low Local Dimming |
 | **Standard** | 3 | Standard Local Dimming |
+| **High** | 4 | Maximum Local Dimming — recommended for HDR gaming on KTC |
+
+> Right-click tray icon → **Local Dimming HDR (KTC)**
+
+**Local Dimming SDR (KTC)** — level applied when HDR is deactivated (normal desktop, SDR use):
+
+| Setting | VCP value | Description |
+|---|---|---|
+| **Off** *(default)* | — | No DDC commands sent. |
+| **Auto** | 1 | Monitor manages dimming automatically in SDR |
+| **Low** | 2 | Low Local Dimming |
+| **Standard** | 3 | Standard Local Dimming |
 | **High** | 4 | Maximum Local Dimming |
 
-When HDR is deactivated, the dimming level is automatically reset to **Auto** (1).
+> Right-click tray icon → **Local Dimming SDR (KTC)**
 
-> Right-click tray icon → **Local Dimming (KTC)** → choose your preferred level
+Both settings are independent so you can, for example, use **High** for HDR gaming and **Auto** (or **Off**) for normal desktop use.
 
 ### Supported browsers (fullscreen detection)
 
@@ -138,7 +152,9 @@ Agrega archivos `.exe` que nunca deben activar el HDR. Útil para launchers (p. 
 
 #### Local Dimming KTC (solo monitores KTC)
 
-Si tienes un monitor KTC que soporta DDC/CI, puedes hacer que HDRAutostart ajuste automáticamente el nivel de Local Dimming cuando el HDR se activa. Esto permite aprovechar al máximo la iluminación local del panel cuando se requiere la máxima calidad de imagen:
+HDRAutostart envía comandos DDC/CI a los monitores KTC para controlar el Local Dimming automáticamente cada vez que el HDR se activa o desactiva. Hay dos ajustes independientes, uno para cada modo:
+
+**Local Dimming HDR (KTC)** — nivel que se aplica cuando el HDR está activo (p. ej. mientras juegas):
 
 | Ajuste | Valor VCP | Descripción |
 |---|---|---|
@@ -146,11 +162,23 @@ Si tienes un monitor KTC que soporta DDC/CI, puedes hacer que HDRAutostart ajust
 | **Auto** | 1 | El monitor controla el dimming automáticamente |
 | **Bajo** | 2 | Local Dimming bajo |
 | **Estándar** | 3 | Local Dimming estándar |
+| **Alto** | 4 | Local Dimming máximo — recomendado para jugar en HDR en KTC |
+
+> Clic derecho en el icono de bandeja → **Local Dimming HDR (KTC)**
+
+**Local Dimming SDR (KTC)** — nivel que se aplica cuando el HDR se desactiva (escritorio normal, uso en SDR):
+
+| Ajuste | Valor VCP | Descripción |
+|---|---|---|
+| **Desactivado** *(por defecto)* | — | No se envían comandos DDC. |
+| **Auto** | 1 | El monitor gestiona el dimming automáticamente en SDR |
+| **Bajo** | 2 | Local Dimming bajo |
+| **Estándar** | 3 | Local Dimming estándar |
 | **Alto** | 4 | Local Dimming máximo |
 
-Cuando el HDR se desactiva, el nivel de dimming se restablece automáticamente a **Auto** (1).
+> Clic derecho en el icono de bandeja → **Local Dimming SDR (KTC)**
 
-> Clic derecho en el icono de bandeja → **Local Dimming (KTC)** → elige tu nivel preferido
+Ambos ajustes son independientes, por lo que puedes usar, por ejemplo, **Alto** para jugar en HDR y **Auto** (o **Desactivado**) para el uso normal del escritorio.
 
 ### Navegadores compatibles (detección pantalla completa)
 
