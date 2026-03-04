@@ -15,7 +15,7 @@ Windows 11 supports HDR, but it does not switch automatically. If you leave HDR 
 | Feature | Description |
 |---|---|
 | **Game auto-detection** | Monitors Steam / GOG / Epic (and any custom folder) for new game processes and enables HDR the moment a game launches. HDR is disabled automatically when the game closes. |
-| **Browser fullscreen** | When Chrome, Edge, Firefox, Brave, Vivaldi, Opera, or other supported browsers enter fullscreen (F11 / fullscreen video), HDR is enabled. It is disabled again as soon as the browser leaves fullscreen. |
+| **Browser fullscreen** | When Chrome, Edge, Firefox, Brave, Vivaldi, Opera, or other supported browsers enter fullscreen, HDR is enabled. It is disabled again as soon as the browser leaves fullscreen. To watch HDR videos, simply put the browser in fullscreen mode — usually by pressing **F11** or clicking the fullscreen button on the video player. |
 | **Whitelist** | Add individual `.exe` files that should always trigger HDR, regardless of their folder location. |
 | **Blacklist** | Add individual `.exe` files that should never trigger HDR (e.g. launchers inside game folders you don't want triggering HDR). |
 | **KTC Local Dimming** | For KTC monitors with DDC/CI support: automatically control the Local Dimming level via the monitor's internal VCP command when HDR activates. Off by default — safe to use on any monitor. |
@@ -114,7 +114,7 @@ Windows 11 soporta HDR, pero no lo activa automáticamente. Si dejas el HDR siem
 | Función | Descripción |
 |---|---|
 | **Detección automática de juegos** | Monitorea Steam / GOG / Epic (y cualquier carpeta personalizada) en busca de nuevos procesos de juego y activa el HDR en cuanto el juego abre. El HDR se desactiva automáticamente cuando el juego cierra. |
-| **Pantalla completa en navegador** | Cuando Chrome, Edge, Firefox, Brave, Vivaldi, Opera u otros navegadores compatibles entran en pantalla completa (F11 / video en pantalla completa), se activa el HDR. Se desactiva en cuanto el navegador sale de pantalla completa. |
+| **Pantalla completa en navegador** | Cuando Chrome, Edge, Firefox, Brave, Vivaldi, Opera u otros navegadores compatibles entran en pantalla completa, se activa el HDR. Se desactiva en cuanto el navegador sale de pantalla completa. Para ver videos en HDR, simplemente pon el navegador en pantalla completa — normalmente pulsando **F11** o el botón de pantalla completa del reproductor de video. |
 | **Lista blanca** | Agrega archivos `.exe` individuales que siempre deben activar el HDR, independientemente de su carpeta. |
 | **Lista negra** | Agrega archivos `.exe` individuales que nunca deben activar el HDR (p. ej. launchers dentro de carpetas de juegos que no quieres que disparen el HDR). |
 | **Local Dimming KTC** | Para monitores KTC con soporte DDC/CI: controla automáticamente el nivel de Local Dimming del monitor mediante su comando VCP interno cuando el HDR se activa. Desactivado por defecto — seguro en cualquier monitor. |
