@@ -1,0 +1,4 @@
+#include <windows.h>
+
+// Application icon (shown in Start Menu shortcut, taskbar, Alt+Tab, etc.)
+IDI_APPICON ICON "icon.ico"

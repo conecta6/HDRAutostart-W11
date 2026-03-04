@@ -1,0 +1,19 @@
+# Build outputs
+dist/
+*.exe
+*.obj
+*.res
+
+# Generated icon (created by create_icon.ps1 at build time)
+icon.ico
+
+# Logs & user config
+*.log
+*.ini
+
+# MSVC temporaries
+*.pdb
+*.ilk
+
+# Claude internal
+.claude/
