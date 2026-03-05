@@ -4,6 +4,7 @@
 //   · Browser fullscreen triggers HDR (auto-off when leaving fullscreen)
 //   · KTC Local Dimming via DDC/CI (VCP 0xF4)
 // =============================================================================
+#define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -49,36 +50,36 @@ extern "C" {
 // Localisation
 // =============================================================================
 struct Lang {
-    const char *menuFolders, *menuWhitelist, *menuBlacklist, *menuStartup, *menuExit;
-    const char *dlgFolders,  *dlgWhitelist,  *dlgBlacklist;
+    const char *menuFolders, *menuWhitelist, *menuBlacklist, *menuExclude, *menuStartup, *menuExit;
+    const char *dlgFolders,  *dlgWhitelist,  *dlgBlacklist,  *dlgExclude;
     const char *btnAdd, *btnRemove, *btnClose;
+    const char *btnAddFolder, *btnAddFile;
     const char *tipOn, *tipOff;
-    const char *menuKTC;
+    const char *menuLocalDimming, *menuKTC, *menuKTCSDR;
     const char *ktcOff, *ktcAuto, *ktcLow, *ktcStd, *ktcHigh;
-    const char *menuKTCSDR;
     const char *menuGithub;
 };
 
 static const Lang kES = {
-    "Carpetas monitoreadas...", "Activar HDR siempre...", "Nunca activar HDR...",
+    "Carpetas monitoreadas...", "Activar HDR siempre...", "Nunca activar HDR...", "Excluir...",
     "Ejecutar al inicio", "Salir",
-    "Carpetas monitoreadas", "Activar HDR siempre", "Nunca activar HDR",
+    "Carpetas monitoreadas", "Activar HDR siempre", "Nunca activar HDR", "Excluir",
     "Agregar", "Eliminar", "Cerrar",
+    "Agregar carpeta", "Agregar archivo",
     "HDRAutostart \x97 HDR activo", "HDRAutostart \x97 HDR inactivo",
-    "Local Dimming HDR (KTC)",
+    "Local Dimming", "HDR (KTC)", "SDR (KTC)",
     "Desactivado", "Auto", "Bajo", "Est\xe1ndar", "Alto",
-    "Local Dimming SDR (KTC)",
     "GitHub"
 };
 static const Lang kEN = {
-    "Monitored folders...", "Always enable HDR...", "Never enable HDR...",
+    "Monitored folders...", "Always enable HDR...", "Never enable HDR...", "Exclude...",
     "Run at startup", "Exit",
-    "Monitored folders", "Always enable HDR", "Never enable HDR",
+    "Monitored folders", "Always enable HDR", "Never enable HDR", "Exclude",
     "Add", "Remove", "Close",
+    "Add folder", "Add file",
     "HDRAutostart \x97 HDR active", "HDRAutostart \x97 HDR inactive",
-    "Local Dimming HDR (KTC)",
+    "Local Dimming", "HDR (KTC)", "SDR (KTC)",
     "Off", "Auto", "Low", "Standard", "High",
-    "Local Dimming SDR (KTC)",
     "GitHub"
 };
 static const Lang* L = &kEN;
@@ -94,7 +95,8 @@ static void DetectLang()
 struct Config {
     std::vector<std::string> folders;    // paths that trigger HDR (prefix match)
     std::vector<std::string> whitelist;  // specific exe paths that always trigger
-    std::vector<std::string> blacklist;  // specific exe paths that never trigger
+    std::vector<std::string> blacklist;  // specific exe paths that never trigger HDR but may trigger KTC dimming
+    std::vector<std::string> exclude;    // completely ignored — no HDR, no KTC dimming
     int ktcLocalDimming    = 0;  // 0=Off(default) 1=Auto 2=Low 3=Std 4=High  (juegos HDR)
     int ktcSdrLocalDimming = 0;  // 0=Off(default) 1=Auto 2=Low 3=Std 4=High  (juegos blacklist/SDR)
 };
@@ -148,6 +150,8 @@ static void SaveConfig()
     for (auto& s : g_cfg.whitelist) fprintf(f, "%s\n", s.c_str());
     fprintf(f, "[blacklist]\n");
     for (auto& s : g_cfg.blacklist) fprintf(f, "%s\n", s.c_str());
+    fprintf(f, "[exclude]\n");
+    for (auto& s : g_cfg.exclude)   fprintf(f, "%s\n", s.c_str());
     LeaveCriticalSection(&g_cfgLock);
     fclose(f);
 }
@@ -205,7 +209,7 @@ static void LoadConfig()
         return;
     }
 
-    enum Section { SEC_NONE, SEC_SETTINGS, SEC_FOLDERS, SEC_WHITELIST, SEC_BLACKLIST };
+    enum Section { SEC_NONE, SEC_SETTINGS, SEC_FOLDERS, SEC_WHITELIST, SEC_BLACKLIST, SEC_EXCLUDE };
     Section sec = SEC_NONE;
     char line[MAX_PATH];
     while (fgets(line, sizeof(line), f)) {
@@ -216,6 +220,7 @@ static void LoadConfig()
         if (!strcmp(line, "[folders]"))   { sec = SEC_FOLDERS;   continue; }
         if (!strcmp(line, "[whitelist]")) { sec = SEC_WHITELIST; continue; }
         if (!strcmp(line, "[blacklist]")) { sec = SEC_BLACKLIST; continue; }
+        if (!strcmp(line, "[exclude]"))   { sec = SEC_EXCLUDE;   continue; }
         switch (sec) {
         case SEC_SETTINGS:
             if (strncmp(line, "ktc_local_dimming=", 18) == 0) {
@@ -230,6 +235,7 @@ static void LoadConfig()
         case SEC_FOLDERS:   g_cfg.folders.push_back(line);   break;
         case SEC_WHITELIST: g_cfg.whitelist.push_back(line); break;
         case SEC_BLACKLIST: g_cfg.blacklist.push_back(line); break;
+        case SEC_EXCLUDE:   g_cfg.exclude.push_back(line);   break;
         default: break;
         }
     }
@@ -431,13 +437,48 @@ static std::string ToLower(std::string s)
     return s;
 }
 
+// Launchers/platform clients always ignored regardless of folder location
+static const char* kLauncherExes[] = {
+    // Steam
+    "steam.exe", "steamwebhelper.exe", "steamservice.exe", "streaming_client.exe",
+    // GOG Galaxy
+    "gogalaxy.exe", "galaxyclient.exe", "galaxyclient helper.exe", "gogcomwebhelper.exe",
+    // Xbox / Game Bar
+    "xboxapp.exe", "gamebar.exe", "gamebarftserver.exe", "xboxpcappftserver.exe",
+        "gameinputsvc.exe", "xgpuuncapsvc.exe",
+    // Epic Games
+    "epicgameslauncher.exe", "epicwebhelper.exe", "unrealcefsubprocess.exe",
+    // Ubisoft Connect
+    "ubisoft connect.exe", "ubisoftconnect.exe", "uplay.exe",
+        "ubisoftgamelauncher.exe", "uplaywebcore.exe",
+    // EA App
+    "eadesktop.exe", "ealauncher.exe", "eabackgroundservice.exe",
+        "eaconnect_me.exe", "eacefsubproc.exe", "link2ea.exe",
+    nullptr
+};
+
 // Returns  1 = activate HDR
 //          0 = ignore
 //         -1 = block (blacklist)
 static int ClassifyProcess(const std::string& path)
 {
     std::string lo = ToLower(path);
+
+    // Always ignore known platform launchers (even if inside a monitored folder)
+    {
+        const char* p = lo.c_str();
+        const char* b = strrchr(p, '\\');
+        b = b ? b + 1 : p;
+        for (int i = 0; kLauncherExes[i]; ++i)
+            if (!strcmp(b, kLauncherExes[i])) return 0;
+    }
     EnterCriticalSection(&g_cfgLock);
+    // User-defined exclude list: exact exe match or recursive folder prefix match
+    for (auto& e : g_cfg.exclude) {
+        std::string elo = ToLower(e);
+        bool match = (!elo.empty() && elo.back() == '\\') ? (lo.find(elo) == 0) : (elo == lo);
+        if (match) { LeaveCriticalSection(&g_cfgLock); return 0; }
+    }
     for (auto& e : g_cfg.blacklist)
         if (ToLower(e) == lo) { LeaveCriticalSection(&g_cfgLock); return -1; }
     for (auto& e : g_cfg.whitelist)
@@ -565,6 +606,7 @@ static HICON CreateHDRIcon(bool active)
 
 static HANDLE g_stopEvent = nullptr;
 static HWND   g_trayWnd   = nullptr;
+static char   g_hdrSource[MAX_PATH] = {};  // who activated HDR (game exe name or "Browser")
 
 static DWORD WINAPI MonitorThread(LPVOID)
 {
@@ -619,6 +661,7 @@ static DWORD WINAPI MonitorThread(LPVOID)
             EnterCriticalSection(&g_cfgLock);
             hDim = g_cfg.ktcLocalDimming;
             sDim = g_cfg.ktcSdrLocalDimming;
+            g_hdrSource[0] = '\0';
             LeaveCriticalSection(&g_cfgLock);
             if (hDim > 0) {
                 if (!sdrGames.empty() && sDim > 0) {
@@ -680,6 +723,7 @@ static DWORD WINAPI MonitorThread(LPVOID)
                         int dimming;
                         EnterCriticalSection(&g_cfgLock);
                         dimming = g_cfg.ktcLocalDimming;
+                        strncpy_s(g_hdrSource, base ? base + 1 : path.c_str(), _TRUNCATE);
                         LeaveCriticalSection(&g_cfgLock);
                         SetKTCLocalDimming(dimming);
                         sdrDimmingActive = false;  // HDR takes precedence
@@ -733,12 +777,14 @@ static DWORD WINAPI MonitorThread(LPVOID)
 // =============================================================================
 // List-management dialog  (generic: folder list or exe list)
 // =============================================================================
-#define IDC_LBOX   100
-#define IDC_ADD    101
-#define IDC_DEL    102
-#define IDC_CLOSE2 103
+#define IDC_LBOX       100
+#define IDC_ADD        101
+#define IDC_DEL        102
+#define IDC_CLOSE2     103
+#define IDC_ADD_FOLDER 104
 
-struct ListDlgData { std::vector<std::string>* items; bool isFolder; HFONT hFont = nullptr; };
+// mode: 0=files only  1=folders only  2=both (files + folders, used by Exclude dialog)
+struct ListDlgData { std::vector<std::string>* items; int mode; HFONT hFont = nullptr; };
 
 static void Populate(HWND lb, std::vector<std::string>* items)
 {
@@ -791,15 +837,31 @@ static LRESULT CALLBACK ListDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SendMessageA(lb, WM_SETFONT, (WPARAM)d->hFont, FALSE);
 
         int y = lbH + gap * 2;
-        HWND bAdd = CreateWindowA("BUTTON", L->btnAdd,    WS_CHILD | WS_VISIBLE,
-            gap,                 y, bw, bh, hwnd, (HMENU)IDC_ADD,    nullptr, nullptr);
-        HWND bDel = CreateWindowA("BUTTON", L->btnRemove, WS_CHILD | WS_VISIBLE,
-            gap + bw + gap,      y, bw, bh, hwnd, (HMENU)IDC_DEL,    nullptr, nullptr);
-        HWND bCls = CreateWindowA("BUTTON", L->btnClose,  WS_CHILD | WS_VISIBLE,
-            rc.right - bw - gap, y, bw, bh, hwnd, (HMENU)IDC_CLOSE2, nullptr, nullptr);
-        SendMessageA(bAdd, WM_SETFONT, (WPARAM)d->hFont, FALSE);
-        SendMessageA(bDel, WM_SETFONT, (WPARAM)d->hFont, FALSE);
-        SendMessageA(bCls, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+        if (d->mode == 2) {
+            // Exclude dialog: Add folder + Add file + Remove + Close
+            HWND bAddF = CreateWindowA("BUTTON", L->btnAddFolder, WS_CHILD | WS_VISIBLE,
+                gap,                     y, bw, bh, hwnd, (HMENU)IDC_ADD_FOLDER, nullptr, nullptr);
+            HWND bAddE = CreateWindowA("BUTTON", L->btnAddFile,   WS_CHILD | WS_VISIBLE,
+                gap + bw + gap,          y, bw, bh, hwnd, (HMENU)IDC_ADD,        nullptr, nullptr);
+            HWND bDel  = CreateWindowA("BUTTON", L->btnRemove,    WS_CHILD | WS_VISIBLE,
+                gap + (bw + gap) * 2,    y, bw, bh, hwnd, (HMENU)IDC_DEL,        nullptr, nullptr);
+            HWND bCls  = CreateWindowA("BUTTON", L->btnClose,     WS_CHILD | WS_VISIBLE,
+                rc.right - bw - gap,     y, bw, bh, hwnd, (HMENU)IDC_CLOSE2,     nullptr, nullptr);
+            SendMessageA(bAddF, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+            SendMessageA(bAddE, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+            SendMessageA(bDel,  WM_SETFONT, (WPARAM)d->hFont, FALSE);
+            SendMessageA(bCls,  WM_SETFONT, (WPARAM)d->hFont, FALSE);
+        } else {
+            HWND bAdd = CreateWindowA("BUTTON", L->btnAdd,    WS_CHILD | WS_VISIBLE,
+                gap,                 y, bw, bh, hwnd, (HMENU)IDC_ADD,    nullptr, nullptr);
+            HWND bDel = CreateWindowA("BUTTON", L->btnRemove, WS_CHILD | WS_VISIBLE,
+                gap + bw + gap,      y, bw, bh, hwnd, (HMENU)IDC_DEL,    nullptr, nullptr);
+            HWND bCls = CreateWindowA("BUTTON", L->btnClose,  WS_CHILD | WS_VISIBLE,
+                rc.right - bw - gap, y, bw, bh, hwnd, (HMENU)IDC_CLOSE2, nullptr, nullptr);
+            SendMessageA(bAdd, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+            SendMessageA(bDel, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+            SendMessageA(bCls, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+        }
 
         Populate(lb, d->items);
         return 0;
@@ -808,42 +870,48 @@ static LRESULT CALLBACK ListDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_COMMAND: {
         HWND lb = GetDlgItem(hwnd, IDC_LBOX);
 
-        if (LOWORD(wp) == IDC_ADD) {
-            if (d->isFolder) {
-                BROWSEINFOA bi = {};
-                bi.hwndOwner = hwnd;
-                bi.ulFlags   = BIF_RETURNONLYFSDIRS | BIF_USENEWUI;
-                LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
-                if (pidl) {
-                    char path[MAX_PATH] = {};
-                    if (SHGetPathFromIDListA(pidl, path)) {
-                        std::string s(path);
-                        if (s.back() != '\\') s += '\\';
-                        EnterCriticalSection(&g_cfgLock);
-                        d->items->push_back(s);
-                        LeaveCriticalSection(&g_cfgLock);
-                        SaveConfig();
-                        Populate(lb, d->items);
-                    }
-                    CoTaskMemFree(pidl);
-                }
-            } else {
+        auto browseFolder = [&]() {
+            BROWSEINFOA bi = {};
+            bi.hwndOwner = hwnd;
+            bi.ulFlags   = BIF_RETURNONLYFSDIRS | BIF_USENEWUI;
+            LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
+            if (pidl) {
                 char path[MAX_PATH] = {};
-                OPENFILENAMEA ofn = {};
-                ofn.lStructSize = sizeof(ofn);
-                ofn.hwndOwner   = hwnd;
-                ofn.lpstrFilter = "Executables\0*.exe\0All Files\0*.*\0";
-                ofn.lpstrFile   = path;
-                ofn.nMaxFile    = MAX_PATH;
-                ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-                if (GetOpenFileNameA(&ofn)) {
+                if (SHGetPathFromIDListA(pidl, path)) {
+                    std::string s(path);
+                    if (s.back() != '\\') s += '\\';
                     EnterCriticalSection(&g_cfgLock);
-                    d->items->push_back(path);
+                    d->items->push_back(s);
                     LeaveCriticalSection(&g_cfgLock);
                     SaveConfig();
                     Populate(lb, d->items);
                 }
+                CoTaskMemFree(pidl);
             }
+        };
+        auto browseFile = [&]() {
+            char path[MAX_PATH] = {};
+            OPENFILENAMEA ofn = {};
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner   = hwnd;
+            ofn.lpstrFilter = "Executables\0*.exe\0All Files\0*.*\0";
+            ofn.lpstrFile   = path;
+            ofn.nMaxFile    = MAX_PATH;
+            ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+            if (GetOpenFileNameA(&ofn)) {
+                EnterCriticalSection(&g_cfgLock);
+                d->items->push_back(path);
+                LeaveCriticalSection(&g_cfgLock);
+                SaveConfig();
+                Populate(lb, d->items);
+            }
+        };
+
+        if (LOWORD(wp) == IDC_ADD_FOLDER) { browseFolder(); }
+
+        if (LOWORD(wp) == IDC_ADD) {
+            if (d->mode == 1) browseFolder();
+            else              browseFile();   // mode 0 = files only, mode 2 = add file
         }
 
         if (LOWORD(wp) == IDC_DEL) {
@@ -873,9 +941,9 @@ static LRESULT CALLBACK ListDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 static void ShowListDialog(const char* title,
                            std::vector<std::string>* items,
-                           bool isFolder)
+                           int mode)
 {
-    ListDlgData* data = new ListDlgData{items, isFolder};
+    ListDlgData* data = new ListDlgData{items, mode};
     HINSTANCE hInst   = (HINSTANCE)GetModuleHandleA(nullptr);
 
     // Get system DPI to size the window properly
@@ -901,6 +969,7 @@ static void ShowListDialog(const char* title,
 #define ID_TRAY_FOLDERS   200
 #define ID_TRAY_WHITELIST 201
 #define ID_TRAY_BLACKLIST 202
+#define ID_TRAY_EXCLUDE   206
 #define ID_TRAY_ABOUT     199
 #define ID_TRAY_STARTUP   203
 #define ID_TRAY_EXIT      204
@@ -925,19 +994,26 @@ static HICON           g_icoOn        = nullptr;
 static UINT            WM_TASKBARCREATED = 0;
 static int             g_trayRetry    = 0;  // retry counter for NIM_ADD
 
-// These two bools are only accessed on the main (tray) thread — no lock needed
-static bool g_gameHdrOn    = false;  // updated by WM_HDRSTATUS from monitor thread
-static bool g_browserHdrOn = false;  // managed by TIMER_BROWSER
+// These are only accessed on the main (tray) thread — no lock needed
+static bool g_gameHdrOn      = false;  // updated by WM_HDRSTATUS from monitor thread
+static bool g_browserHdrOn   = false;  // managed by TIMER_BROWSER
+static int  g_browserSkipTicks = 20;   // skip first 10s of browser checks at startup
 
 static void UpdateTray(bool on)
 {
-    snprintf(g_nid.szTip, sizeof(g_nid.szTip), "%s  v" APP_VERSION, on ? L->tipOn : L->tipOff);
+    if (on && g_hdrSource[0])
+        snprintf(g_nid.szTip, sizeof(g_nid.szTip), "%s [%s]  v" APP_VERSION, L->tipOn, g_hdrSource);
+    else
+        snprintf(g_nid.szTip, sizeof(g_nid.szTip), "%s  v" APP_VERSION, on ? L->tipOn : L->tipOff);
     g_nid.hIcon = on ? g_icoOn : g_icoOff;
     Shell_NotifyIconA(NIM_MODIFY, &g_nid);
 }
 
 static void CheckBrowserHDR()
 {
+    // Skip the first ~10 seconds after startup to let the shell settle
+    if (g_browserSkipTicks > 0) { --g_browserSkipTicks; return; }
+
     // Game controls HDR while running — don't interfere
     if (g_gameHdrOn) {
         g_browserHdrOn = false;
@@ -954,12 +1030,14 @@ static void CheckBrowserHDR()
         dimming = g_cfg.ktcLocalDimming;
         LeaveCriticalSection(&g_cfgLock);
         SetKTCLocalDimming(dimming);
+        strncpy_s(g_hdrSource, "Browser", _TRUNCATE);
         g_browserHdrOn = true;
         UpdateTray(true);
     } else if (!isFS && g_browserHdrOn) {
         Log("Browser left fullscreen — disabling HDR");
         SetHDR(false);
         { int d; EnterCriticalSection(&g_cfgLock); d=g_cfg.ktcLocalDimming; LeaveCriticalSection(&g_cfgLock); if(d>0) SetKTCLocalDimming(1); }
+        g_hdrSource[0] = '\0';
         g_browserHdrOn = false;
         UpdateTray(false);
     }
@@ -997,23 +1075,24 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             AppendMenuA(m, MF_STRING, ID_TRAY_FOLDERS,   L->menuFolders);
             AppendMenuA(m, MF_STRING, ID_TRAY_WHITELIST, L->menuWhitelist);
             AppendMenuA(m, MF_STRING, ID_TRAY_BLACKLIST, L->menuBlacklist);
+            AppendMenuA(m, MF_STRING, ID_TRAY_EXCLUDE,   L->menuExclude);
             AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
 
-            // KTC Local Dimming HDR submenu
-            HMENU sub = CreatePopupMenu();
+            // Local Dimming parent menu
             int d, ds;
             EnterCriticalSection(&g_cfgLock);
             d  = g_cfg.ktcLocalDimming;
             ds = g_cfg.ktcSdrLocalDimming;
             LeaveCriticalSection(&g_cfgLock);
+
+            HMENU sub = CreatePopupMenu();
             AppendMenuA(sub, MF_STRING | (d==0?MF_CHECKED:0u), ID_KTC_OFF,      L->ktcOff);
             AppendMenuA(sub, MF_SEPARATOR, 0, nullptr);
             AppendMenuA(sub, MF_STRING | (d==1?MF_CHECKED:0u), ID_KTC_AUTO,     L->ktcAuto);
             AppendMenuA(sub, MF_STRING | (d==2?MF_CHECKED:0u), ID_KTC_LOW,      L->ktcLow);
             AppendMenuA(sub, MF_STRING | (d==3?MF_CHECKED:0u), ID_KTC_STANDARD, L->ktcStd);
             AppendMenuA(sub, MF_STRING | (d==4?MF_CHECKED:0u), ID_KTC_HIGH,     L->ktcHigh);
-            AppendMenuA(m, MF_POPUP, (UINT_PTR)sub, L->menuKTC);
-            // KTC Local Dimming SDR submenu
+
             HMENU subSDR = CreatePopupMenu();
             AppendMenuA(subSDR, MF_STRING | (ds==0?MF_CHECKED:0u), ID_KTC_SDR_OFF,      L->ktcOff);
             AppendMenuA(subSDR, MF_SEPARATOR, 0, nullptr);
@@ -1021,7 +1100,11 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             AppendMenuA(subSDR, MF_STRING | (ds==2?MF_CHECKED:0u), ID_KTC_SDR_LOW,      L->ktcLow);
             AppendMenuA(subSDR, MF_STRING | (ds==3?MF_CHECKED:0u), ID_KTC_SDR_STANDARD, L->ktcStd);
             AppendMenuA(subSDR, MF_STRING | (ds==4?MF_CHECKED:0u), ID_KTC_SDR_HIGH,     L->ktcHigh);
-            AppendMenuA(m, MF_POPUP, (UINT_PTR)subSDR, L->menuKTCSDR);
+
+            HMENU dimMenu = CreatePopupMenu();
+            AppendMenuA(dimMenu, MF_POPUP, (UINT_PTR)sub,    L->menuKTC);
+            AppendMenuA(dimMenu, MF_POPUP, (UINT_PTR)subSDR, L->menuKTCSDR);
+            AppendMenuA(m, MF_POPUP, (UINT_PTR)dimMenu, L->menuLocalDimming);
             AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
 
             UINT startFlag = MF_STRING | (IsInStartup() ? MF_CHECKED : 0u);
@@ -1042,11 +1125,13 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case ID_TRAY_FOLDERS:
-            ShowListDialog(L->dlgFolders,   &g_cfg.folders,   true);  break;
+            ShowListDialog(L->dlgFolders,   &g_cfg.folders,   1); break;
         case ID_TRAY_WHITELIST:
-            ShowListDialog(L->dlgWhitelist, &g_cfg.whitelist, false); break;
+            ShowListDialog(L->dlgWhitelist, &g_cfg.whitelist, 0); break;
         case ID_TRAY_BLACKLIST:
-            ShowListDialog(L->dlgBlacklist, &g_cfg.blacklist, false); break;
+            ShowListDialog(L->dlgBlacklist, &g_cfg.blacklist, 0); break;
+        case ID_TRAY_EXCLUDE:
+            ShowListDialog(L->dlgExclude,   &g_cfg.exclude,   2); break;
         case ID_TRAY_STARTUP:
             SetStartup(!IsInStartup());  break;
         case ID_KTC_OFF:          { EnterCriticalSection(&g_cfgLock); g_cfg.ktcLocalDimming=0;    LeaveCriticalSection(&g_cfgLock); SaveConfig(); } break;
