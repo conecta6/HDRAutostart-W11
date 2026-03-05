@@ -18,6 +18,7 @@ Windows 11 supports HDR, but it does not switch automatically. If you leave HDR 
 | **Browser fullscreen** | When Chrome, Edge, Firefox, Brave, Vivaldi, Opera, or other supported browsers enter fullscreen, HDR is enabled. It is disabled again as soon as the browser leaves fullscreen. To watch HDR videos, simply put the browser in fullscreen mode — usually by pressing **F11** or clicking the fullscreen button on the video player. |
 | **Whitelist** | Add individual `.exe` files that should always trigger HDR, regardless of their folder location. |
 | **Blacklist** | Add individual `.exe` files that should never trigger HDR (e.g. launchers inside game folders you don't want triggering HDR). |
+| **Exclude** | Completely ignore specific executables or entire folders. Excluded items are never scanned — no HDR, no KTC dimming. Useful for tools, utilities, or whole directories you never want to trigger anything. |
 | **KTC Local Dimming** | For KTC monitors with DDC/CI support: automatically control the Local Dimming level via the monitor's internal VCP command when HDR activates. Off by default — safe to use on any monitor. |
 | **Run at startup** | One-click option to launch HDRAutostart with Windows. |
 | **System tray** | Runs silently in the background. Orange icon = HDR active, grey icon = HDR inactive. Right-click for the menu. |
@@ -50,6 +51,19 @@ Add specific `.exe` files that should always trigger HDR no matter where they ar
 Add `.exe` files that should never trigger HDR. Useful for launchers (e.g. `EpicGamesLauncher.exe`) that live inside a monitored folder but are not games.
 
 > Right-click tray icon → **Never enable HDR…**
+
+#### Exclude
+
+Completely ignore specific executables or entire folders — the excluded items are never processed at all (no HDR, no KTC dimming, no blacklist logic).
+
+- **Add file** — pick a specific `.exe` to exclude.
+- **Add folder** — pick a folder; all executables inside it and any subfolder are excluded recursively.
+
+Useful for tools, benchmarks, or secondary launchers you never want HDRAutostart to react to, even if they run from inside a monitored game folder.
+
+> Right-click tray icon → **Exclude…**
+
+> **Note:** Common platform launchers (Steam, GOG Galaxy, Epic, Xbox, Ubisoft Connect, EA App) are always excluded automatically and do not need to be added manually.
 
 #### KTC Local Dimming (KTC monitors only)
 
@@ -117,6 +131,7 @@ Windows 11 soporta HDR, pero no lo activa automáticamente. Si dejas el HDR siem
 | **Pantalla completa en navegador** | Cuando Chrome, Edge, Firefox, Brave, Vivaldi, Opera u otros navegadores compatibles entran en pantalla completa, se activa el HDR. Se desactiva en cuanto el navegador sale de pantalla completa. Para ver videos en HDR, simplemente pon el navegador en pantalla completa — normalmente pulsando **F11** o el botón de pantalla completa del reproductor de video. |
 | **Lista blanca** | Agrega archivos `.exe` individuales que siempre deben activar el HDR, independientemente de su carpeta. |
 | **Lista negra** | Agrega archivos `.exe` individuales que nunca deben activar el HDR (p. ej. launchers dentro de carpetas de juegos que no quieres que disparen el HDR). |
+| **Excluir** | Ignora completamente ejecutables concretos o carpetas enteras. Los elementos excluidos no se procesan en absoluto — sin HDR, sin KTC dimming. Útil para herramientas, utilidades o directorios enteros que nunca quieres que disparen nada. |
 | **Local Dimming KTC** | Para monitores KTC con soporte DDC/CI: controla automáticamente el nivel de Local Dimming del monitor mediante su comando VCP interno cuando el HDR se activa. Desactivado por defecto — seguro en cualquier monitor. |
 | **Ejecutar al inicio** | Opción con un clic para lanzar HDRAutostart con Windows. |
 | **Bandeja del sistema** | Se ejecuta silenciosamente en segundo plano. Icono naranja = HDR activo, icono gris = HDR inactivo. Clic derecho para el menú. |
@@ -149,6 +164,19 @@ Agrega archivos `.exe` específicos que siempre deben activar el HDR sin importa
 Agrega archivos `.exe` que nunca deben activar el HDR. Útil para launchers (p. ej. `EpicGamesLauncher.exe`) que viven dentro de una carpeta monitorizada pero no son juegos.
 
 > Clic derecho en el icono de bandeja → **Nunca activar HDR…**
+
+#### Excluir
+
+Ignora completamente ejecutables concretos o carpetas enteras — los elementos excluidos no se procesan en absoluto (sin HDR, sin KTC dimming, sin lógica de lista negra).
+
+- **Agregar archivo** — selecciona un `.exe` concreto para excluir.
+- **Agregar carpeta** — selecciona una carpeta; todos los ejecutables dentro de ella y sus subcarpetas quedan excluidos de forma recursiva.
+
+Útil para herramientas, benchmarks o lanzadores secundarios a los que nunca quieres que HDRAutostart reaccione, aunque estén dentro de una carpeta monitorizada.
+
+> Clic derecho en el icono de bandeja → **Excluir…**
+
+> **Nota:** Los launchers de las plataformas principales (Steam, GOG Galaxy, Epic, Xbox, Ubisoft Connect, EA App) se excluyen automáticamente y no es necesario agregarlos.
 
 #### Local Dimming KTC (solo monitores KTC)
 
