@@ -99,6 +99,12 @@ Both settings are independent so you can, for example, use **High** for HDR gami
 
 Chrome, Microsoft Edge, Firefox, Opera, Brave, Vivaldi, Internet Explorer, Waterfox, LibreWolf, Thorium.
 
+### Windows Defender warning
+
+Some antivirus tools (including Windows Defender) may flag `HDRAutostart.exe` as suspicious. **This is a false positive.** The app is open source — you can review every line of code in this repository. The detection is triggered because the app requests administrator privileges, reads the Windows registry, and controls system APIs, which are the exact features it needs to work. It contains no malicious code.
+
+If you want to verify it yourself, you can [build it from source](#building-from-source) or scan the file at [VirusTotal](https://www.virustotal.com).
+
 ### Requirements
 
 - Windows 10 version 1903 or later (HDR API requirement)
@@ -215,6 +221,12 @@ Ambos ajustes son independientes, por lo que puedes usar, por ejemplo, **Alto** 
 ### Navegadores compatibles (detección pantalla completa)
 
 Chrome, Microsoft Edge, Firefox, Opera, Brave, Vivaldi, Internet Explorer, Waterfox, LibreWolf, Thorium.
+
+### Aviso de Windows Defender
+
+Algunos antivirus (incluido Windows Defender) pueden marcar `HDRAutostart.exe` como sospechoso. **Es un falso positivo.** La aplicación es de código abierto — puedes revisar cada línea de código en este repositorio. La detección se dispara porque la app solicita privilegios de administrador, lee el registro de Windows y controla APIs del sistema, que son exactamente las funciones que necesita para operar. No contiene código malicioso.
+
+Si quieres verificarlo tú mismo, puedes [compilarlo desde el código fuente](#compilar-desde-el-código-fuente) o escanear el archivo en [VirusTotal](https://www.virustotal.com).
 
 ### Requisitos
 
