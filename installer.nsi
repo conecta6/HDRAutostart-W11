@@ -6,7 +6,7 @@
 
 Unicode True
 !define APP_NAME    "HDRAutostart"
-!define APP_VERSION "0.14"
+!define APP_VERSION "0.15"
 !define EXE_NAME    "HDRAutostart.exe"
 !define TASK_NAME   "HDRAutostart"
 !define REG_APP     "Software\HDRAutostart"

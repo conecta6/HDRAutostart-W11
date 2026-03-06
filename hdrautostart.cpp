@@ -48,7 +48,7 @@ extern "C" {
 #pragma comment(lib, "urlmon.lib")
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")
 
-#define APP_VERSION "0.14"
+#define APP_VERSION "0.15"
 
 // =============================================================================
 // Localisation
@@ -1001,16 +1001,25 @@ static DWORD WINAPI DoSilentUpdate(LPVOID p)
     HRESULT hr = URLDownloadToFileA(nullptr, a->url, a->path, 0, nullptr);
     Log("URLDownloadToFile result: 0x%08X", (unsigned)hr);
     if (SUCCEEDED(hr)) {
-        Log("Download OK — launching installer silently");
+        Log("Download OK — removing Zone.Identifier and launching installer silently");
+        // Remove the internet-zone mark so SmartScreen doesn't block silent execution
+        std::string zoneId = std::string(a->path) + ":Zone.Identifier";
+        DeleteFileA(zoneId.c_str());
+
         SHELLEXECUTEINFOA sei = {};
-        sei.cbSize     = sizeof(sei);
-        sei.fMask      = SEE_MASK_NOCLOSEPROCESS;
-        sei.lpVerb     = "open";
-        sei.lpFile     = a->path;
+        sei.cbSize       = sizeof(sei);
+        sei.fMask        = SEE_MASK_NOCLOSEPROCESS;
+        sei.lpVerb       = "open";
+        sei.lpFile       = a->path;
         sei.lpParameters = "/S";
-        sei.nShow      = SW_HIDE;
+        sei.nShow        = SW_HIDE;
         BOOL ok = ShellExecuteExA(&sei);
         Log("ShellExecuteEx result: %d (err=%lu)", ok, GetLastError());
+        if (ok && sei.hProcess) {
+            // Wait up to 60s for the installer to finish before this thread exits
+            WaitForSingleObject(sei.hProcess, 60000);
+            CloseHandle(sei.hProcess);
+        }
     } else {
         Log("Download FAILED — hr=0x%08X", (unsigned)hr);
     }
