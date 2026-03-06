@@ -6,7 +6,7 @@
 
 Unicode True
 !define APP_NAME    "HDRAutostart"
-!define APP_VERSION "1.0"
+!define APP_VERSION "0.13"
 !define EXE_NAME    "HDRAutostart.exe"
 !define TASK_NAME   "HDRAutostart"
 !define REG_APP     "Software\HDRAutostart"
@@ -51,6 +51,9 @@ Haga clic en Siguiente para continuar."
 Function .onInit
     ReadEnvStr $ProgramData PROGRAMDATA
 
+    ; Silent mode (auto-update): detect existing install location from registry
+    IfSilent silentDetect
+
     MessageBox MB_YESNO|MB_ICONQUESTION \
         "Instalar ${APP_NAME} para TODOS los usuarios?$\n$\n\
 Si  -> Program Files  (configuracion compartida en ProgramData)$\n\
@@ -65,6 +68,26 @@ No  -> Solo esta cuenta (AppData del usuario actual)" \
     allUsers:
     StrCpy $AllUsers "1"
     StrCpy $INSTDIR "$PROGRAMFILES64\${APP_NAME}"
+    Goto done
+
+    silentDetect:
+    ; Try HKLM (all-users install)
+    ReadRegStr $INSTDIR HKLM "${REG_UNINST}" "InstallLocation"
+    StrCmp $INSTDIR "" 0 silentHKLM
+    ; Try HKCU (current-user install)
+    ReadRegStr $INSTDIR HKCU "${REG_UNINST}" "InstallLocation"
+    StrCmp $INSTDIR "" 0 silentHKCU
+    ; Fallback: current user
+    StrCpy $INSTDIR "$LOCALAPPDATA\${APP_NAME}"
+    StrCpy $AllUsers "0"
+    Goto done
+
+    silentHKLM:
+    StrCpy $AllUsers "1"
+    Goto done
+
+    silentHKCU:
+    StrCpy $AllUsers "0"
 
     done:
 FunctionEnd
@@ -123,11 +146,18 @@ Section "Instalar"
         WriteRegStr   HKCU "${REG_UNINST}" "DisplayIcon"     "$INSTDIR\${EXE_NAME}"
     ${EndIf}
 
+    ; Silent auto-update: relaunch the app automatically
+    IfSilent 0 showMsg
+    Exec '"$INSTDIR\${EXE_NAME}"'
+    Goto endSection
+
+    showMsg:
     MessageBox MB_ICONINFORMATION \
         "${APP_NAME} instalado correctamente.$\n$\n\
 - Tarea programada creada: se inicia automaticamente con Windows sin UAC.$\n\
 - Puede activarlo/desactivarlo desde el icono de la bandeja -> Ejecutar al inicio."
 
+    endSection:
 SectionEnd
 
 ; -- Uninstall section --------------------------------------------------------

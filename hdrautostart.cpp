@@ -34,6 +34,8 @@ extern "C" {
 #include <set>
 #include <algorithm>
 #include <ctime>
+#include <winhttp.h>
+#include <urlmon.h>
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -42,9 +44,11 @@ extern "C" {
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "dxva2.lib")
+#pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "urlmon.lib")
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")
 
-#define APP_VERSION "0.1"
+#define APP_VERSION "0.13"
 
 // =============================================================================
 // Localisation
@@ -964,6 +968,114 @@ static void ShowListDialog(const char* title,
 }
 
 // =============================================================================
+// Auto-update  (background thread → WinHTTP + URLDownloadToFile)
+// =============================================================================
+#define WM_UPDATE_AVAILABLE (WM_APP + 3)
+
+struct UpdateInfo { char tag[64]; char dlUrl[512]; };
+
+static bool IsNewerVersion(const char* remote)
+{
+    const char* r = (*remote == 'v' || *remote == 'V') ? remote + 1 : remote;
+    int lMaj=0, lMin=0, lPat=0, rMaj=0, rMin=0, rPat=0;
+    sscanf(APP_VERSION, "%d.%d.%d", &lMaj, &lMin, &lPat);
+    sscanf(r,           "%d.%d.%d", &rMaj, &rMin, &rPat);
+    if (rMaj != lMaj) return rMaj > lMaj;
+    if (rMin != lMin) return rMin > lMin;
+    return rPat > lPat;
+}
+
+struct DownloadArgs { char url[512]; char path[MAX_PATH]; };
+
+static DWORD WINAPI DoSilentUpdate(LPVOID p)
+{
+    DownloadArgs* a = (DownloadArgs*)p;
+    HRESULT hr = URLDownloadToFileA(nullptr, a->url, a->path, 0, nullptr);
+    if (SUCCEEDED(hr)) {
+        // Run installer silently — it will kill us, install, then relaunch the exe
+        SHELLEXECUTEINFOA sei = {};
+        sei.cbSize = sizeof(sei);
+        sei.fMask  = SEE_MASK_NOCLOSEPROCESS;
+        sei.lpVerb = "open";
+        sei.lpFile = a->path;
+        sei.lpParameters = "/S";
+        sei.nShow  = SW_HIDE;
+        ShellExecuteExA(&sei);
+    }
+    delete a;
+    return 0;
+}
+
+static DWORD WINAPI UpdateCheckThread(LPVOID)
+{
+    Sleep(8000);  // let the app settle before checking
+
+    HINTERNET hSes = WinHttpOpen(L"HDRAutostart-Update/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSes) return 0;
+
+    HINTERNET hCon = WinHttpConnect(hSes, L"api.github.com",
+        INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hCon) { WinHttpCloseHandle(hSes); return 0; }
+
+    HINTERNET hReq = WinHttpOpenRequest(hCon, L"GET",
+        L"/repos/conecta6/HDRAutostart-W11/releases/latest",
+        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE);
+    if (!hReq) { WinHttpCloseHandle(hCon); WinHttpCloseHandle(hSes); return 0; }
+
+    WinHttpAddRequestHeaders(hReq,
+        L"Accept: application/vnd.github+json\r\n",
+        (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD);
+
+    if (!WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+            WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) goto cleanup;
+    if (!WinHttpReceiveResponse(hReq, nullptr)) goto cleanup;
+
+    {
+        std::string body;
+        DWORD avail = 0;
+        while (WinHttpQueryDataAvailable(hReq, &avail) && avail > 0) {
+            std::string chunk(avail, '\0');
+            DWORD got = 0;
+            if (WinHttpReadData(hReq, &chunk[0], avail, &got))
+                body.append(chunk, 0, got);
+        }
+
+        // Extract "tag_name":"..."
+        const char* p = strstr(body.c_str(), "\"tag_name\"");
+        if (!p) goto cleanup;
+        p = strchr(p, ':');  if (!p) goto cleanup;
+        p = strchr(p, '"');  if (!p) goto cleanup;
+        ++p;
+        const char* e = strchr(p, '"');  if (!e) goto cleanup;
+        size_t tlen = (size_t)(e - p);
+        if (tlen == 0 || tlen >= 64) goto cleanup;
+
+        char tag[64] = {};
+        memcpy(tag, p, tlen);
+
+        Log("Update check: latest=%s current=" APP_VERSION, tag);
+        if (!IsNewerVersion(tag)) goto cleanup;
+
+        UpdateInfo* info = new UpdateInfo;
+        strncpy_s(info->tag, tag, _TRUNCATE);
+        snprintf(info->dlUrl, sizeof(info->dlUrl),
+            "https://github.com/conecta6/HDRAutostart-W11/releases/download/%s/HDRAutostartSetup.exe",
+            tag);
+
+        if (g_trayWnd) PostMessageA(g_trayWnd, WM_UPDATE_AVAILABLE, 0, (LPARAM)info);
+    }
+
+cleanup:
+    WinHttpCloseHandle(hReq);
+    WinHttpCloseHandle(hCon);
+    WinHttpCloseHandle(hSes);
+    return 0;
+}
+
+// =============================================================================
 // Tray window
 // =============================================================================
 #define ID_TRAY_FOLDERS   200
@@ -1045,6 +1157,32 @@ static void CheckBrowserHDR()
 
 static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    if (msg == WM_UPDATE_AVAILABLE) {
+        UpdateInfo* info = (UpdateInfo*)lp;
+        Log("Update available: %s — downloading silently", info->tag);
+
+        // Balloon notification
+        g_nid.uFlags |= NIF_INFO;
+        snprintf(g_nid.szInfo,      sizeof(g_nid.szInfo),
+            L == &kES ? "Actualizando a %s..." : "Updating to %s...", info->tag);
+        snprintf(g_nid.szInfoTitle, sizeof(g_nid.szInfoTitle), "HDRAutostart");
+        g_nid.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
+        Shell_NotifyIconA(NIM_MODIFY, &g_nid);
+        g_nid.uFlags &= ~NIF_INFO;
+
+        // Download and install in background thread
+        char tmpDir[MAX_PATH];
+        GetTempPathA(MAX_PATH, tmpDir);
+        DownloadArgs* da = new DownloadArgs;
+        strncpy_s(da->url,  info->dlUrl, _TRUNCATE);
+        snprintf(da->path, sizeof(da->path),
+            "%sHDRAutostartSetup_%s.exe", tmpDir, info->tag);
+        CloseHandle(CreateThread(nullptr, 0, DoSilentUpdate, da, 0, nullptr));
+
+        delete info;
+        return 0;
+    }
+
     if (msg == WM_TASKBARCREATED) {
         KillTimer(hwnd, TIMER_TRAY_RETRY);
         g_trayRetry = 0;
@@ -1226,7 +1364,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     SetTimer(g_trayWnd, TIMER_BROWSER, 500, nullptr);
 
     g_stopEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
-    HANDLE hThread = CreateThread(nullptr, 0, MonitorThread, nullptr, 0, nullptr);
+    HANDLE hThread = CreateThread(nullptr, 0, MonitorThread,     nullptr, 0, nullptr);
+    CloseHandle(CreateThread(           nullptr, 0, UpdateCheckThread, nullptr, 0, nullptr));
 
     MSG msg;
     while (GetMessageA(&msg, nullptr, 0, 0) > 0) {
