@@ -48,7 +48,7 @@ extern "C" {
 #pragma comment(lib, "urlmon.lib")
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")
 
-#define APP_VERSION "0.13"
+#define APP_VERSION "0.14"
 
 // =============================================================================
 // Localisation
@@ -101,8 +101,9 @@ struct Config {
     std::vector<std::string> whitelist;  // specific exe paths that always trigger
     std::vector<std::string> blacklist;  // specific exe paths that never trigger HDR but may trigger KTC dimming
     std::vector<std::string> exclude;    // completely ignored — no HDR, no KTC dimming
-    int ktcLocalDimming    = 0;  // 0=Off(default) 1=Auto 2=Low 3=Std 4=High  (juegos HDR)
-    int ktcSdrLocalDimming = 0;  // 0=Off(default) 1=Auto 2=Low 3=Std 4=High  (juegos blacklist/SDR)
+    int    ktcLocalDimming    = 0;  // 0=Off(default) 1=Auto 2=Low 3=Std 4=High  (juegos HDR)
+    int    ktcSdrLocalDimming = 0;  // 0=Off(default) 1=Auto 2=Low 3=Std 4=High  (juegos blacklist/SDR)
+    time_t lastUpdateAttempt  = 0;  // unix timestamp of last auto-update trigger (anti-loop)
 };
 
 static CRITICAL_SECTION g_cfgLock;
@@ -148,6 +149,8 @@ static void SaveConfig()
     fprintf(f, "[settings]\n");
     fprintf(f, "ktc_local_dimming=%d\n",     g_cfg.ktcLocalDimming);
     fprintf(f, "ktc_sdr_local_dimming=%d\n", g_cfg.ktcSdrLocalDimming);
+    if (g_cfg.lastUpdateAttempt)
+        fprintf(f, "last_update_attempt=%lld\n", (long long)g_cfg.lastUpdateAttempt);
     fprintf(f, "[folders]\n");
     for (auto& s : g_cfg.folders)   fprintf(f, "%s\n", s.c_str());
     fprintf(f, "[whitelist]\n");
@@ -235,6 +238,8 @@ static void LoadConfig()
                 int v = atoi(line + 22);
                 if (v >= 1 && v <= 4) g_cfg.ktcSdrLocalDimming = v;
             }
+            if (strncmp(line, "last_update_attempt=", 20) == 0)
+                g_cfg.lastUpdateAttempt = (time_t)atoll(line + 20);
             break;
         case SEC_FOLDERS:   g_cfg.folders.push_back(line);   break;
         case SEC_WHITELIST: g_cfg.whitelist.push_back(line); break;
@@ -1017,6 +1022,16 @@ static DWORD WINAPI DoSilentUpdate(LPVOID p)
 static DWORD WINAPI UpdateCheckThread(LPVOID)
 {
     Sleep(8000);  // let the app settle before checking
+
+    // Anti-loop: skip if an update was triggered less than 1 hour ago
+    EnterCriticalSection(&g_cfgLock);
+    time_t lastAttempt = g_cfg.lastUpdateAttempt;
+    LeaveCriticalSection(&g_cfgLock);
+    if (lastAttempt != 0 && (time(nullptr) - lastAttempt) < 3600) {
+        Log("Update check: skipped (triggered %lld s ago)", (long long)(time(nullptr) - lastAttempt));
+        return 0;
+    }
+
     Log("Update check: starting");
 
     HINTERNET hSes = WinHttpOpen(L"HDRAutostart-Update/1.0",
@@ -1194,6 +1209,12 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         g_nid.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
         Shell_NotifyIconA(NIM_MODIFY, &g_nid);
         g_nid.uFlags &= ~NIF_INFO;
+
+        // Save timestamp to prevent re-triggering on the next launch (anti-loop)
+        EnterCriticalSection(&g_cfgLock);
+        g_cfg.lastUpdateAttempt = time(nullptr);
+        LeaveCriticalSection(&g_cfgLock);
+        SaveConfig();
 
         // Download and install in background thread
         char tmpDir[MAX_PATH];
