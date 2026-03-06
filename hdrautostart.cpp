@@ -989,51 +989,72 @@ struct DownloadArgs { char url[512]; char path[MAX_PATH]; };
 
 static DWORD WINAPI DoSilentUpdate(LPVOID p)
 {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     DownloadArgs* a = (DownloadArgs*)p;
+    Log("Downloading update from: %s", a->url);
+    Log("Saving to: %s", a->path);
     HRESULT hr = URLDownloadToFileA(nullptr, a->url, a->path, 0, nullptr);
+    Log("URLDownloadToFile result: 0x%08X", (unsigned)hr);
     if (SUCCEEDED(hr)) {
-        // Run installer silently — it will kill us, install, then relaunch the exe
+        Log("Download OK — launching installer silently");
         SHELLEXECUTEINFOA sei = {};
-        sei.cbSize = sizeof(sei);
-        sei.fMask  = SEE_MASK_NOCLOSEPROCESS;
-        sei.lpVerb = "open";
-        sei.lpFile = a->path;
+        sei.cbSize     = sizeof(sei);
+        sei.fMask      = SEE_MASK_NOCLOSEPROCESS;
+        sei.lpVerb     = "open";
+        sei.lpFile     = a->path;
         sei.lpParameters = "/S";
-        sei.nShow  = SW_HIDE;
-        ShellExecuteExA(&sei);
+        sei.nShow      = SW_HIDE;
+        BOOL ok = ShellExecuteExA(&sei);
+        Log("ShellExecuteEx result: %d (err=%lu)", ok, GetLastError());
+    } else {
+        Log("Download FAILED — hr=0x%08X", (unsigned)hr);
     }
     delete a;
+    CoUninitialize();
     return 0;
 }
 
 static DWORD WINAPI UpdateCheckThread(LPVOID)
 {
     Sleep(8000);  // let the app settle before checking
+    Log("Update check: starting");
 
     HINTERNET hSes = WinHttpOpen(L"HDRAutostart-Update/1.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSes) return 0;
+    if (!hSes) { Log("Update: WinHttpOpen failed err=%lu", GetLastError()); return 0; }
 
     HINTERNET hCon = WinHttpConnect(hSes, L"api.github.com",
         INTERNET_DEFAULT_HTTPS_PORT, 0);
-    if (!hCon) { WinHttpCloseHandle(hSes); return 0; }
+    if (!hCon) { Log("Update: WinHttpConnect failed err=%lu", GetLastError()); WinHttpCloseHandle(hSes); return 0; }
 
     HINTERNET hReq = WinHttpOpenRequest(hCon, L"GET",
         L"/repos/conecta6/HDRAutostart-W11/releases/latest",
         nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
         WINHTTP_FLAG_SECURE);
-    if (!hReq) { WinHttpCloseHandle(hCon); WinHttpCloseHandle(hSes); return 0; }
+    if (!hReq) { Log("Update: WinHttpOpenRequest failed err=%lu", GetLastError()); WinHttpCloseHandle(hCon); WinHttpCloseHandle(hSes); return 0; }
 
     WinHttpAddRequestHeaders(hReq,
         L"Accept: application/vnd.github+json\r\n",
         (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD);
 
     if (!WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-            WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) goto cleanup;
-    if (!WinHttpReceiveResponse(hReq, nullptr)) goto cleanup;
+            WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
+        Log("Update: WinHttpSendRequest failed err=%lu", GetLastError()); goto cleanup;
+    }
+    if (!WinHttpReceiveResponse(hReq, nullptr)) {
+        Log("Update: WinHttpReceiveResponse failed err=%lu", GetLastError()); goto cleanup;
+    }
 
     {
+        // Check HTTP status code
+        DWORD status = 0, statusSz = sizeof(status);
+        WinHttpQueryHeaders(hReq,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSz, WINHTTP_NO_HEADER_INDEX);
+        Log("Update: HTTP status %lu", status);
+        if (status != 200) goto cleanup;
+
         std::string body;
         DWORD avail = 0;
         while (WinHttpQueryDataAvailable(hReq, &avail) && avail > 0) {
@@ -1042,10 +1063,11 @@ static DWORD WINAPI UpdateCheckThread(LPVOID)
             if (WinHttpReadData(hReq, &chunk[0], avail, &got))
                 body.append(chunk, 0, got);
         }
+        Log("Update: response body length=%zu", body.size());
 
         // Extract "tag_name":"..."
         const char* p = strstr(body.c_str(), "\"tag_name\"");
-        if (!p) goto cleanup;
+        if (!p) { Log("Update: tag_name not found in response"); goto cleanup; }
         p = strchr(p, ':');  if (!p) goto cleanup;
         p = strchr(p, '"');  if (!p) goto cleanup;
         ++p;
@@ -1057,8 +1079,9 @@ static DWORD WINAPI UpdateCheckThread(LPVOID)
         memcpy(tag, p, tlen);
 
         Log("Update check: latest=%s current=" APP_VERSION, tag);
-        if (!IsNewerVersion(tag)) goto cleanup;
+        if (!IsNewerVersion(tag)) { Log("Update: already up to date"); goto cleanup; }
 
+        Log("Update: newer version found — preparing download");
         UpdateInfo* info = new UpdateInfo;
         strncpy_s(info->tag, tag, _TRUNCATE);
         snprintf(info->dlUrl, sizeof(info->dlUrl),
@@ -1066,12 +1089,14 @@ static DWORD WINAPI UpdateCheckThread(LPVOID)
             tag);
 
         if (g_trayWnd) PostMessageA(g_trayWnd, WM_UPDATE_AVAILABLE, 0, (LPARAM)info);
+        else { Log("Update: g_trayWnd is null, cannot post message"); delete info; }
     }
 
 cleanup:
     WinHttpCloseHandle(hReq);
     WinHttpCloseHandle(hCon);
     WinHttpCloseHandle(hSes);
+    Log("Update check: done");
     return 0;
 }
 
