@@ -1385,6 +1385,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     DetectLang();
     InitializeCriticalSection(&g_cfgLock);
     LoadConfig();
+    g_cfg.lastUpdateAttempt = 0;  // reset on fresh start so update is always attempted
     OpenLog();
     Log("=== HDRAutostart started ===");
 
