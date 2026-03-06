@@ -48,7 +48,7 @@ extern "C" {
 #pragma comment(lib, "urlmon.lib")
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")
 
-#define APP_VERSION "0.14"
+#define APP_VERSION "0.16"
 
 // =============================================================================
 // Localisation
