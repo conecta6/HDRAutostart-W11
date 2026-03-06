@@ -107,13 +107,28 @@ Chrome, Microsoft Edge, Firefox, Opera, Brave, Vivaldi, Internet Explorer, Water
 
 ### Building from source
 
-Requires Visual Studio Build Tools 2022 or later with the MSVC x64 toolchain.
+Requires:
+- Visual Studio Build Tools 2022 or later with the MSVC x64 toolchain
+- NSIS 3.x ([nsis.sf.net](https://nsis.sf.net))
+
+**Before building**, open `build.bat` and edit the paths at the top of the file to match your environment:
+
+```bat
+:: =============================================================================
+:: BUILD CONFIGURATION — edit these paths to match your environment
+:: =============================================================================
+set VCVARSALL="C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat"
+set NSIS_X86="C:\Program Files (x86)\NSIS\makensis.exe"
+set NSIS_X64="C:\Program Files\NSIS\makensis.exe"
+```
+
+Then run:
 
 ```bat
 build.bat
 ```
 
-Output: `dist\HDRAutostart.exe`
+Output: `dist\HDRAutostart.exe` and `dist\HDRAutostartSetup.exe`
 
 ---
 
@@ -220,13 +235,28 @@ Chrome, Microsoft Edge, Firefox, Opera, Brave, Vivaldi, Internet Explorer, Water
 
 ### Compilar desde el código fuente
 
-Requiere Visual Studio Build Tools 2022 o posterior con la toolchain MSVC x64.
+Requiere:
+- Visual Studio Build Tools 2022 o posterior con la toolchain MSVC x64
+- NSIS 3.x ([nsis.sf.net](https://nsis.sf.net))
+
+**Antes de compilar**, abre `build.bat` y edita las rutas al inicio del archivo para que coincidan con tu entorno:
+
+```bat
+:: =============================================================================
+:: BUILD CONFIGURATION — edit these paths to match your environment
+:: =============================================================================
+set VCVARSALL="C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat"
+set NSIS_X86="C:\Program Files (x86)\NSIS\makensis.exe"
+set NSIS_X64="C:\Program Files\NSIS\makensis.exe"
+```
+
+Luego ejecuta:
 
 ```bat
 build.bat
 ```
 
-Resultado: `dist\HDRAutostart.exe`
+Resultado: `dist\HDRAutostart.exe` y `dist\HDRAutostartSetup.exe`
 
 ---
 
