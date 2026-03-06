@@ -108,21 +108,10 @@ Chrome, Microsoft Edge, Firefox, Opera, Brave, Vivaldi, Internet Explorer, Water
 ### Building from source
 
 Requires:
-- Visual Studio Build Tools 2022 or later with the MSVC x64 toolchain
-- NSIS 3.x ([nsis.sf.net](https://nsis.sf.net))
+- [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the **Desktop development with C++** workload (MSVC x64)
+- [NSIS 3.x](https://nsis.sourceforge.io/Download)
 
-**Before building**, open `build.bat` and edit the paths at the top of the file to match your environment:
-
-```bat
-:: =============================================================================
-:: BUILD CONFIGURATION — edit these paths to match your environment
-:: =============================================================================
-set VCVARSALL="C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat"
-set NSIS_X86="C:\Program Files (x86)\NSIS\makensis.exe"
-set NSIS_X64="C:\Program Files\NSIS\makensis.exe"
-```
-
-Then run:
+All source paths in `build.bat` are relative to `%~dp0` (the folder where the script lives). If `vcvarsall.bat` is not found, edit line 7 of `build.bat` to match your Visual Studio installation path. Then run:
 
 ```bat
 build.bat
@@ -236,21 +225,10 @@ Chrome, Microsoft Edge, Firefox, Opera, Brave, Vivaldi, Internet Explorer, Water
 ### Compilar desde el código fuente
 
 Requiere:
-- Visual Studio Build Tools 2022 o posterior con la toolchain MSVC x64
-- NSIS 3.x ([nsis.sf.net](https://nsis.sf.net))
+- [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) con la carga de trabajo **Desarrollo para escritorio con C++** (MSVC x64)
+- [NSIS 3.x](https://nsis.sourceforge.io/Download)
 
-**Antes de compilar**, abre `build.bat` y edita las rutas al inicio del archivo para que coincidan con tu entorno:
-
-```bat
-:: =============================================================================
-:: BUILD CONFIGURATION — edit these paths to match your environment
-:: =============================================================================
-set VCVARSALL="C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat"
-set NSIS_X86="C:\Program Files (x86)\NSIS\makensis.exe"
-set NSIS_X64="C:\Program Files\NSIS\makensis.exe"
-```
-
-Luego ejecuta:
+Todas las rutas en `build.bat` son relativas a `%~dp0` (la carpeta donde vive el script). Si `vcvarsall.bat` no se encuentra, edita la línea 7 de `build.bat` para que coincida con tu ruta de instalación de Visual Studio. Luego ejecuta:
 
 ```bat
 build.bat

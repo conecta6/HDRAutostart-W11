@@ -1,16 +1,10 @@
 @echo off
 setlocal enabledelayedexpansion
 
-:: =============================================================================
-:: BUILD CONFIGURATION — edit these paths to match your environment
-:: =============================================================================
-set VCVARSALL="C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat"
-set NSIS_X86="C:\Program Files (x86)\NSIS\makensis.exe"
-set NSIS_X64="C:\Program Files\NSIS\makensis.exe"
-:: =============================================================================
+:: Project root: %~dp0  (directory where this build.bat lives — no need to change)
+:: All source files and output are relative to %~dp0
 
-call %VCVARSALL% x64
-if errorlevel 1 ( echo [ERROR] vcvarsall.bat not found - check VCVARSALL in build.bat & pause & exit /b 1 )
+call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64
 if not exist "%~dp0dist" mkdir "%~dp0dist"
 
 :: Check if HDRAutostart is running and kill it before building
@@ -40,10 +34,10 @@ if errorlevel 1 ( echo [ERROR] HDRAutostart build failed & pause & exit /b 1 )
 echo [BUILD] HDRAutostart.exe OK
 
 :: ── Build installer ──────────────────────────────────────────────────────────
-if exist %NSIS_X86% (
-    %NSIS_X86% "%~dp0installer.nsi"
+if exist "C:\Program Files (x86)\NSIS\makensis.exe" (
+    "C:\Program Files (x86)\NSIS\makensis.exe" "%~dp0installer.nsi"
 ) else (
-    %NSIS_X64% "%~dp0installer.nsi"
+    "C:\Program Files\NSIS\makensis.exe" "%~dp0installer.nsi"
 )
 if errorlevel 1 ( echo [ERROR] NSIS installer failed & pause & exit /b 1 )
 
