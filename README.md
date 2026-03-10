@@ -27,8 +27,8 @@ Windows 11 supports HDR, but it does not switch automatically. If you leave HDR 
 
 ### Installation
 
-1. Download `HDRAutostart.exe` from [Releases](../../releases).
-2. Run it. Windows will ask for administrator privileges — these are required to control HDR via the Windows Display API.
+1. Download `HDRAutostartSetup.exe` from [Releases](../../releases).
+2. Run the installer. Windows will ask for administrator privileges — these are required to control HDR via the Windows Display API.
 3. The app appears in the system tray. Right-click to configure.
 4. (Optional) Enable **Run at startup** so it starts automatically with Windows.
 
@@ -183,8 +183,8 @@ Windows 11 soporta HDR, pero no lo activa automáticamente. Si dejas el HDR siem
 
 ### Instalación
 
-1. Descarga `HDRAutostart.exe` desde [Releases](../../releases).
-2. Ejecútalo. Windows pedirá privilegios de administrador — son necesarios para controlar el HDR a través de la API de Windows.
+1. Descarga `HDRAutostartSetup.exe` desde [Releases](../../releases).
+2. Ejecuta el instalador. Windows pedirá privilegios de administrador — son necesarios para controlar el HDR a través de la API de Windows.
 3. La app aparece en la bandeja del sistema. Clic derecho para configurar.
 4. (Opcional) Activa **Ejecutar al inicio** para que arranque automáticamente con Windows.
 
