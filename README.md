@@ -20,7 +20,7 @@ Windows 11 supports HDR, but it does not switch automatically. If you leave HDR 
 | **Blacklist** | Add individual `.exe` files that should never trigger HDR (e.g. launchers inside game folders you don't want triggering HDR). |
 | **Exclude** | Completely ignore specific executables or entire folders. Excluded items are never scanned — no HDR, no KTC dimming. Useful for tools, utilities, or whole directories you never want to trigger anything. |
 | **KTC Local Dimming** | For KTC monitors with DDC/CI support: automatically control the Local Dimming level (VCP 0xF4) when HDR switches on or off. Separate settings for HDR and SDR modes. Off by default — safe on any monitor. |
-| **KTC Sharpness** | Automatically set monitor sharpness (VCP 0x57) when HDR activates or deactivates. Configurable from 0 to 100 in steps of 10. Default: 60. |
+| **KTC Sharpness** | Automatically set monitor sharpness (VCP 0x87) when HDR activates or deactivates. Configurable from 0 to 10. Default: 6. |
 | **Game profiles** | Assign per-game Local Dimming and Sharpness overrides to specific executables. When the game closes, standard global values are restored automatically. |
 | **Run at startup** | One-click option to launch HDRAutostart with Windows. |
 | **System tray** | Runs silently in the background. Orange icon = HDR active, grey icon = HDR inactive. Right-click for the menu. |
@@ -107,12 +107,12 @@ Both settings are independent so you can, for example, use **High** for HDR gami
 
 #### Sharpness
 
-Automatically sets the monitor's sharpness level (VCP 0x57) via DDC/CI when HDR activates or deactivates. Two independent values — one for HDR mode and one for SDR mode. Select from 0 to 100 in steps of 10, or **Off** to send no command.
+Automatically sets the monitor's sharpness level (VCP 0x87) via DDC/CI when HDR activates or deactivates. Two independent values — one for HDR mode and one for SDR mode. Select from 0 to 10, or **Off** to send no command.
 
 | Setting | Description |
 |---|---|
 | **Off** | No DDC sharpness commands sent. |
-| **0 – 100** | Sharpness level sent to the monitor. Default: **60**. |
+| **0 – 10** | Sharpness level sent to the monitor. Default: **6**. |
 
 > KTC Settings → **Sharpness (KTC)** → HDR (KTC) / SDR (KTC)
 
@@ -176,7 +176,7 @@ Windows 11 soporta HDR, pero no lo activa automáticamente. Si dejas el HDR siem
 | **Lista negra** | Agrega archivos `.exe` individuales que nunca deben activar el HDR (p. ej. launchers dentro de carpetas de juegos que no quieres que disparen el HDR). |
 | **Excluir** | Ignora completamente ejecutables concretos o carpetas enteras. Los elementos excluidos no se procesan en absoluto — sin HDR, sin KTC dimming. Útil para herramientas, utilidades o directorios enteros que nunca quieres que disparen nada. |
 | **Local Dimming KTC** | Para monitores KTC con soporte DDC/CI: controla automáticamente el nivel de Local Dimming (VCP 0xF4) cuando el HDR se activa o desactiva. Ajustes independientes para modo HDR y SDR. Desactivado por defecto — seguro en cualquier monitor. |
-| **Nitidez KTC** | Ajusta automáticamente la nitidez del monitor (VCP 0x57) al activar o desactivar el HDR. Configurable de 0 a 100 en saltos de 10. Valor por defecto: 60. |
+| **Nitidez KTC** | Ajusta automáticamente la nitidez del monitor (VCP 0x87) al activar o desactivar el HDR. Configurable de 0 a 10. Valor por defecto: 6. |
 | **Perfiles de juego** | Asigna valores personalizados de Local Dimming y Nitidez a ejecutables específicos. Al cerrar el juego, se restauran automáticamente los valores globales estándar. |
 | **Ejecutar al inicio** | Opción con un clic para lanzar HDRAutostart con Windows. |
 | **Bandeja del sistema** | Se ejecuta silenciosamente en segundo plano. Icono naranja = HDR activo, icono gris = HDR inactivo. Clic derecho para el menú. |
@@ -263,12 +263,12 @@ Ambos ajustes son independientes, por lo que puedes usar, por ejemplo, **Alto** 
 
 #### Nitidez
 
-Ajusta automáticamente el nivel de nitidez del monitor (VCP 0x57) vía DDC/CI al activar o desactivar el HDR. Dos valores independientes — uno para modo HDR y otro para modo SDR. Seleccionable de 0 a 100 en saltos de 10, o **Desactivado** para no enviar ningún comando.
+Ajusta automáticamente el nivel de nitidez del monitor (VCP 0x87) vía DDC/CI al activar o desactivar el HDR. Dos valores independientes — uno para modo HDR y otro para modo SDR. Seleccionable de 0 a 10, o **Desactivado** para no enviar ningún comando.
 
 | Ajuste | Descripción |
 |---|---|
 | **Desactivado** | No se envían comandos de nitidez DDC. |
-| **0 – 100** | Nivel de nitidez enviado al monitor. Por defecto: **60**. |
+| **0 – 10** | Nivel de nitidez enviado al monitor. Por defecto: **6**. |
 
 > Configuración KTC → **Nitidez (KTC)** → HDR (KTC) / SDR (KTC)
 

@@ -122,8 +122,8 @@ struct Config {
     std::vector<std::string> exclude;    // completely ignored — no HDR, no KTC dimming
     int    ktcLocalDimming    = 0;  // 0=Off(default) 1=Auto 2=Low 3=Std 4=High  (juegos HDR)
     int    ktcSdrLocalDimming = 0;  // 0=Off(default) 1=Auto 2=Low 3=Std 4=High  (juegos blacklist/SDR)
-    int    ktcSharpnessHdr    = 6;  // -1=off, 0-10 (VCP 0x57)
-    int    ktcSharpnessSdr    = 6;  // -1=off, 0-10 (VCP 0x57)
+    int    ktcSharpnessHdr    = 6;  // -1=off, 0-10 (VCP 0x87 on KTC)
+    int    ktcSharpnessSdr    = 6;  // -1=off, 0-10 (VCP 0x87 on KTC)
     time_t lastUpdateAttempt  = 0;  // unix timestamp of last auto-update trigger (anti-loop)
     std::vector<GameProfile> profiles;
 };
@@ -380,7 +380,7 @@ static bool SetHDR(bool on)
 }
 
 // =============================================================================
-// NVAPI raw DDC/CI helpers (used for KTC sharpness VCP 0x57 on NVIDIA)
+// NVAPI raw DDC/CI helpers
 // =============================================================================
 typedef unsigned char NvU8;
 typedef unsigned int  NvU32;
@@ -443,8 +443,6 @@ static NvAPI_Unload_t                           g_nvapiUnload = nullptr;
 static NvAPI_GetAssociatedNvidiaDisplayHandle_t g_nvapiGetDisplayHandle = nullptr;
 static NvAPI_GetAssociatedDisplayOutputId_t     g_nvapiGetOutputId = nullptr;
 static NvAPI_I2CWrite_t                         g_nvapiI2CWrite = nullptr;
-
-static bool SetSharpnessViaControlMyMonitor(int level);
 
 static BOOL CALLBACK CollectActiveDisplayNamesProc(HMONITOR hmon, HDC, LPRECT, LPARAM lParam)
 {
@@ -667,12 +665,8 @@ static void SetKTCLocalDimming(int level)
 static void SetKTCSharpness(int level)
 {
     if (level < 0) return;
-    Log("KTC Sharpness -> %d", level);
-    if (SetSharpnessViaControlMyMonitor(level)) return;
-    Log("KTC Sharpness: ControlMyMonitor path failed, trying NVAPI");
-    if (SetNVAPIVCP(0x57, (DWORD)level)) return;
-    Log("KTC Sharpness: NVAPI path failed, falling back to DXVA2 VCP");
-    SetKTCVCP(0x57, level);
+    Log("KTC Sharpness -> %d (VCP 0x87)", level);
+    SetKTCVCP(0x87, level);
 }
 
 // =============================================================================
@@ -845,90 +839,6 @@ static bool FileExists(const std::string& path)
 {
     DWORD attrs = GetFileAttributesA(path.c_str());
     return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
-}
-
-static std::string g_controlMyMonitorPath;
-static bool        g_controlMyMonitorSearched = false;
-
-static std::string FindControlMyMonitorPath()
-{
-    if (g_controlMyMonitorSearched) return g_controlMyMonitorPath;
-    g_controlMyMonitorSearched = true;
-
-    std::vector<std::string> candidates = {
-        ExeDir() + "ControlMyMonitor.exe",
-        ConfigDir() + "ControlMyMonitor.exe"
-    };
-
-    char profile[MAX_PATH] = {};
-    if (SHGetFolderPathA(nullptr, CSIDL_PROFILE, nullptr, SHGFP_TYPE_CURRENT, profile) == S_OK) {
-        std::string downloads = std::string(profile) + "\\Downloads\\";
-        candidates.push_back(downloads + "ControlMyMonitor.exe");
-
-        WIN32_FIND_DATAA fd = {};
-        HANDLE hFind = FindFirstFileA((downloads + "controlmymonitor-*").c_str(), &fd);
-        if (hFind != INVALID_HANDLE_VALUE) {
-            do {
-                if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) continue;
-                std::string p = downloads + fd.cFileName + "\\ControlMyMonitor.exe";
-                candidates.push_back(p);
-            } while (FindNextFileA(hFind, &fd));
-            FindClose(hFind);
-        }
-    }
-
-    for (const auto& path : candidates) {
-        if (FileExists(path)) {
-            g_controlMyMonitorPath = path;
-            Log("ControlMyMonitor: found at %s", path.c_str());
-            break;
-        }
-    }
-
-    if (g_controlMyMonitorPath.empty())
-        Log("ControlMyMonitor: not found");
-    return g_controlMyMonitorPath;
-}
-
-static bool SetSharpnessViaControlMyMonitor(int level)
-{
-    std::string path = FindControlMyMonitorPath();
-    if (path.empty()) return false;
-
-    std::vector<std::string> displayNames;
-    EnumDisplayMonitors(nullptr, nullptr, CollectActiveDisplayNamesProc, (LPARAM)&displayNames);
-    if (displayNames.empty()) {
-        Log("  ControlMyMonitor: no active display names found");
-        return false;
-    }
-
-    for (const auto& displayName : displayNames) {
-        const std::string target = displayName + "\\Monitor0";
-        bool targetOk = false;
-        for (int pass = 0; pass < 3; ++pass) {
-            char cmd[1200] = {};
-            // ControlMyMonitor CLI expects the decimal VCP code here.
-            // Sharpness is 0x57, which is 87 in decimal.
-            snprintf(cmd, sizeof(cmd), "\"%s\" /SetValue \"%s\" 87 %d",
-                path.c_str(), target.c_str(), level);
-
-            DWORD exitCode = STILL_ACTIVE;
-            bool finished = RunAsShellUser(cmd, 5000, &exitCode);
-            Log("  ControlMyMonitor: target=%s level=%d pass=%d finished=%s exit=%lu",
-                target.c_str(), level, pass + 1, finished ? "yes" : "no", (unsigned long)exitCode);
-            if (!(finished && exitCode == 0)) {
-                targetOk = false;
-                break;
-            }
-
-            targetOk = true;
-            if (pass == 0) Sleep(150);
-            else if (pass == 1) Sleep(350);
-        }
-        if (targetOk) return true;
-    }
-
-    return false;
 }
 
 // Launchers/platform clients always ignored regardless of folder location
@@ -1250,7 +1160,7 @@ static DWORD WINAPI MonitorThread(LPVOID)
                             SetKTCLocalDimming(effectiveDimming);
                             dimSentForHdr = true;
                         }
-                        // Sharpness: standard VCP 0x57 gets reset by HDR mode switch.
+                        // Sharpness: VCP 0x87 gets reset by HDR mode switch.
                         // Wait for monitor to stabilize, then send.
                         if (effectiveSharpness >= 0) {
                             Sleep(500);
@@ -1730,7 +1640,7 @@ static void CheckBrowserHDR()
         SetHDR(true);
         // Local dimming after HDR (KTC proprietary VCP — survives mode switch)
         SetKTCLocalDimming(dimming);
-        // Sharpness: standard VCP 0x57 gets reset by HDR mode switch; wait then send
+        // Sharpness: VCP 0x87 gets reset by HDR mode switch; wait then send
         if (sharpHdr >= 0) { Sleep(500); SetKTCSharpness(sharpHdr); }
         strncpy_s(g_hdrSource, "Browser", _TRUNCATE);
         g_browserHdrOn = true;

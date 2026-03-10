@@ -31,10 +31,6 @@ if errorlevel 1 ( echo [ERROR] testhdr build failed & pause & exit /b 1 )
 cl /EHsc /O2 /W3 "%~dp0hdrautostart.cpp" /Fe:"%~dp0dist\HDRAutostart.exe" /Fo:"%~dp0dist\HDRAutostart.obj" /link user32.lib advapi32.lib shell32.lib "%~dp0dist\hdrautostart.res"
 if errorlevel 1 ( echo [ERROR] HDRAutostart build failed & pause & exit /b 1 )
 
-:: Bundle ControlMyMonitor helper for installer/runtime use
-copy /Y "%~dp0third_party\ControlMyMonitor\ControlMyMonitor.exe" "%~dp0dist\ControlMyMonitor.exe" >nul
-if errorlevel 1 ( echo [ERROR] ControlMyMonitor copy failed & pause & exit /b 1 )
-
 echo [BUILD] HDRAutostart.exe OK
 
 :: ── Build installer ──────────────────────────────────────────────────────────
