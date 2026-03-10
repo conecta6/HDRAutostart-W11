@@ -100,6 +100,7 @@ Section "Instalar"
 
     SetOutPath "$INSTDIR"
     File "dist\${EXE_NAME}"
+    File "dist\ControlMyMonitor.exe"
 
     ; -- Config directory & registry key --------------------------------------
     ${If} $AllUsers == "1"
@@ -171,6 +172,7 @@ Section "Uninstall"
 
     ; Remove files
     Delete "$INSTDIR\${EXE_NAME}"
+    Delete "$INSTDIR\ControlMyMonitor.exe"
     Delete "$INSTDIR\Uninstall.exe"
     RMDir  "$INSTDIR"
 

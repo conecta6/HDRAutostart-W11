@@ -23,6 +23,7 @@ extern "C" {
     BOOL WINAPI GetPhysicalMonitorsFromHMONITOR(HMONITOR, DWORD, LPPHYSICAL_MONITOR);
     BOOL WINAPI DestroyPhysicalMonitors(DWORD, LPPHYSICAL_MONITOR);
     BOOL WINAPI SetVCPFeature(HANDLE, BYTE, DWORD);
+    BOOL WINAPI GetVCPFeatureAndVCPFeatureReply(HANDLE, BYTE, LPDWORD, LPDWORD, LPDWORD);
 }
 
 #include <cstdio>
@@ -81,7 +82,7 @@ static const Lang kES = {
     "Desactivado", "Auto", "Bajo", "Est\xe1ndar", "Alto",
     "GitHub",
     "Perfiles de juego...", "Perfiles de juego", "Nitidez (KTC)",
-    "Local Dimming:", "Nitidez (0-100):", "Ejecutable:", "Usar valor global",
+    "Local Dimming:", "Nitidez (0-10):", "Ejecutable:", "Usar valor global",
     "Configuraci\xf3n KTC"
 };
 static const Lang kEN = {
@@ -95,7 +96,7 @@ static const Lang kEN = {
     "Off", "Auto", "Low", "Standard", "High",
     "GitHub",
     "Game profiles...", "Game profiles", "Sharpness (KTC)",
-    "Local Dimming:", "Sharpness (0-100):", "Executable:", "Global default",
+    "Local Dimming:", "Sharpness (0-10):", "Executable:", "Global default",
     "KTC Settings"
 };
 static const Lang* L = &kEN;
@@ -111,7 +112,7 @@ static void DetectLang()
 struct GameProfile {
     std::string exe;   // full path, stored lowercase
     int localDimming;  // -1 = use global, 0 = off, 1-4 = override
-    int sharpness;     // -1 = use global, 0-100 = override
+    int sharpness;     // -1 = use global, 0-10 = override
 };
 
 struct Config {
@@ -121,8 +122,8 @@ struct Config {
     std::vector<std::string> exclude;    // completely ignored — no HDR, no KTC dimming
     int    ktcLocalDimming    = 0;  // 0=Off(default) 1=Auto 2=Low 3=Std 4=High  (juegos HDR)
     int    ktcSdrLocalDimming = 0;  // 0=Off(default) 1=Auto 2=Low 3=Std 4=High  (juegos blacklist/SDR)
-    int    ktcSharpnessHdr    = 60; // -1=off, 0-100 (VCP 0x57)
-    int    ktcSharpnessSdr    = 60; // -1=off, 0-100 (VCP 0x57)
+    int    ktcSharpnessHdr    = 6;  // -1=off, 0-10 (VCP 0x57)
+    int    ktcSharpnessSdr    = 6;  // -1=off, 0-10 (VCP 0x57)
     time_t lastUpdateAttempt  = 0;  // unix timestamp of last auto-update trigger (anti-loop)
     std::vector<GameProfile> profiles;
 };
@@ -266,10 +267,14 @@ static void LoadConfig()
                 if (v >= 1 && v <= 4) g_cfg.ktcSdrLocalDimming = v;
             }
             if (strncmp(line, "ktc_sharpness_hdr=", 18) == 0) {
-                int v = atoi(line + 18); if (v >= -1 && v <= 100) g_cfg.ktcSharpnessHdr = v;
+                int v = atoi(line + 18);
+                if (v > 10 && v <= 100 && (v % 10) == 0) v /= 10;  // migrate old 0-100 configs
+                if (v >= -1 && v <= 10) g_cfg.ktcSharpnessHdr = v;
             }
             if (strncmp(line, "ktc_sharpness_sdr=", 18) == 0) {
-                int v = atoi(line + 18); if (v >= -1 && v <= 100) g_cfg.ktcSharpnessSdr = v;
+                int v = atoi(line + 18);
+                if (v > 10 && v <= 100 && (v % 10) == 0) v /= 10;  // migrate old 0-100 configs
+                if (v >= -1 && v <= 10) g_cfg.ktcSharpnessSdr = v;
             }
             if (strncmp(line, "last_update_attempt=", 20) == 0)
                 g_cfg.lastUpdateAttempt = (time_t)atoll(line + 20);
@@ -288,6 +293,8 @@ static void LoadConfig()
                     gp.exe = std::string(line, p1 - line);
                     gp.localDimming = atoi(p1 + 1);
                     gp.sharpness    = atoi(p2 + 1);
+                    if (gp.sharpness > 10 && gp.sharpness <= 100 && (gp.sharpness % 10) == 0)
+                        gp.sharpness /= 10;  // migrate old 0-100 profile values
                     g_cfg.profiles.push_back(gp);
                 }
             }
@@ -373,6 +380,246 @@ static bool SetHDR(bool on)
 }
 
 // =============================================================================
+// NVAPI raw DDC/CI helpers (used for KTC sharpness VCP 0x57 on NVIDIA)
+// =============================================================================
+typedef unsigned char NvU8;
+typedef unsigned int  NvU32;
+typedef int           NvAPI_Status;
+
+struct NvPhysicalGpuHandle__ { int unused; };
+struct NvDisplayHandle__     { int unused; };
+typedef NvPhysicalGpuHandle__* NvPhysicalGpuHandle;
+typedef NvDisplayHandle__*     NvDisplayHandle;
+
+#define NVAPI_MAX_PHYSICAL_GPUS      64
+#define NVAPI_OK                     0
+#define NVAPI_I2C_SPEED_DEPRECATED   0xFFFF
+#define MAKE_NVAPI_VERSION(typeName, ver) ((NvU32)(sizeof(typeName) | ((ver) << 16)))
+
+typedef enum {
+    NVAPI_I2C_SPEED_DEFAULT,
+    NVAPI_I2C_SPEED_3KHZ,
+    NVAPI_I2C_SPEED_10KHZ,
+    NVAPI_I2C_SPEED_33KHZ,
+    NVAPI_I2C_SPEED_100KHZ,
+    NVAPI_I2C_SPEED_200KHZ,
+    NVAPI_I2C_SPEED_400KHZ,
+} NV_I2C_SPEED;
+
+#pragma pack(push, 8)
+typedef struct {
+    NvU32        version;
+    NvU32        displayMask;
+    NvU8         bIsDDCPort;
+    NvU8         i2cDevAddress;
+    NvU8*        pbI2cRegAddress;
+    NvU32        regAddrSize;
+    NvU8*        pbData;
+    NvU32        cbSize;
+    NvU32        i2cSpeed;
+    NV_I2C_SPEED i2cSpeedKhz;
+    NvU8         portId;
+    NvU32        bIsPortIdSet;
+} NV_I2C_INFO_V3;
+#pragma pack(pop)
+
+typedef NV_I2C_INFO_V3 NV_I2C_INFO;
+#define NV_I2C_INFO_VER3 MAKE_NVAPI_VERSION(NV_I2C_INFO_V3, 3)
+
+typedef void* (__cdecl *NvAPI_QueryInterface_t)(NvU32);
+typedef NvAPI_Status (__cdecl *NvAPI_Initialize_t)();
+typedef NvAPI_Status (__cdecl *NvAPI_Unload_t)();
+typedef NvAPI_Status (__cdecl *NvAPI_EnumPhysicalGPUs_t)(NvPhysicalGpuHandle[NVAPI_MAX_PHYSICAL_GPUS], NvU32*);
+typedef NvAPI_Status (__cdecl *NvAPI_GetAssociatedNvidiaDisplayHandle_t)(const char*, NvDisplayHandle*);
+typedef NvAPI_Status (__cdecl *NvAPI_GetAssociatedDisplayOutputId_t)(NvDisplayHandle, NvU32*);
+typedef NvAPI_Status (__cdecl *NvAPI_I2CWrite_t)(NvPhysicalGpuHandle, NV_I2C_INFO*);
+
+static HMODULE                                  g_nvapiDll = nullptr;
+static bool                                     g_nvapiInitTried = false;
+static bool                                     g_nvapiReady = false;
+static NvPhysicalGpuHandle                      g_nvapiGpus[NVAPI_MAX_PHYSICAL_GPUS] = {};
+static NvU32                                    g_nvapiGpuCount = 0;
+static NvAPI_Unload_t                           g_nvapiUnload = nullptr;
+static NvAPI_GetAssociatedNvidiaDisplayHandle_t g_nvapiGetDisplayHandle = nullptr;
+static NvAPI_GetAssociatedDisplayOutputId_t     g_nvapiGetOutputId = nullptr;
+static NvAPI_I2CWrite_t                         g_nvapiI2CWrite = nullptr;
+
+static bool SetSharpnessViaControlMyMonitor(int level);
+
+static BOOL CALLBACK CollectActiveDisplayNamesProc(HMONITOR hmon, HDC, LPRECT, LPARAM lParam)
+{
+    auto* names = reinterpret_cast<std::vector<std::string>*>(lParam);
+    MONITORINFOEXA mi = {};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoA(hmon, (MONITORINFO*)&mi)) return TRUE;
+    std::string name = mi.szDevice;
+    if (std::find(names->begin(), names->end(), name) == names->end())
+        names->push_back(name);
+    return TRUE;
+}
+
+static bool InitNVAPI()
+{
+    if (g_nvapiInitTried) return g_nvapiReady;
+    g_nvapiInitTried = true;
+
+    g_nvapiDll = LoadLibraryA(sizeof(void*) == 8 ? "nvapi64.dll" : "nvapi.dll");
+    if (!g_nvapiDll) {
+        Log("NVAPI: library not available");
+        return false;
+    }
+
+    auto query = reinterpret_cast<NvAPI_QueryInterface_t>(
+        GetProcAddress(g_nvapiDll, "nvapi_QueryInterface"));
+    if (!query) {
+        Log("NVAPI: nvapi_QueryInterface not found");
+        FreeLibrary(g_nvapiDll);
+        g_nvapiDll = nullptr;
+        return false;
+    }
+
+    auto nvapiInitialize = reinterpret_cast<NvAPI_Initialize_t>(query(0x0150e828));
+    g_nvapiUnload = reinterpret_cast<NvAPI_Unload_t>(query(0xd22bdd7e));
+    auto nvapiEnumPhysicalGPUs = reinterpret_cast<NvAPI_EnumPhysicalGPUs_t>(query(0xe5ac921f));
+    g_nvapiI2CWrite = reinterpret_cast<NvAPI_I2CWrite_t>(query(0xe812eb07));
+    g_nvapiGetDisplayHandle =
+        reinterpret_cast<NvAPI_GetAssociatedNvidiaDisplayHandle_t>(query(0x35c29134));
+    g_nvapiGetOutputId =
+        reinterpret_cast<NvAPI_GetAssociatedDisplayOutputId_t>(query(0xd995937e));
+
+    if (!nvapiInitialize || !g_nvapiUnload || !nvapiEnumPhysicalGPUs ||
+        !g_nvapiI2CWrite || !g_nvapiGetDisplayHandle || !g_nvapiGetOutputId) {
+        Log("NVAPI: required entry points missing");
+        FreeLibrary(g_nvapiDll);
+        g_nvapiDll = nullptr;
+        g_nvapiUnload = nullptr;
+        g_nvapiI2CWrite = nullptr;
+        g_nvapiGetDisplayHandle = nullptr;
+        g_nvapiGetOutputId = nullptr;
+        return false;
+    }
+
+    NvAPI_Status st = nvapiInitialize();
+    if (st != NVAPI_OK) {
+        Log("NVAPI: initialize failed status=%d", st);
+        FreeLibrary(g_nvapiDll);
+        g_nvapiDll = nullptr;
+        g_nvapiUnload = nullptr;
+        g_nvapiI2CWrite = nullptr;
+        g_nvapiGetDisplayHandle = nullptr;
+        g_nvapiGetOutputId = nullptr;
+        return false;
+    }
+
+    st = nvapiEnumPhysicalGPUs(g_nvapiGpus, &g_nvapiGpuCount);
+    if (st != NVAPI_OK || g_nvapiGpuCount == 0) {
+        Log("NVAPI: EnumPhysicalGPUs failed status=%d count=%lu", st, (unsigned long)g_nvapiGpuCount);
+        g_nvapiUnload();
+        FreeLibrary(g_nvapiDll);
+        g_nvapiDll = nullptr;
+        g_nvapiUnload = nullptr;
+        g_nvapiI2CWrite = nullptr;
+        g_nvapiGetDisplayHandle = nullptr;
+        g_nvapiGetOutputId = nullptr;
+        g_nvapiGpuCount = 0;
+        return false;
+    }
+
+    g_nvapiReady = true;
+    Log("NVAPI: ready gpus=%lu", (unsigned long)g_nvapiGpuCount);
+    return true;
+}
+
+static void ShutdownNVAPI()
+{
+    if (g_nvapiReady && g_nvapiUnload) {
+        NvAPI_Status st = g_nvapiUnload();
+        Log("NVAPI: unload status=%d", st);
+    }
+    g_nvapiReady = false;
+    g_nvapiGpuCount = 0;
+    g_nvapiUnload = nullptr;
+    g_nvapiI2CWrite = nullptr;
+    g_nvapiGetDisplayHandle = nullptr;
+    g_nvapiGetOutputId = nullptr;
+    if (g_nvapiDll) {
+        FreeLibrary(g_nvapiDll);
+        g_nvapiDll = nullptr;
+    }
+}
+
+static bool SetNVAPIVCP(BYTE vcp, DWORD value)
+{
+    if (!InitNVAPI()) return false;
+
+    std::vector<std::string> displayNames;
+    EnumDisplayMonitors(nullptr, nullptr, CollectActiveDisplayNamesProc, (LPARAM)&displayNames);
+    if (displayNames.empty()) {
+        Log("NVAPI: no active displays found");
+        return false;
+    }
+
+    NvU8 payload[7] = {
+        0x51,
+        0x84,
+        0x03,
+        vcp,
+        (NvU8)((value >> 8) & 0xFF),
+        (NvU8)(value & 0xFF),
+        0x00
+    };
+    NvU8 checksum = 0x6E;
+    for (size_t i = 0; i < sizeof(payload) - 1; ++i) checksum ^= payload[i];
+    payload[sizeof(payload) - 1] = checksum;
+
+    bool anyAttempt = false;
+    bool anySuccess = false;
+
+    for (const auto& displayName : displayNames) {
+        NvDisplayHandle nvDisplay = nullptr;
+        NvU32 outputId = 0;
+
+        NvAPI_Status st = g_nvapiGetDisplayHandle(displayName.c_str(), &nvDisplay);
+        if (st != NVAPI_OK || !nvDisplay) {
+            Log("  NVAPI [%s]: no display handle status=%d", displayName.c_str(), st);
+            continue;
+        }
+
+        st = g_nvapiGetOutputId(nvDisplay, &outputId);
+        if (st != NVAPI_OK || outputId == 0) {
+            Log("  NVAPI [%s]: no output id status=%d output=0x%08lX",
+                displayName.c_str(), st, (unsigned long)outputId);
+            continue;
+        }
+
+        for (NvU32 i = 0; i < g_nvapiGpuCount; ++i) {
+            NV_I2C_INFO info = {};
+            info.version         = NV_I2C_INFO_VER3;
+            info.displayMask     = outputId;
+            info.bIsDDCPort      = 1;
+            info.i2cDevAddress   = 0x6E;
+            info.pbI2cRegAddress = nullptr;
+            info.regAddrSize     = 0;
+            info.pbData          = payload;
+            info.cbSize          = (NvU32)sizeof(payload);
+            info.i2cSpeed        = NVAPI_I2C_SPEED_DEPRECATED;
+            info.i2cSpeedKhz     = NVAPI_I2C_SPEED_DEFAULT;
+            info.portId          = 0;
+            info.bIsPortIdSet    = 0;
+
+            anyAttempt = true;
+            st = g_nvapiI2CWrite(g_nvapiGpus[i], &info);
+            Log("  NVAPI [%s gpu=%lu]: VCP 0x%02X=%lu mask=0x%08lX status=%d",
+                displayName.c_str(), (unsigned long)i, (unsigned)vcp, (unsigned long)value,
+                (unsigned long)outputId, st);
+            if (st == NVAPI_OK) anySuccess = true;
+        }
+    }
+
+    if (!anyAttempt) Log("NVAPI: no writable display path for VCP 0x%02X", (unsigned)vcp);
+    return anySuccess;
+}
+// =============================================================================
 // KTC DDC/CI VCP helpers
 // =============================================================================
 // Generic DDC/CI VCP setter — lParam = (vcp << 16) | value
@@ -381,12 +628,25 @@ static BOOL CALLBACK KTCSetVCPProc(HMONITOR hmon, HDC, LPRECT, LPARAM lParam)
     BYTE  vcp  = (BYTE)((DWORD_PTR)lParam >> 16);
     DWORD val  = (DWORD)((DWORD_PTR)lParam & 0xFFFF);
     DWORD count = 0;
-    if (!GetNumberOfPhysicalMonitorsFromHMONITOR(hmon, &count) || count == 0) return TRUE;
+    if (!GetNumberOfPhysicalMonitorsFromHMONITOR(hmon, &count) || count == 0) {
+        Log("  KTC DDC: no physical monitors for HMONITOR");
+        return TRUE;
+    }
     std::vector<PHYSICAL_MONITOR> mons(count);
     if (GetPhysicalMonitorsFromHMONITOR(hmon, count, mons.data())) {
         for (DWORD i = 0; i < count; i++) {
+            char desc[256] = {};
+            WideCharToMultiByte(CP_UTF8, 0, mons[i].szPhysicalMonitorDescription, -1,
+                                desc, sizeof(desc) - 1, nullptr, nullptr);
             BOOL ok = SetVCPFeature(mons[i].hPhysicalMonitor, vcp, val);
-            if (!ok) Log("  KTC DDC: VCP 0x%02X monitor %lu failed", (unsigned)vcp, i);
+            DWORD vcpType = 0, curVal = 0, maxVal = 0;
+            BOOL readOk = GetVCPFeatureAndVCPFeatureReply(
+                mons[i].hPhysicalMonitor, vcp, &vcpType, &curVal, &maxVal);
+            Log("  KTC DDC [%s]: VCP 0x%02X=%lu set=%s readback=%s cur=%lu max=%lu",
+                desc, (unsigned)vcp, val,
+                ok ? "OK" : "FAIL",
+                readOk ? "OK" : "FAIL",
+                curVal, maxVal);
         }
         DestroyPhysicalMonitors(count, mons.data());
     }
@@ -408,6 +668,10 @@ static void SetKTCSharpness(int level)
 {
     if (level < 0) return;
     Log("KTC Sharpness -> %d", level);
+    if (SetSharpnessViaControlMyMonitor(level)) return;
+    Log("KTC Sharpness: ControlMyMonitor path failed, trying NVAPI");
+    if (SetNVAPIVCP(0x57, (DWORD)level)) return;
+    Log("KTC Sharpness: NVAPI path failed, falling back to DXVA2 VCP");
     SetKTCVCP(0x57, level);
 }
 
@@ -451,6 +715,76 @@ static void RunSilent(const char* cmd)
         WaitForSingleObject(pi.hProcess, 10000);
         CloseHandle(pi.hProcess);  CloseHandle(pi.hThread);
     }
+}
+
+static bool RunSilentEx(const char* cmd, DWORD timeoutMs, DWORD* exitCode = nullptr)
+{
+    STARTUPINFOA si = {};  si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {};
+    char buf[1024];  strncpy_s(buf, cmd, _TRUNCATE);
+    if (!CreateProcessA(nullptr, buf, nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        return false;
+    }
+
+    bool ok = (WaitForSingleObject(pi.hProcess, timeoutMs) == WAIT_OBJECT_0);
+    DWORD code = STILL_ACTIVE;
+    GetExitCodeProcess(pi.hProcess, &code);
+    if (exitCode) *exitCode = code;
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return ok;
+}
+
+static std::wstring ToWideACP(const char* s)
+{
+    if (!s) return std::wstring();
+    int n = MultiByteToWideChar(CP_ACP, 0, s, -1, nullptr, 0);
+    if (n <= 0) return std::wstring();
+    std::vector<wchar_t> buf((size_t)n, L'\0');
+    MultiByteToWideChar(CP_ACP, 0, s, -1, buf.data(), n);
+    return std::wstring(buf.data());
+}
+
+static bool RunAsShellUser(const char* cmd, DWORD timeoutMs, DWORD* exitCode = nullptr)
+{
+    HWND shell = GetShellWindow();
+    if (!shell) return false;
+
+    DWORD shellPid = 0;
+    GetWindowThreadProcessId(shell, &shellPid);
+    if (!shellPid) return false;
+
+    HANDLE hShell = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, shellPid);
+    if (!hShell) return false;
+
+    HANDLE hToken = nullptr;
+    bool ok = false;
+    if (OpenProcessToken(hShell, TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY, &hToken)) {
+        HANDLE hDup = nullptr;
+        if (DuplicateTokenEx(hToken, TOKEN_ALL_ACCESS, nullptr, SecurityImpersonation,
+                             TokenPrimary, &hDup)) {
+            STARTUPINFOW si = {};  si.cb = sizeof(si);
+            PROCESS_INFORMATION pi = {};
+            std::wstring wcmd = ToWideACP(cmd);
+            std::vector<wchar_t> cmdBuf(wcmd.begin(), wcmd.end());
+            cmdBuf.push_back(L'\0');
+
+            if (CreateProcessWithTokenW(hDup, LOGON_WITH_PROFILE, nullptr, cmdBuf.data(),
+                                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+                ok = (WaitForSingleObject(pi.hProcess, timeoutMs) == WAIT_OBJECT_0);
+                DWORD code = STILL_ACTIVE;
+                GetExitCodeProcess(pi.hProcess, &code);
+                if (exitCode) *exitCode = code;
+                CloseHandle(pi.hProcess);
+                CloseHandle(pi.hThread);
+            }
+            CloseHandle(hDup);
+        }
+        CloseHandle(hToken);
+    }
+    CloseHandle(hShell);
+    return ok;
 }
 
 // Check if the scheduled task exists (Task Scheduler stores tasks in registry).
@@ -505,6 +839,96 @@ static std::string ToLower(std::string s)
 {
     std::transform(s.begin(), s.end(), s.begin(), ::tolower);
     return s;
+}
+
+static bool FileExists(const std::string& path)
+{
+    DWORD attrs = GetFileAttributesA(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static std::string g_controlMyMonitorPath;
+static bool        g_controlMyMonitorSearched = false;
+
+static std::string FindControlMyMonitorPath()
+{
+    if (g_controlMyMonitorSearched) return g_controlMyMonitorPath;
+    g_controlMyMonitorSearched = true;
+
+    std::vector<std::string> candidates = {
+        ExeDir() + "ControlMyMonitor.exe",
+        ConfigDir() + "ControlMyMonitor.exe"
+    };
+
+    char profile[MAX_PATH] = {};
+    if (SHGetFolderPathA(nullptr, CSIDL_PROFILE, nullptr, SHGFP_TYPE_CURRENT, profile) == S_OK) {
+        std::string downloads = std::string(profile) + "\\Downloads\\";
+        candidates.push_back(downloads + "ControlMyMonitor.exe");
+
+        WIN32_FIND_DATAA fd = {};
+        HANDLE hFind = FindFirstFileA((downloads + "controlmymonitor-*").c_str(), &fd);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) continue;
+                std::string p = downloads + fd.cFileName + "\\ControlMyMonitor.exe";
+                candidates.push_back(p);
+            } while (FindNextFileA(hFind, &fd));
+            FindClose(hFind);
+        }
+    }
+
+    for (const auto& path : candidates) {
+        if (FileExists(path)) {
+            g_controlMyMonitorPath = path;
+            Log("ControlMyMonitor: found at %s", path.c_str());
+            break;
+        }
+    }
+
+    if (g_controlMyMonitorPath.empty())
+        Log("ControlMyMonitor: not found");
+    return g_controlMyMonitorPath;
+}
+
+static bool SetSharpnessViaControlMyMonitor(int level)
+{
+    std::string path = FindControlMyMonitorPath();
+    if (path.empty()) return false;
+
+    std::vector<std::string> displayNames;
+    EnumDisplayMonitors(nullptr, nullptr, CollectActiveDisplayNamesProc, (LPARAM)&displayNames);
+    if (displayNames.empty()) {
+        Log("  ControlMyMonitor: no active display names found");
+        return false;
+    }
+
+    for (const auto& displayName : displayNames) {
+        const std::string target = displayName + "\\Monitor0";
+        bool targetOk = false;
+        for (int pass = 0; pass < 3; ++pass) {
+            char cmd[1200] = {};
+            // ControlMyMonitor CLI expects the decimal VCP code here.
+            // Sharpness is 0x57, which is 87 in decimal.
+            snprintf(cmd, sizeof(cmd), "\"%s\" /SetValue \"%s\" 87 %d",
+                path.c_str(), target.c_str(), level);
+
+            DWORD exitCode = STILL_ACTIVE;
+            bool finished = RunAsShellUser(cmd, 5000, &exitCode);
+            Log("  ControlMyMonitor: target=%s level=%d pass=%d finished=%s exit=%lu",
+                target.c_str(), level, pass + 1, finished ? "yes" : "no", (unsigned long)exitCode);
+            if (!(finished && exitCode == 0)) {
+                targetOk = false;
+                break;
+            }
+
+            targetOk = true;
+            if (pass == 0) Sleep(150);
+            else if (pass == 1) Sleep(350);
+        }
+        if (targetOk) return true;
+    }
+
+    return false;
 }
 
 // Launchers/platform clients always ignored regardless of folder location
@@ -686,6 +1110,8 @@ static DWORD WINAPI MonitorThread(LPVOID)
     std::map<DWORD, GameProfile> activeProfiles;  // pid -> profile used
     bool hdrActive        = false;
     bool sdrDimmingActive = false;
+    bool dimSentForHdr    = false;  // any dimming command sent this HDR session
+    bool sharpSentForHdr  = false;  // any sharpness command sent this HDR session
 
     std::set<DWORD> seen;
     {
@@ -729,26 +1155,25 @@ static DWORD WINAPI MonitorThread(LPVOID)
         if (games.empty() && hdrActive) {
             Log("All HDR games closed — disabling HDR");
             SetHDR(false);
-            int hDim, sDim, hSharp, sSharp;
+            int sDim, sSharp;
             EnterCriticalSection(&g_cfgLock);
-            hDim   = g_cfg.ktcLocalDimming;
             sDim   = g_cfg.ktcSdrLocalDimming;
-            hSharp = g_cfg.ktcSharpnessHdr;
             sSharp = g_cfg.ktcSharpnessSdr;
             g_hdrSource[0] = '\0';
             LeaveCriticalSection(&g_cfgLock);
-            if (hDim > 0) {
+            // Restore dimming if any was sent this session (from global OR from a profile)
+            if (dimSentForHdr) {
                 if (!sdrGames.empty() && sDim > 0) {
-                    // SDR game still running — restore SDR dimming
                     SetKTCLocalDimming(sDim);
-                    SetKTCSharpness(sSharp);
                     sdrDimmingActive = true;
                 } else {
                     SetKTCLocalDimming(1);  // reset to Auto
-                    SetKTCSharpness(sSharp);
                 }
-            } else {
+                dimSentForHdr = false;
+            }
+            if (sharpSentForHdr) {
                 SetKTCSharpness(sSharp);
+                sharpSentForHdr = false;
             }
             hdrActive = false;
             if (g_trayWnd) PostMessage(g_trayWnd, WM_HDRSTATUS, 0, 0);
@@ -792,14 +1217,6 @@ static DWORD WINAPI MonitorThread(LPVOID)
                     if (!hProc) { Log("  (cannot open process)"); continue; }
 
                     if (games.empty()) {
-                        Log("Enabling HDR...");
-                        bool ok = false;
-                        for (int r = 0; r < 3 && !ok; r++) {
-                            if (r) Sleep(300);
-                            ok = SetHDR(true);
-                        }
-                        Log("HDR %s", ok ? "ENABLED" : "enable FAILED after retries");
-
                         // Check for per-game profile
                         int profileDimming = -1, profileSharpness = -1;
                         std::string loPath = ToLower(path);
@@ -818,8 +1235,28 @@ static DWORD WINAPI MonitorThread(LPVOID)
 
                         int effectiveDimming   = (profileDimming  >= 0) ? profileDimming  : hdrDimming;
                         int effectiveSharpness = (profileSharpness >= 0) ? profileSharpness : hdrSharpness;
-                        SetKTCLocalDimming(effectiveDimming);
-                        SetKTCSharpness(effectiveSharpness);
+
+                        // Enable HDR
+                        Log("Enabling HDR...");
+                        bool ok = false;
+                        for (int r = 0; r < 3 && !ok; r++) {
+                            if (r) Sleep(300);
+                            ok = SetHDR(true);
+                        }
+                        Log("HDR %s", ok ? "ENABLED" : "enable FAILED after retries");
+
+                        // Local dimming after HDR (KTC proprietary VCP — survives mode switch)
+                        if (effectiveDimming > 0) {
+                            SetKTCLocalDimming(effectiveDimming);
+                            dimSentForHdr = true;
+                        }
+                        // Sharpness: standard VCP 0x57 gets reset by HDR mode switch.
+                        // Wait for monitor to stabilize, then send.
+                        if (effectiveSharpness >= 0) {
+                            Sleep(500);
+                            SetKTCSharpness(effectiveSharpness);
+                            sharpSentForHdr = true;
+                        }
 
                         GameProfile usedProfile;
                         usedProfile.exe          = loPath;
@@ -864,7 +1301,9 @@ static DWORD WINAPI MonitorThread(LPVOID)
     // Shutdown cleanup
     if (hdrActive) {
         SetHDR(false);
-        { int d, sh; EnterCriticalSection(&g_cfgLock); d=g_cfg.ktcLocalDimming; sh=g_cfg.ktcSharpnessSdr; LeaveCriticalSection(&g_cfgLock); if(d>0) SetKTCLocalDimming(1); SetKTCSharpness(sh); }
+        int sh; EnterCriticalSection(&g_cfgLock); sh=g_cfg.ktcSharpnessSdr; LeaveCriticalSection(&g_cfgLock);
+        if (dimSentForHdr)   SetKTCLocalDimming(1);
+        if (sharpSentForHdr) SetKTCSharpness(sh);
         if (g_trayWnd) PostMessage(g_trayWnd, WM_HDRSTATUS, 0, 0);
     }
     if (sdrDimmingActive) {
@@ -1283,14 +1722,16 @@ static void CheckBrowserHDR()
 
     if (isFS && !g_browserHdrOn) {
         Log("Browser fullscreen — enabling HDR");
-        SetHDR(true);
         int dimming, sharpHdr;
         EnterCriticalSection(&g_cfgLock);
         dimming  = g_cfg.ktcLocalDimming;
         sharpHdr = g_cfg.ktcSharpnessHdr;
         LeaveCriticalSection(&g_cfgLock);
+        SetHDR(true);
+        // Local dimming after HDR (KTC proprietary VCP — survives mode switch)
         SetKTCLocalDimming(dimming);
-        SetKTCSharpness(sharpHdr);
+        // Sharpness: standard VCP 0x57 gets reset by HDR mode switch; wait then send
+        if (sharpHdr >= 0) { Sleep(500); SetKTCSharpness(sharpHdr); }
         strncpy_s(g_hdrSource, "Browser", _TRUNCATE);
         g_browserHdrOn = true;
         UpdateTray(true);
@@ -1344,11 +1785,11 @@ static LRESULT CALLBACK SharpDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             gap + lw + gap, gap, cw, S(220), hwnd, (HMENU)IDC_SHARP_COMBO, nullptr, nullptr);
         SendMessageA(hCbo, WM_SETFONT, (WPARAM)d->hFont, FALSE);
 
-        // Off (-1), then 0, 10, 20 ... 100
+        // Off (-1), then 0, 1, 2 ... 10
         { int idx = (int)SendMessageA(hCbo, CB_ADDSTRING, 0, (LPARAM)"Off");
           SendMessageA(hCbo, CB_SETITEMDATA, idx, (LPARAM)(DWORD)-1); }
         int selIdx = (*d->value == -1) ? 0 : 0;
-        for (int v = 0; v <= 100; v += 10) {
+        for (int v = 0; v <= 10; v++) {
             char buf[8]; snprintf(buf, sizeof(buf), "%d", v);
             int idx = (int)SendMessageA(hCbo, CB_ADDSTRING, 0, (LPARAM)buf);
             SendMessageA(hCbo, CB_SETITEMDATA, idx, (LPARAM)(DWORD)v);
@@ -1477,7 +1918,7 @@ static LRESULT CALLBACK ProfEditDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             int idxG = (int)SendMessageA(hC2, CB_ADDSTRING, 0, (LPARAM)"Global default");
             SendMessageA(hC2, CB_SETITEMDATA, idxG, (LPARAM)(DWORD)-1);
             int selSharp = (d->sharpness == -1) ? 0 : 0;
-            for (int v = 0; v <= 100; v += 10) {
+            for (int v = 0; v <= 10; v++) {
                 char buf[8]; snprintf(buf, sizeof(buf), "%d", v);
                 int idx = (int)SendMessageA(hC2, CB_ADDSTRING, 0, (LPARAM)buf);
                 SendMessageA(hC2, CB_SETITEMDATA, idx, (LPARAM)(DWORD)v);
@@ -1827,10 +2268,10 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
             // KTC Settings root submenu
             HMENU ktcMenu = CreatePopupMenu();
-            AppendMenuA(ktcMenu, MF_POPUP,     (UINT_PTR)dimMenu,   L->menuLocalDimming);
-            AppendMenuA(ktcMenu, MF_POPUP,     (UINT_PTR)sharpMenu, L->menuSharpness);
+            AppendMenuA(ktcMenu, MF_POPUP,     (UINT_PTR)dimMenu,       L->menuLocalDimming);
+            AppendMenuA(ktcMenu, MF_POPUP,     (UINT_PTR)sharpMenu,     L->menuSharpness);
             AppendMenuA(ktcMenu, MF_SEPARATOR, 0, nullptr);
-            AppendMenuA(ktcMenu, MF_STRING,    ID_TRAY_PROFILES,    L->menuProfiles);
+            AppendMenuA(ktcMenu, MF_STRING,    ID_TRAY_PROFILES,        L->menuProfiles);
             AppendMenuA(m, MF_POPUP, (UINT_PTR)ktcMenu, L->menuKTCSettings);
             AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
 
@@ -1885,6 +2326,8 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             SetEvent(g_stopEvent);
             DestroyWindow(hwnd);
             break;
+        default:
+            break;
         }
         return 0;
 
@@ -1927,6 +2370,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     g_cfg.lastUpdateAttempt = 0;  // reset on fresh start so update is always attempted
     OpenLog();
     Log("=== HDRAutostart started ===");
+    InitNVAPI();
 
     WM_TASKBARCREATED = RegisterWindowMessageA("TaskbarCreated");
 
@@ -1994,6 +2438,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 
     if (g_icoOff) DestroyIcon(g_icoOff);
     if (g_icoOn)  DestroyIcon(g_icoOn);
+    ShutdownNVAPI();
     DeleteCriticalSection(&g_cfgLock);
     if (g_log) fclose(g_log);
     CoUninitialize();

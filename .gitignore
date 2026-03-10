@@ -3,6 +3,10 @@ dist/
 *.exe
 *.obj
 *.res
+!third_party/
+!third_party/ControlMyMonitor/
+!third_party/ControlMyMonitor/ControlMyMonitor.exe
+!third_party/ControlMyMonitor/readme.txt
 
 # Generated icon (created by create_icon.ps1 at build time)
 icon.ico
