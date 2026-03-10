@@ -48,7 +48,7 @@ extern "C" {
 #pragma comment(lib, "urlmon.lib")
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")
 
-#define APP_VERSION "0.16"
+#define APP_VERSION "0.20"
 
 // =============================================================================
 // Localisation
@@ -62,6 +62,11 @@ struct Lang {
     const char *menuLocalDimming, *menuKTC, *menuKTCSDR;
     const char *ktcOff, *ktcAuto, *ktcLow, *ktcStd, *ktcHigh;
     const char *menuGithub;
+    const char *menuProfiles;
+    const char *dlgProfiles;
+    const char *menuSharpness;
+    const char *profDimLabel, *profSharpLabel, *profExeLabel;
+    const char *profDimDefault;
 };
 
 static const Lang kES = {
@@ -73,7 +78,9 @@ static const Lang kES = {
     "HDRAutostart \x97 HDR activo", "HDRAutostart \x97 HDR inactivo",
     "Local Dimming", "HDR (KTC)", "SDR (KTC)",
     "Desactivado", "Auto", "Bajo", "Est\xe1ndar", "Alto",
-    "GitHub"
+    "GitHub",
+    "Perfiles de juego...", "Perfiles de juego", "Nitidez (KTC)",
+    "Local Dimming:", "Nitidez (0-100):", "Ejecutable:", "Usar valor global"
 };
 static const Lang kEN = {
     "Monitored folders...", "Always enable HDR...", "Never enable HDR...", "Exclude...",
@@ -84,7 +91,9 @@ static const Lang kEN = {
     "HDRAutostart \x97 HDR active", "HDRAutostart \x97 HDR inactive",
     "Local Dimming", "HDR (KTC)", "SDR (KTC)",
     "Off", "Auto", "Low", "Standard", "High",
-    "GitHub"
+    "GitHub",
+    "Game profiles...", "Game profiles", "Sharpness (KTC)",
+    "Local Dimming:", "Sharpness (0-100):", "Executable:", "Global default"
 };
 static const Lang* L = &kEN;
 
@@ -96,6 +105,12 @@ static void DetectLang()
 // =============================================================================
 // Config  (hdrautostart.ini next to exe)
 // =============================================================================
+struct GameProfile {
+    std::string exe;   // full path, stored lowercase
+    int localDimming;  // -1 = use global, 0 = off, 1-4 = override
+    int sharpness;     // -1 = use global, 0-100 = override
+};
+
 struct Config {
     std::vector<std::string> folders;    // paths that trigger HDR (prefix match)
     std::vector<std::string> whitelist;  // specific exe paths that always trigger
@@ -103,7 +118,10 @@ struct Config {
     std::vector<std::string> exclude;    // completely ignored — no HDR, no KTC dimming
     int    ktcLocalDimming    = 0;  // 0=Off(default) 1=Auto 2=Low 3=Std 4=High  (juegos HDR)
     int    ktcSdrLocalDimming = 0;  // 0=Off(default) 1=Auto 2=Low 3=Std 4=High  (juegos blacklist/SDR)
+    int    ktcSharpnessHdr    = 60; // -1=off, 0-100 (VCP 0x57)
+    int    ktcSharpnessSdr    = 60; // -1=off, 0-100 (VCP 0x57)
     time_t lastUpdateAttempt  = 0;  // unix timestamp of last auto-update trigger (anti-loop)
+    std::vector<GameProfile> profiles;
 };
 
 static CRITICAL_SECTION g_cfgLock;
@@ -149,6 +167,8 @@ static void SaveConfig()
     fprintf(f, "[settings]\n");
     fprintf(f, "ktc_local_dimming=%d\n",     g_cfg.ktcLocalDimming);
     fprintf(f, "ktc_sdr_local_dimming=%d\n", g_cfg.ktcSdrLocalDimming);
+    fprintf(f, "ktc_sharpness_hdr=%d\n", g_cfg.ktcSharpnessHdr);
+    fprintf(f, "ktc_sharpness_sdr=%d\n", g_cfg.ktcSharpnessSdr);
     if (g_cfg.lastUpdateAttempt)
         fprintf(f, "last_update_attempt=%lld\n", (long long)g_cfg.lastUpdateAttempt);
     fprintf(f, "[folders]\n");
@@ -159,6 +179,9 @@ static void SaveConfig()
     for (auto& s : g_cfg.blacklist) fprintf(f, "%s\n", s.c_str());
     fprintf(f, "[exclude]\n");
     for (auto& s : g_cfg.exclude)   fprintf(f, "%s\n", s.c_str());
+    fprintf(f, "[profiles]\n");
+    for (auto& p : g_cfg.profiles)
+        fprintf(f, "%s|%d|%d\n", p.exe.c_str(), p.localDimming, p.sharpness);
     LeaveCriticalSection(&g_cfgLock);
     fclose(f);
 }
@@ -216,7 +239,7 @@ static void LoadConfig()
         return;
     }
 
-    enum Section { SEC_NONE, SEC_SETTINGS, SEC_FOLDERS, SEC_WHITELIST, SEC_BLACKLIST, SEC_EXCLUDE };
+    enum Section { SEC_NONE, SEC_SETTINGS, SEC_FOLDERS, SEC_WHITELIST, SEC_BLACKLIST, SEC_EXCLUDE, SEC_PROFILES };
     Section sec = SEC_NONE;
     char line[MAX_PATH];
     while (fgets(line, sizeof(line), f)) {
@@ -228,6 +251,7 @@ static void LoadConfig()
         if (!strcmp(line, "[whitelist]")) { sec = SEC_WHITELIST; continue; }
         if (!strcmp(line, "[blacklist]")) { sec = SEC_BLACKLIST; continue; }
         if (!strcmp(line, "[exclude]"))   { sec = SEC_EXCLUDE;   continue; }
+        if (!strcmp(line, "[profiles]"))  { sec = SEC_PROFILES;  continue; }
         switch (sec) {
         case SEC_SETTINGS:
             if (strncmp(line, "ktc_local_dimming=", 18) == 0) {
@@ -238,6 +262,12 @@ static void LoadConfig()
                 int v = atoi(line + 22);
                 if (v >= 1 && v <= 4) g_cfg.ktcSdrLocalDimming = v;
             }
+            if (strncmp(line, "ktc_sharpness_hdr=", 18) == 0) {
+                int v = atoi(line + 18); if (v >= -1 && v <= 100) g_cfg.ktcSharpnessHdr = v;
+            }
+            if (strncmp(line, "ktc_sharpness_sdr=", 18) == 0) {
+                int v = atoi(line + 18); if (v >= -1 && v <= 100) g_cfg.ktcSharpnessSdr = v;
+            }
             if (strncmp(line, "last_update_attempt=", 20) == 0)
                 g_cfg.lastUpdateAttempt = (time_t)atoll(line + 20);
             break;
@@ -245,6 +275,21 @@ static void LoadConfig()
         case SEC_WHITELIST: g_cfg.whitelist.push_back(line); break;
         case SEC_BLACKLIST: g_cfg.blacklist.push_back(line); break;
         case SEC_EXCLUDE:   g_cfg.exclude.push_back(line);   break;
+        case SEC_PROFILES: {
+            // format: path|dimming|sharpness
+            char* p1 = strchr(line, '|');
+            if (p1) {
+                char* p2 = strchr(p1 + 1, '|');
+                if (p2) {
+                    GameProfile gp;
+                    gp.exe = std::string(line, p1 - line);
+                    gp.localDimming = atoi(p1 + 1);
+                    gp.sharpness    = atoi(p2 + 1);
+                    g_cfg.profiles.push_back(gp);
+                }
+            }
+            break;
+        }
         default: break;
         }
     }
@@ -325,29 +370,42 @@ static bool SetHDR(bool on)
 }
 
 // =============================================================================
-// KTC Local Dimming via DDC/CI  (VCP code 0xF4)
-//   1=Auto  2=Low  3=Standard  4=High
+// KTC DDC/CI VCP helpers
 // =============================================================================
-static BOOL CALLBACK KTCEnumProc(HMONITOR hmon, HDC, LPRECT, LPARAM lParam)
+// Generic DDC/CI VCP setter — lParam = (vcp << 16) | value
+static BOOL CALLBACK KTCSetVCPProc(HMONITOR hmon, HDC, LPRECT, LPARAM lParam)
 {
+    BYTE  vcp  = (BYTE)((DWORD_PTR)lParam >> 16);
+    DWORD val  = (DWORD)((DWORD_PTR)lParam & 0xFFFF);
     DWORD count = 0;
     if (!GetNumberOfPhysicalMonitorsFromHMONITOR(hmon, &count) || count == 0) return TRUE;
     std::vector<PHYSICAL_MONITOR> mons(count);
     if (GetPhysicalMonitorsFromHMONITOR(hmon, count, mons.data())) {
         for (DWORD i = 0; i < count; i++) {
-            BOOL ok = SetVCPFeature(mons[i].hPhysicalMonitor, 0xF4, (DWORD)lParam);
-            if (!ok) Log("  KTC DDC: monitor %lu not supported or failed", i);
+            BOOL ok = SetVCPFeature(mons[i].hPhysicalMonitor, vcp, val);
+            if (!ok) Log("  KTC DDC: VCP 0x%02X monitor %lu failed", (unsigned)vcp, i);
         }
         DestroyPhysicalMonitors(count, mons.data());
     }
     return TRUE;
 }
-
+static void SetKTCVCP(BYTE vcp, int value)
+{
+    if (value < 0) return;
+    EnumDisplayMonitors(nullptr, nullptr, KTCSetVCPProc,
+        (LPARAM)(((DWORD)vcp << 16) | (DWORD)value));
+}
 static void SetKTCLocalDimming(int level)
 {
-    if (level == 0) return;   // KTC feature disabled — send no DDC commands
+    if (level == 0) return;
     Log("KTC LocalDimming -> %d (1=Auto,2=Low,3=Std,4=High)", level);
-    EnumDisplayMonitors(nullptr, nullptr, KTCEnumProc, (LPARAM)level);
+    SetKTCVCP(0xF4, level);
+}
+static void SetKTCSharpness(int level)
+{
+    if (level < 0) return;
+    Log("KTC Sharpness -> %d", level);
+    SetKTCVCP(0x57, level);
 }
 
 // =============================================================================
@@ -622,6 +680,7 @@ static DWORD WINAPI MonitorThread(LPVOID)
     Log("Monitor started");
     std::map<DWORD, HANDLE> games;     // HDR games (whitelist/folders)
     std::map<DWORD, HANDLE> sdrGames;  // SDR/blacklisted games (KTC dimming only)
+    std::map<DWORD, GameProfile> activeProfiles;  // pid -> profile used
     bool hdrActive        = false;
     bool sdrDimmingActive = false;
 
@@ -646,6 +705,7 @@ static DWORD WINAPI MonitorThread(LPVOID)
                 const char* base = strrchr(name, '\\');
                 Log("Game exited: %s (PID %lu)", base ? base + 1 : name, it->first);
                 CloseHandle(it->second);
+                activeProfiles.erase(it->first);
                 it = games.erase(it);
             } else ++it;
         }
@@ -666,20 +726,26 @@ static DWORD WINAPI MonitorThread(LPVOID)
         if (games.empty() && hdrActive) {
             Log("All HDR games closed — disabling HDR");
             SetHDR(false);
-            int hDim, sDim;
+            int hDim, sDim, hSharp, sSharp;
             EnterCriticalSection(&g_cfgLock);
-            hDim = g_cfg.ktcLocalDimming;
-            sDim = g_cfg.ktcSdrLocalDimming;
+            hDim   = g_cfg.ktcLocalDimming;
+            sDim   = g_cfg.ktcSdrLocalDimming;
+            hSharp = g_cfg.ktcSharpnessHdr;
+            sSharp = g_cfg.ktcSharpnessSdr;
             g_hdrSource[0] = '\0';
             LeaveCriticalSection(&g_cfgLock);
             if (hDim > 0) {
                 if (!sdrGames.empty() && sDim > 0) {
                     // SDR game still running — restore SDR dimming
                     SetKTCLocalDimming(sDim);
+                    SetKTCSharpness(sSharp);
                     sdrDimmingActive = true;
                 } else {
                     SetKTCLocalDimming(1);  // reset to Auto
+                    SetKTCSharpness(sSharp);
                 }
+            } else {
+                SetKTCSharpness(sSharp);
             }
             hdrActive = false;
             if (g_trayWnd) PostMessage(g_trayWnd, WM_HDRSTATUS, 0, 0);
@@ -687,11 +753,12 @@ static DWORD WINAPI MonitorThread(LPVOID)
 
         // --- All SDR games closed ---
         if (sdrGames.empty() && sdrDimmingActive && !hdrActive) {
-            int sDim;
+            int sDim, sSharp;
             EnterCriticalSection(&g_cfgLock);
-            sDim = g_cfg.ktcSdrLocalDimming;
+            sDim   = g_cfg.ktcSdrLocalDimming;
+            sSharp = g_cfg.ktcSharpnessSdr;
             LeaveCriticalSection(&g_cfgLock);
-            if (sDim > 0) { Log("All SDR games closed — reset dimming"); SetKTCLocalDimming(1); }
+            if (sDim > 0) { Log("All SDR games closed — reset dimming"); SetKTCLocalDimming(1); SetKTCSharpness(sSharp); }
             sdrDimmingActive = false;
         }
 
@@ -729,12 +796,34 @@ static DWORD WINAPI MonitorThread(LPVOID)
                             ok = SetHDR(true);
                         }
                         Log("HDR %s", ok ? "ENABLED" : "enable FAILED after retries");
-                        int dimming;
+
+                        // Check for per-game profile
+                        int profileDimming = -1, profileSharpness = -1;
+                        std::string loPath = ToLower(path);
                         EnterCriticalSection(&g_cfgLock);
-                        dimming = g_cfg.ktcLocalDimming;
+                        for (auto& prof : g_cfg.profiles) {
+                            if (prof.exe == loPath) {
+                                profileDimming   = prof.localDimming;
+                                profileSharpness = prof.sharpness;
+                                break;
+                            }
+                        }
+                        int hdrDimming  = g_cfg.ktcLocalDimming;
+                        int hdrSharpness = g_cfg.ktcSharpnessHdr;
                         strncpy_s(g_hdrSource, base ? base + 1 : path.c_str(), _TRUNCATE);
                         LeaveCriticalSection(&g_cfgLock);
-                        SetKTCLocalDimming(dimming);
+
+                        int effectiveDimming   = (profileDimming  >= 0) ? profileDimming  : hdrDimming;
+                        int effectiveSharpness = (profileSharpness >= 0) ? profileSharpness : hdrSharpness;
+                        SetKTCLocalDimming(effectiveDimming);
+                        SetKTCSharpness(effectiveSharpness);
+
+                        GameProfile usedProfile;
+                        usedProfile.exe          = loPath;
+                        usedProfile.localDimming = profileDimming;
+                        usedProfile.sharpness    = profileSharpness;
+                        activeProfiles[pid]      = usedProfile;
+
                         sdrDimmingActive = false;  // HDR takes precedence
                         hdrActive = true;
                         if (g_trayWnd) PostMessage(g_trayWnd, WM_HDRSTATUS, 1, 0);
@@ -743,9 +832,10 @@ static DWORD WINAPI MonitorThread(LPVOID)
 
                 } else if (cls == -1) {
                     // Blacklisted / SDR game
-                    int sDim;
+                    int sDim, sSharp;
                     EnterCriticalSection(&g_cfgLock);
-                    sDim = g_cfg.ktcSdrLocalDimming;
+                    sDim   = g_cfg.ktcSdrLocalDimming;
+                    sSharp = g_cfg.ktcSharpnessSdr;
                     LeaveCriticalSection(&g_cfgLock);
                     if (sDim == 0) continue;  // SDR dimming disabled — ignore
 
@@ -757,6 +847,7 @@ static DWORD WINAPI MonitorThread(LPVOID)
                     if (sdrGames.empty() && !hdrActive) {
                         Log("SDR dimming -> %d", sDim);
                         SetKTCLocalDimming(sDim);
+                        SetKTCSharpness(sSharp);
                         sdrDimmingActive = true;
                     }
                     sdrGames[pid] = hProc;
@@ -770,12 +861,12 @@ static DWORD WINAPI MonitorThread(LPVOID)
     // Shutdown cleanup
     if (hdrActive) {
         SetHDR(false);
-        { int d; EnterCriticalSection(&g_cfgLock); d=g_cfg.ktcLocalDimming; LeaveCriticalSection(&g_cfgLock); if(d>0) SetKTCLocalDimming(1); }
+        { int d, sh; EnterCriticalSection(&g_cfgLock); d=g_cfg.ktcLocalDimming; sh=g_cfg.ktcSharpnessSdr; LeaveCriticalSection(&g_cfgLock); if(d>0) SetKTCLocalDimming(1); SetKTCSharpness(sh); }
         if (g_trayWnd) PostMessage(g_trayWnd, WM_HDRSTATUS, 0, 0);
     }
     if (sdrDimmingActive) {
-        int d; EnterCriticalSection(&g_cfgLock); d=g_cfg.ktcSdrLocalDimming; LeaveCriticalSection(&g_cfgLock);
-        if (d > 0) SetKTCLocalDimming(1);
+        int d, sh; EnterCriticalSection(&g_cfgLock); d=g_cfg.ktcSdrLocalDimming; sh=g_cfg.ktcSharpnessSdr; LeaveCriticalSection(&g_cfgLock);
+        if (d > 0) { SetKTCLocalDimming(1); SetKTCSharpness(sh); }
     }
     for (auto& kv : games)    CloseHandle(kv.second);
     for (auto& kv : sdrGames) CloseHandle(kv.second);
@@ -1136,6 +1227,9 @@ cleanup:
 #define ID_TRAY_STARTUP   203
 #define ID_TRAY_EXIT      204
 #define ID_TRAY_GITHUB    205
+#define ID_TRAY_PROFILES  207
+#define ID_KTC_SHARP_HDR  320
+#define ID_KTC_SHARP_SDR  321
 #define ID_KTC_OFF          299
 #define ID_KTC_AUTO         300
 #define ID_KTC_LOW          301
@@ -1187,22 +1281,440 @@ static void CheckBrowserHDR()
     if (isFS && !g_browserHdrOn) {
         Log("Browser fullscreen — enabling HDR");
         SetHDR(true);
-        int dimming;
+        int dimming, sharpHdr;
         EnterCriticalSection(&g_cfgLock);
-        dimming = g_cfg.ktcLocalDimming;
+        dimming  = g_cfg.ktcLocalDimming;
+        sharpHdr = g_cfg.ktcSharpnessHdr;
         LeaveCriticalSection(&g_cfgLock);
         SetKTCLocalDimming(dimming);
+        SetKTCSharpness(sharpHdr);
         strncpy_s(g_hdrSource, "Browser", _TRUNCATE);
         g_browserHdrOn = true;
         UpdateTray(true);
     } else if (!isFS && g_browserHdrOn) {
         Log("Browser left fullscreen — disabling HDR");
         SetHDR(false);
-        { int d; EnterCriticalSection(&g_cfgLock); d=g_cfg.ktcLocalDimming; LeaveCriticalSection(&g_cfgLock); if(d>0) SetKTCLocalDimming(1); }
+        { int d, sh; EnterCriticalSection(&g_cfgLock); d=g_cfg.ktcLocalDimming; sh=g_cfg.ktcSharpnessSdr; LeaveCriticalSection(&g_cfgLock); if(d>0) SetKTCLocalDimming(1); SetKTCSharpness(sh); }
         g_hdrSource[0] = '\0';
         g_browserHdrOn = false;
         UpdateTray(false);
     }
+}
+
+// =============================================================================
+// Sharpness combobox dialog
+// =============================================================================
+#define IDC_SHARP_COMBO  400
+#define IDC_SHARP_OK     401
+#define IDC_SHARP_CANCEL 402
+
+struct SharpDlgData {
+    int*  value;
+    HFONT hFont;
+};
+
+static LRESULT CALLBACK SharpDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    SharpDlgData* d = (SharpDlgData*)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_CREATE: {
+        d = (SharpDlgData*)((CREATESTRUCTA*)lp)->lpCreateParams;
+        SetWindowLongPtrA(hwnd, GWLP_USERDATA, (LONG_PTR)d);
+
+        typedef UINT(WINAPI* PFN_GetDpiForWindow)(HWND);
+        static auto pfnDpi = (PFN_GetDpiForWindow)GetProcAddress(GetModuleHandleA("user32.dll"), "GetDpiForWindow");
+        UINT dpi = pfnDpi ? pfnDpi(hwnd) : 96;
+        auto S = [&](int v){ return MulDiv(v, (int)dpi, 96); };
+
+        NONCLIENTMETRICSA ncm = {}; ncm.cbSize = sizeof(ncm);
+        SystemParametersInfoA(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
+        d->hFont = CreateFontIndirectA(&ncm.lfMessageFont);
+
+        int gap = S(8), bw = S(80), bh = S(26), lw = S(110), cw = S(110);
+
+        HWND hLbl = CreateWindowA("STATIC", "Sharpness:",
+            WS_CHILD | WS_VISIBLE, gap, gap + S(4), lw, S(20), hwnd, nullptr, nullptr, nullptr);
+        SendMessageA(hLbl, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+
+        HWND hCbo = CreateWindowExA(0, "COMBOBOX", nullptr,
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            gap + lw + gap, gap, cw, S(220), hwnd, (HMENU)IDC_SHARP_COMBO, nullptr, nullptr);
+        SendMessageA(hCbo, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+
+        // Off (-1), then 0, 10, 20 ... 100
+        { int idx = (int)SendMessageA(hCbo, CB_ADDSTRING, 0, (LPARAM)"Off");
+          SendMessageA(hCbo, CB_SETITEMDATA, idx, (LPARAM)(DWORD)-1); }
+        int selIdx = (*d->value == -1) ? 0 : 0;
+        for (int v = 0; v <= 100; v += 10) {
+            char buf[8]; snprintf(buf, sizeof(buf), "%d", v);
+            int idx = (int)SendMessageA(hCbo, CB_ADDSTRING, 0, (LPARAM)buf);
+            SendMessageA(hCbo, CB_SETITEMDATA, idx, (LPARAM)(DWORD)v);
+            if (v == *d->value) selIdx = idx;
+        }
+        SendMessageA(hCbo, CB_SETCURSEL, selIdx, 0);
+
+        int y2 = gap + S(36);
+        HWND hOk  = CreateWindowA("BUTTON", "OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+            gap,              y2, bw, bh, hwnd, (HMENU)IDC_SHARP_OK,     nullptr, nullptr);
+        HWND hCan = CreateWindowA("BUTTON", "Cancel", WS_CHILD | WS_VISIBLE,
+            gap + bw + gap,   y2, bw, bh, hwnd, (HMENU)IDC_SHARP_CANCEL, nullptr, nullptr);
+        SendMessageA(hOk,  WM_SETFONT, (WPARAM)d->hFont, FALSE);
+        SendMessageA(hCan, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDC_SHARP_OK) {
+            HWND hCbo = GetDlgItem(hwnd, IDC_SHARP_COMBO);
+            int sel = (int)SendMessageA(hCbo, CB_GETCURSEL, 0, 0);
+            if (sel != CB_ERR) {
+                *d->value = (int)(DWORD)SendMessageA(hCbo, CB_GETITEMDATA, sel, 0);
+                SaveConfig();
+            }
+            DestroyWindow(hwnd);
+        } else if (LOWORD(wp) == IDC_SHARP_CANCEL) {
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    case WM_CLOSE:   DestroyWindow(hwnd); return 0;
+    case WM_DESTROY:
+        if (d && d->hFont) DeleteObject(d->hFont);
+        delete d;
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+static void ShowSharpnessDialog(const char* title, int* value)
+{
+    SharpDlgData* data = new SharpDlgData{value, nullptr};
+    HINSTANCE hInst = (HINSTANCE)GetModuleHandleA(nullptr);
+
+    typedef UINT(WINAPI* PFN_GetDpiForSystem)();
+    static auto pfnDpiSys = (PFN_GetDpiForSystem)GetProcAddress(GetModuleHandleA("user32.dll"), "GetDpiForSystem");
+    UINT dpi = pfnDpiSys ? pfnDpiSys() : 96;
+    int W = MulDiv(290, (int)dpi, 96);
+    int H = MulDiv(110, (int)dpi, 96);
+
+    HWND hw = CreateWindowExA(
+        WS_EX_TOPMOST,
+        "HDRAutostartSharpDlg", title,
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT, W, H,
+        nullptr, nullptr, hInst, data);
+    if (hw) SetForegroundWindow(hw);
+    else    delete data;
+}
+
+// =============================================================================
+// Per-profile edit dialog
+// =============================================================================
+#define IDC_PROF_DIM_COMBO   410
+#define IDC_PROF_SHARP_COMBO 411
+#define IDC_PROF_OK          412
+#define IDC_PROF_CANCEL      413
+
+struct ProfEditData {
+    int  dimming;
+    int  sharpness;
+    bool ok;
+    HFONT hFont;
+};
+
+static LRESULT CALLBACK ProfEditDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    ProfEditData* d = (ProfEditData*)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_CREATE: {
+        d = (ProfEditData*)((CREATESTRUCTA*)lp)->lpCreateParams;
+        SetWindowLongPtrA(hwnd, GWLP_USERDATA, (LONG_PTR)d);
+
+        typedef UINT(WINAPI* PFN_GetDpiForWindow)(HWND);
+        static auto pfnDpi = (PFN_GetDpiForWindow)GetProcAddress(GetModuleHandleA("user32.dll"), "GetDpiForWindow");
+        UINT dpi = pfnDpi ? pfnDpi(hwnd) : 96;
+        auto S = [&](int v){ return MulDiv(v, (int)dpi, 96); };
+
+        NONCLIENTMETRICSA ncm = {}; ncm.cbSize = sizeof(ncm);
+        SystemParametersInfoA(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
+        d->hFont = CreateFontIndirectA(&ncm.lfMessageFont);
+
+        int gap = S(8), bw = S(80), bh = S(26), lw = S(120), cw = S(160);
+
+        // Row 1 — Local Dimming
+        HWND hL1 = CreateWindowA("STATIC", "Local Dimming:",
+            WS_CHILD | WS_VISIBLE, gap, gap + S(4), lw, S(20), hwnd, nullptr, nullptr, nullptr);
+        SendMessageA(hL1, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+        HWND hC1 = CreateWindowExA(0, "COMBOBOX", nullptr,
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            gap + lw + gap, gap, cw, S(160), hwnd, (HMENU)IDC_PROF_DIM_COMBO, nullptr, nullptr);
+        SendMessageA(hC1, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+        {
+            struct { const char* label; int val; } dimItems[] = {
+                {"Global default", -1}, {"Off", 0}, {"Auto", 1},
+                {"Low", 2}, {"Standard", 3}, {"High", 4}
+            };
+            int selDim = 0;
+            for (int i = 0; i < 6; i++) {
+                int idx = (int)SendMessageA(hC1, CB_ADDSTRING, 0, (LPARAM)dimItems[i].label);
+                SendMessageA(hC1, CB_SETITEMDATA, idx, (LPARAM)(DWORD)dimItems[i].val);
+                if (dimItems[i].val == d->dimming) selDim = idx;
+            }
+            SendMessageA(hC1, CB_SETCURSEL, selDim, 0);
+        }
+
+        // Row 2 — Sharpness
+        int row2 = gap + S(36);
+        HWND hL2 = CreateWindowA("STATIC", "Sharpness:",
+            WS_CHILD | WS_VISIBLE, gap, row2 + S(4), lw, S(20), hwnd, nullptr, nullptr, nullptr);
+        SendMessageA(hL2, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+        HWND hC2 = CreateWindowExA(0, "COMBOBOX", nullptr,
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            gap + lw + gap, row2, cw, S(220), hwnd, (HMENU)IDC_PROF_SHARP_COMBO, nullptr, nullptr);
+        SendMessageA(hC2, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+        {
+            int idxG = (int)SendMessageA(hC2, CB_ADDSTRING, 0, (LPARAM)"Global default");
+            SendMessageA(hC2, CB_SETITEMDATA, idxG, (LPARAM)(DWORD)-1);
+            int selSharp = (d->sharpness == -1) ? 0 : 0;
+            for (int v = 0; v <= 100; v += 10) {
+                char buf[8]; snprintf(buf, sizeof(buf), "%d", v);
+                int idx = (int)SendMessageA(hC2, CB_ADDSTRING, 0, (LPARAM)buf);
+                SendMessageA(hC2, CB_SETITEMDATA, idx, (LPARAM)(DWORD)v);
+                if (v == d->sharpness) selSharp = idx;
+            }
+            SendMessageA(hC2, CB_SETCURSEL, selSharp, 0);
+        }
+
+        int y3 = row2 + S(36);
+        HWND hOk  = CreateWindowA("BUTTON", "OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+            gap,              y3, bw, bh, hwnd, (HMENU)IDC_PROF_OK,     nullptr, nullptr);
+        HWND hCan = CreateWindowA("BUTTON", "Cancel", WS_CHILD | WS_VISIBLE,
+            gap + bw + gap,   y3, bw, bh, hwnd, (HMENU)IDC_PROF_CANCEL, nullptr, nullptr);
+        SendMessageA(hOk,  WM_SETFONT, (WPARAM)d->hFont, FALSE);
+        SendMessageA(hCan, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDC_PROF_OK) {
+            HWND hC1 = GetDlgItem(hwnd, IDC_PROF_DIM_COMBO);
+            HWND hC2 = GetDlgItem(hwnd, IDC_PROF_SHARP_COMBO);
+            int s1 = (int)SendMessageA(hC1, CB_GETCURSEL, 0, 0);
+            int s2 = (int)SendMessageA(hC2, CB_GETCURSEL, 0, 0);
+            if (s1 != CB_ERR && s2 != CB_ERR) {
+                d->dimming   = (int)(DWORD)SendMessageA(hC1, CB_GETITEMDATA, s1, 0);
+                d->sharpness = (int)(DWORD)SendMessageA(hC2, CB_GETITEMDATA, s2, 0);
+                d->ok        = true;
+            }
+            DestroyWindow(hwnd);
+        } else if (LOWORD(wp) == IDC_PROF_CANCEL) {
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    case WM_CLOSE:   DestroyWindow(hwnd); return 0;
+    case WM_DESTROY:
+        if (d && d->hFont) DeleteObject(d->hFont);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+// Run ProfEditDlg modally (spin message loop until destroyed)
+static bool RunProfEditDialog(HWND parent, int& dimming, int& sharpness)
+{
+    ProfEditData data;
+    data.dimming   = dimming;
+    data.sharpness = sharpness;
+    data.ok        = false;
+    data.hFont     = nullptr;
+
+    HINSTANCE hInst = (HINSTANCE)GetModuleHandleA(nullptr);
+    typedef UINT(WINAPI* PFN_GetDpiForSystem)();
+    static auto pfnDpiSys = (PFN_GetDpiForSystem)GetProcAddress(GetModuleHandleA("user32.dll"), "GetDpiForSystem");
+    UINT dpi = pfnDpiSys ? pfnDpiSys() : 96;
+    int W = MulDiv(320, (int)dpi, 96);
+    int H = MulDiv(155, (int)dpi, 96);
+
+    HWND hw = CreateWindowExA(
+        WS_EX_TOPMOST,
+        "HDRAutostartProfEditDlg", "Profile settings",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT, W, H,
+        parent, nullptr, hInst, &data);
+    if (!hw) return false;
+    SetForegroundWindow(hw);
+    EnableWindow(parent, FALSE);
+    MSG m;
+    while (IsWindow(hw) && GetMessageA(&m, nullptr, 0, 0) > 0) {
+        TranslateMessage(&m);
+        DispatchMessageA(&m);
+    }
+    EnableWindow(parent, TRUE);
+    SetForegroundWindow(parent);
+    if (data.ok) { dimming = data.dimming; sharpness = data.sharpness; }
+    return data.ok;
+}
+
+// =============================================================================
+// Game Profiles dialog
+// =============================================================================
+#define IDC_PROF_LIST   420
+#define IDC_PROF_ADD    421
+#define IDC_PROF_REMOVE 422
+#define IDC_PROF_CLOSE  423
+#define IDC_PROF_EDIT   424
+
+struct ProfilesDlgData { HFONT hFont; };
+
+static void PopulateProfilesList(HWND lb)
+{
+    SendMessageA(lb, LB_RESETCONTENT, 0, 0);
+    EnterCriticalSection(&g_cfgLock);
+    for (auto& p : g_cfg.profiles) {
+        // Show basename for readability
+        const char* base = strrchr(p.exe.c_str(), '\\');
+        const char* name = base ? base + 1 : p.exe.c_str();
+        char dim_str[16], sharp_str[16];
+        if (p.localDimming < 0) snprintf(dim_str,   sizeof(dim_str),   "Global");
+        else                     snprintf(dim_str,   sizeof(dim_str),   "%d", p.localDimming);
+        if (p.sharpness < 0)    snprintf(sharp_str, sizeof(sharp_str), "Global");
+        else                     snprintf(sharp_str, sizeof(sharp_str), "%d", p.sharpness);
+        char entry[MAX_PATH + 64];
+        snprintf(entry, sizeof(entry), "%s  [Dim: %s | Sharp: %s]", name, dim_str, sharp_str);
+        SendMessageA(lb, LB_ADDSTRING, 0, (LPARAM)entry);
+    }
+    LeaveCriticalSection(&g_cfgLock);
+}
+
+static LRESULT CALLBACK ProfilesDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    ProfilesDlgData* d = (ProfilesDlgData*)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_CREATE: {
+        d = (ProfilesDlgData*)((CREATESTRUCTA*)lp)->lpCreateParams;
+        SetWindowLongPtrA(hwnd, GWLP_USERDATA, (LONG_PTR)d);
+
+        typedef UINT(WINAPI* PFN_GetDpiForWindow)(HWND);
+        static auto pfnDpi = (PFN_GetDpiForWindow)GetProcAddress(GetModuleHandleA("user32.dll"), "GetDpiForWindow");
+        UINT dpi = pfnDpi ? pfnDpi(hwnd) : 96;
+        auto S = [&](int v){ return MulDiv(v, (int)dpi, 96); };
+
+        NONCLIENTMETRICSA ncm = {}; ncm.cbSize = sizeof(ncm);
+        SystemParametersInfoA(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
+        d->hFont = CreateFontIndirectA(&ncm.lfMessageFont);
+
+        RECT rc; GetClientRect(hwnd, &rc);
+        int gap = S(8), bw = S(90), bh = S(28);
+        int lbH = rc.bottom - bh - gap * 3;
+
+        HWND lb = CreateWindowExA(WS_EX_CLIENTEDGE, "LISTBOX", nullptr,
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+            gap, gap, rc.right - gap * 2, lbH,
+            hwnd, (HMENU)IDC_PROF_LIST, nullptr, nullptr);
+        SendMessageA(lb, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+
+        int y = lbH + gap * 2;
+        HWND bAdd  = CreateWindowA("BUTTON", L->btnAdd,    WS_CHILD | WS_VISIBLE,
+            gap,                       y, bw, bh, hwnd, (HMENU)IDC_PROF_ADD,    nullptr, nullptr);
+        HWND bEdit = CreateWindowA("BUTTON", L == &kES ? "Editar" : "Edit", WS_CHILD | WS_VISIBLE,
+            gap + (bw + gap),          y, bw, bh, hwnd, (HMENU)IDC_PROF_EDIT,   nullptr, nullptr);
+        HWND bDel  = CreateWindowA("BUTTON", L->btnRemove, WS_CHILD | WS_VISIBLE,
+            gap + (bw + gap) * 2,      y, bw, bh, hwnd, (HMENU)IDC_PROF_REMOVE, nullptr, nullptr);
+        HWND bCls  = CreateWindowA("BUTTON", L->btnClose,  WS_CHILD | WS_VISIBLE,
+            rc.right - bw - gap,       y, bw, bh, hwnd, (HMENU)IDC_PROF_CLOSE,  nullptr, nullptr);
+        SendMessageA(bAdd,  WM_SETFONT, (WPARAM)d->hFont, FALSE);
+        SendMessageA(bEdit, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+        SendMessageA(bDel,  WM_SETFONT, (WPARAM)d->hFont, FALSE);
+        SendMessageA(bCls,  WM_SETFONT, (WPARAM)d->hFont, FALSE);
+
+        PopulateProfilesList(lb);
+        return 0;
+    }
+    case WM_COMMAND: {
+        HWND lb = GetDlgItem(hwnd, IDC_PROF_LIST);
+        if (LOWORD(wp) == IDC_PROF_ADD) {
+            // Pick an exe
+            char path[MAX_PATH] = {};
+            OPENFILENAMEA ofn = {};
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner   = hwnd;
+            ofn.lpstrFilter = "Executables\0*.exe\0All Files\0*.*\0";
+            ofn.lpstrFile   = path;
+            ofn.nMaxFile    = MAX_PATH;
+            ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+            if (GetOpenFileNameA(&ofn)) {
+                int dimming = -1, sharpness = -1;
+                if (RunProfEditDialog(hwnd, dimming, sharpness)) {
+                    GameProfile gp;
+                    gp.exe          = ToLower(std::string(path));
+                    gp.localDimming = dimming;
+                    gp.sharpness    = sharpness;
+                    EnterCriticalSection(&g_cfgLock);
+                    g_cfg.profiles.push_back(gp);
+                    LeaveCriticalSection(&g_cfgLock);
+                    SaveConfig();
+                    PopulateProfilesList(lb);
+                }
+            }
+        } else if (LOWORD(wp) == IDC_PROF_EDIT ||
+                   (LOWORD(wp) == IDC_PROF_LIST && HIWORD(wp) == LBN_DBLCLK)) {
+            int sel = (int)SendMessageA(lb, LB_GETCURSEL, 0, 0);
+            if (sel != LB_ERR) {
+                EnterCriticalSection(&g_cfgLock);
+                bool valid = sel < (int)g_cfg.profiles.size();
+                int dimming  = valid ? g_cfg.profiles[sel].localDimming : -1;
+                int sharpness = valid ? g_cfg.profiles[sel].sharpness   : -1;
+                LeaveCriticalSection(&g_cfgLock);
+                if (valid && RunProfEditDialog(hwnd, dimming, sharpness)) {
+                    EnterCriticalSection(&g_cfgLock);
+                    g_cfg.profiles[sel].localDimming = dimming;
+                    g_cfg.profiles[sel].sharpness    = sharpness;
+                    LeaveCriticalSection(&g_cfgLock);
+                    SaveConfig();
+                    PopulateProfilesList(lb);
+                    SendMessageA(lb, LB_SETCURSEL, sel, 0);
+                }
+            }
+        } else if (LOWORD(wp) == IDC_PROF_REMOVE) {
+            int sel = (int)SendMessageA(lb, LB_GETCURSEL, 0, 0);
+            if (sel != LB_ERR) {
+                EnterCriticalSection(&g_cfgLock);
+                if (sel < (int)g_cfg.profiles.size())
+                    g_cfg.profiles.erase(g_cfg.profiles.begin() + sel);
+                LeaveCriticalSection(&g_cfgLock);
+                SaveConfig();
+                PopulateProfilesList(lb);
+            }
+        } else if (LOWORD(wp) == IDC_PROF_CLOSE) {
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    }
+    case WM_CLOSE:   DestroyWindow(hwnd); return 0;
+    case WM_DESTROY:
+        if (d && d->hFont) DeleteObject(d->hFont);
+        delete d;
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+static void ShowProfilesDialog()
+{
+    ProfilesDlgData* data = new ProfilesDlgData{nullptr};
+    HINSTANCE hInst = (HINSTANCE)GetModuleHandleA(nullptr);
+
+    typedef UINT(WINAPI* PFN_GetDpiForSystem)();
+    static auto pfnDpiSys = (PFN_GetDpiForSystem)GetProcAddress(GetModuleHandleA("user32.dll"), "GetDpiForSystem");
+    UINT dpi = pfnDpiSys ? pfnDpiSys() : 96;
+    int W = MulDiv(640, (int)dpi, 96);
+    int H = MulDiv(460, (int)dpi, 96);
+
+    HWND hw = CreateWindowExA(
+        WS_EX_TOPMOST,
+        "HDRAutostartProfilesDlg", L->dlgProfiles,
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT, W, H,
+        nullptr, nullptr, hInst, data);
+    if (hw) SetForegroundWindow(hw);
+    else    delete data;
 }
 
 static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -1273,10 +1785,12 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
 
             // Local Dimming parent menu
-            int d, ds;
+            int d, ds, shdrv, ssdv;
             EnterCriticalSection(&g_cfgLock);
-            d  = g_cfg.ktcLocalDimming;
-            ds = g_cfg.ktcSdrLocalDimming;
+            d     = g_cfg.ktcLocalDimming;
+            ds    = g_cfg.ktcSdrLocalDimming;
+            shdrv = g_cfg.ktcSharpnessHdr;
+            ssdv  = g_cfg.ktcSharpnessSdr;
             LeaveCriticalSection(&g_cfgLock);
 
             HMENU sub = CreatePopupMenu();
@@ -1299,6 +1813,18 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             AppendMenuA(dimMenu, MF_POPUP, (UINT_PTR)sub,    L->menuKTC);
             AppendMenuA(dimMenu, MF_POPUP, (UINT_PTR)subSDR, L->menuKTCSDR);
             AppendMenuA(m, MF_POPUP, (UINT_PTR)dimMenu, L->menuLocalDimming);
+
+            // Sharpness submenu
+            char shdrLabel[64], ssdLabel[64];
+            snprintf(shdrLabel, sizeof(shdrLabel), "HDR (KTC): %d", shdrv);
+            snprintf(ssdLabel,  sizeof(ssdLabel),  "SDR (KTC): %d", ssdv);
+            HMENU sharpMenu = CreatePopupMenu();
+            AppendMenuA(sharpMenu, MF_STRING, ID_KTC_SHARP_HDR, shdrLabel);
+            AppendMenuA(sharpMenu, MF_STRING, ID_KTC_SHARP_SDR, ssdLabel);
+            AppendMenuA(m, MF_POPUP, (UINT_PTR)sharpMenu, L->menuSharpness);
+            AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
+
+            AppendMenuA(m, MF_STRING, ID_TRAY_PROFILES, L->menuProfiles);
             AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
 
             UINT startFlag = MF_STRING | (IsInStartup() ? MF_CHECKED : 0u);
@@ -1338,6 +1864,12 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case ID_KTC_SDR_LOW:      { EnterCriticalSection(&g_cfgLock); g_cfg.ktcSdrLocalDimming=2; LeaveCriticalSection(&g_cfgLock); SaveConfig(); } break;
         case ID_KTC_SDR_STANDARD: { EnterCriticalSection(&g_cfgLock); g_cfg.ktcSdrLocalDimming=3; LeaveCriticalSection(&g_cfgLock); SaveConfig(); } break;
         case ID_KTC_SDR_HIGH:     { EnterCriticalSection(&g_cfgLock); g_cfg.ktcSdrLocalDimming=4; LeaveCriticalSection(&g_cfgLock); SaveConfig(); } break;
+        case ID_KTC_SHARP_HDR:
+            ShowSharpnessDialog("Sharpness HDR (KTC)", &g_cfg.ktcSharpnessHdr); break;
+        case ID_KTC_SHARP_SDR:
+            ShowSharpnessDialog("Sharpness SDR (KTC)", &g_cfg.ktcSharpnessSdr); break;
+        case ID_TRAY_PROFILES:
+            ShowProfilesDialog(); break;
         case ID_TRAY_GITHUB:
             ShellExecuteA(nullptr, "open", "https://github.com/conecta6/HDRAutostart-W11", nullptr, nullptr, SW_SHOWNORMAL);
             break;
@@ -1401,6 +1933,24 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     wc2.lpszClassName = "HDRAutostartListDlg";  wc2.lpfnWndProc = ListDlgProc;
     wc2.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     RegisterClassExA(&wc2);
+
+    WNDCLASSEXA wc3 = {};
+    wc3.cbSize = sizeof(wc3);  wc3.hInstance = hInst;
+    wc3.lpszClassName = "HDRAutostartSharpDlg";  wc3.lpfnWndProc = SharpDlgProc;
+    wc3.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    RegisterClassExA(&wc3);
+
+    WNDCLASSEXA wc4 = {};
+    wc4.cbSize = sizeof(wc4);  wc4.hInstance = hInst;
+    wc4.lpszClassName = "HDRAutostartProfilesDlg";  wc4.lpfnWndProc = ProfilesDlgProc;
+    wc4.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    RegisterClassExA(&wc4);
+
+    WNDCLASSEXA wc5 = {};
+    wc5.cbSize = sizeof(wc5);  wc5.hInstance = hInst;
+    wc5.lpszClassName = "HDRAutostartProfEditDlg";  wc5.lpfnWndProc = ProfEditDlgProc;
+    wc5.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    RegisterClassExA(&wc5);
 
     g_trayWnd = CreateWindowExA(0, "HDRAutostartTray", "HDRAutostart", 0,
         0, 0, 0, 0, HWND_MESSAGE, nullptr, hInst, nullptr);
