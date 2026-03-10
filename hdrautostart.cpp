@@ -67,6 +67,7 @@ struct Lang {
     const char *menuSharpness;
     const char *profDimLabel, *profSharpLabel, *profExeLabel;
     const char *profDimDefault;
+    const char *menuKTCSettings;
 };
 
 static const Lang kES = {
@@ -80,7 +81,8 @@ static const Lang kES = {
     "Desactivado", "Auto", "Bajo", "Est\xe1ndar", "Alto",
     "GitHub",
     "Perfiles de juego...", "Perfiles de juego", "Nitidez (KTC)",
-    "Local Dimming:", "Nitidez (0-100):", "Ejecutable:", "Usar valor global"
+    "Local Dimming:", "Nitidez (0-100):", "Ejecutable:", "Usar valor global",
+    "Configuraci\xf3n KTC"
 };
 static const Lang kEN = {
     "Monitored folders...", "Always enable HDR...", "Never enable HDR...", "Exclude...",
@@ -93,7 +95,8 @@ static const Lang kEN = {
     "Off", "Auto", "Low", "Standard", "High",
     "GitHub",
     "Game profiles...", "Game profiles", "Sharpness (KTC)",
-    "Local Dimming:", "Sharpness (0-100):", "Executable:", "Global default"
+    "Local Dimming:", "Sharpness (0-100):", "Executable:", "Global default",
+    "KTC Settings"
 };
 static const Lang* L = &kEN;
 
@@ -1809,10 +1812,10 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             AppendMenuA(subSDR, MF_STRING | (ds==3?MF_CHECKED:0u), ID_KTC_SDR_STANDARD, L->ktcStd);
             AppendMenuA(subSDR, MF_STRING | (ds==4?MF_CHECKED:0u), ID_KTC_SDR_HIGH,     L->ktcHigh);
 
+            // Local Dimming submenu
             HMENU dimMenu = CreatePopupMenu();
             AppendMenuA(dimMenu, MF_POPUP, (UINT_PTR)sub,    L->menuKTC);
             AppendMenuA(dimMenu, MF_POPUP, (UINT_PTR)subSDR, L->menuKTCSDR);
-            AppendMenuA(m, MF_POPUP, (UINT_PTR)dimMenu, L->menuLocalDimming);
 
             // Sharpness submenu
             char shdrLabel[64], ssdLabel[64];
@@ -1821,10 +1824,14 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             HMENU sharpMenu = CreatePopupMenu();
             AppendMenuA(sharpMenu, MF_STRING, ID_KTC_SHARP_HDR, shdrLabel);
             AppendMenuA(sharpMenu, MF_STRING, ID_KTC_SHARP_SDR, ssdLabel);
-            AppendMenuA(m, MF_POPUP, (UINT_PTR)sharpMenu, L->menuSharpness);
-            AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
 
-            AppendMenuA(m, MF_STRING, ID_TRAY_PROFILES, L->menuProfiles);
+            // KTC Settings root submenu
+            HMENU ktcMenu = CreatePopupMenu();
+            AppendMenuA(ktcMenu, MF_POPUP,     (UINT_PTR)dimMenu,   L->menuLocalDimming);
+            AppendMenuA(ktcMenu, MF_POPUP,     (UINT_PTR)sharpMenu, L->menuSharpness);
+            AppendMenuA(ktcMenu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuA(ktcMenu, MF_STRING,    ID_TRAY_PROFILES,    L->menuProfiles);
+            AppendMenuA(m, MF_POPUP, (UINT_PTR)ktcMenu, L->menuKTCSettings);
             AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
 
             UINT startFlag = MF_STRING | (IsInStartup() ? MF_CHECKED : 0u);

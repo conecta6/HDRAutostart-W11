@@ -19,7 +19,9 @@ Windows 11 supports HDR, but it does not switch automatically. If you leave HDR 
 | **Whitelist** | Add individual `.exe` files that should always trigger HDR, regardless of their folder location. |
 | **Blacklist** | Add individual `.exe` files that should never trigger HDR (e.g. launchers inside game folders you don't want triggering HDR). |
 | **Exclude** | Completely ignore specific executables or entire folders. Excluded items are never scanned — no HDR, no KTC dimming. Useful for tools, utilities, or whole directories you never want to trigger anything. |
-| **KTC Local Dimming** | For KTC monitors with DDC/CI support: automatically control the Local Dimming level via the monitor's internal VCP command when HDR activates. Off by default — safe to use on any monitor. |
+| **KTC Local Dimming** | For KTC monitors with DDC/CI support: automatically control the Local Dimming level (VCP 0xF4) when HDR switches on or off. Separate settings for HDR and SDR modes. Off by default — safe on any monitor. |
+| **KTC Sharpness** | Automatically set monitor sharpness (VCP 0x57) when HDR activates or deactivates. Configurable from 0 to 100 in steps of 10. Default: 60. |
+| **Game profiles** | Assign per-game Local Dimming and Sharpness overrides to specific executables. When the game closes, standard global values are restored automatically. |
 | **Run at startup** | One-click option to launch HDRAutostart with Windows. |
 | **System tray** | Runs silently in the background. Orange icon = HDR active, grey icon = HDR inactive. Right-click for the menu. |
 
@@ -65,7 +67,17 @@ Useful for tools, benchmarks, or secondary launchers you never want HDRAutostart
 
 > **Note:** Common platform launchers (Steam, GOG Galaxy, Epic, Xbox, Ubisoft Connect, EA App) are always excluded automatically and do not need to be added manually.
 
-#### KTC Local Dimming (KTC monitors only)
+---
+
+### KTC Settings (KTC monitors only)
+
+All KTC-specific options are grouped under:
+
+> Right-click tray icon → **KTC Settings**
+
+This submenu contains Local Dimming, Sharpness, and Game Profiles.
+
+#### Local Dimming
 
 HDRAutostart sends DDC/CI commands to KTC monitors to control Local Dimming automatically when HDR switches on or off. There are two independent settings — one for each mode:
 
@@ -79,8 +91,6 @@ HDRAutostart sends DDC/CI commands to KTC monitors to control Local Dimming auto
 | **Standard** | 3 | Standard Local Dimming |
 | **High** | 4 | Maximum Local Dimming — recommended for HDR gaming on KTC |
 
-> Right-click tray icon → **Local Dimming HDR (KTC)**
-
 **Local Dimming SDR (KTC)** — level applied when HDR is deactivated (normal desktop, SDR use):
 
 | Setting | VCP value | Description |
@@ -91,9 +101,32 @@ HDRAutostart sends DDC/CI commands to KTC monitors to control Local Dimming auto
 | **Standard** | 3 | Standard Local Dimming |
 | **High** | 4 | Maximum Local Dimming |
 
-> Right-click tray icon → **Local Dimming SDR (KTC)**
-
 Both settings are independent so you can, for example, use **High** for HDR gaming and **Auto** (or **Off**) for normal desktop use.
+
+> KTC Settings → **Local Dimming** → HDR (KTC) / SDR (KTC)
+
+#### Sharpness
+
+Automatically sets the monitor's sharpness level (VCP 0x57) via DDC/CI when HDR activates or deactivates. Two independent values — one for HDR mode and one for SDR mode. Select from 0 to 100 in steps of 10, or **Off** to send no command.
+
+| Setting | Description |
+|---|---|
+| **Off** | No DDC sharpness commands sent. |
+| **0 – 100** | Sharpness level sent to the monitor. Default: **60**. |
+
+> KTC Settings → **Sharpness (KTC)** → HDR (KTC) / SDR (KTC)
+
+#### Game profiles
+
+Assign per-game Local Dimming and Sharpness overrides to specific executables. When that game launches, the profile values are applied instead of the global KTC settings. When the game closes, the global standard values are automatically restored.
+
+- **Add** — pick a `.exe` file, then choose Local Dimming and Sharpness overrides (or **Global default** to inherit the global setting).
+- **Edit** — select a profile and click Edit (or double-click) to modify its values.
+- **Remove** — delete the selected profile.
+
+> KTC Settings → **Game profiles…**
+
+---
 
 ### Supported browsers (fullscreen detection)
 
@@ -142,7 +175,9 @@ Windows 11 soporta HDR, pero no lo activa automáticamente. Si dejas el HDR siem
 | **Lista blanca** | Agrega archivos `.exe` individuales que siempre deben activar el HDR, independientemente de su carpeta. |
 | **Lista negra** | Agrega archivos `.exe` individuales que nunca deben activar el HDR (p. ej. launchers dentro de carpetas de juegos que no quieres que disparen el HDR). |
 | **Excluir** | Ignora completamente ejecutables concretos o carpetas enteras. Los elementos excluidos no se procesan en absoluto — sin HDR, sin KTC dimming. Útil para herramientas, utilidades o directorios enteros que nunca quieres que disparen nada. |
-| **Local Dimming KTC** | Para monitores KTC con soporte DDC/CI: controla automáticamente el nivel de Local Dimming del monitor mediante su comando VCP interno cuando el HDR se activa. Desactivado por defecto — seguro en cualquier monitor. |
+| **Local Dimming KTC** | Para monitores KTC con soporte DDC/CI: controla automáticamente el nivel de Local Dimming (VCP 0xF4) cuando el HDR se activa o desactiva. Ajustes independientes para modo HDR y SDR. Desactivado por defecto — seguro en cualquier monitor. |
+| **Nitidez KTC** | Ajusta automáticamente la nitidez del monitor (VCP 0x57) al activar o desactivar el HDR. Configurable de 0 a 100 en saltos de 10. Valor por defecto: 60. |
+| **Perfiles de juego** | Asigna valores personalizados de Local Dimming y Nitidez a ejecutables específicos. Al cerrar el juego, se restauran automáticamente los valores globales estándar. |
 | **Ejecutar al inicio** | Opción con un clic para lanzar HDRAutostart con Windows. |
 | **Bandeja del sistema** | Se ejecuta silenciosamente en segundo plano. Icono naranja = HDR activo, icono gris = HDR inactivo. Clic derecho para el menú. |
 
@@ -188,7 +223,17 @@ Ignora completamente ejecutables concretos o carpetas enteras — los elementos 
 
 > **Nota:** Los launchers de las plataformas principales (Steam, GOG Galaxy, Epic, Xbox, Ubisoft Connect, EA App) se excluyen automáticamente y no es necesario agregarlos.
 
-#### Local Dimming KTC (solo monitores KTC)
+---
+
+### Configuración KTC (solo monitores KTC)
+
+Todas las opciones específicas de KTC están agrupadas en:
+
+> Clic derecho en el icono de bandeja → **Configuración KTC**
+
+Este submenú contiene Local Dimming, Nitidez y Perfiles de juego.
+
+#### Local Dimming
 
 HDRAutostart envía comandos DDC/CI a los monitores KTC para controlar el Local Dimming automáticamente cada vez que el HDR se activa o desactiva. Hay dos ajustes independientes, uno para cada modo:
 
@@ -202,8 +247,6 @@ HDRAutostart envía comandos DDC/CI a los monitores KTC para controlar el Local 
 | **Estándar** | 3 | Local Dimming estándar |
 | **Alto** | 4 | Local Dimming máximo — recomendado para jugar en HDR en KTC |
 
-> Clic derecho en el icono de bandeja → **Local Dimming HDR (KTC)**
-
 **Local Dimming SDR (KTC)** — nivel que se aplica cuando el HDR se desactiva (escritorio normal, uso en SDR):
 
 | Ajuste | Valor VCP | Descripción |
@@ -214,9 +257,32 @@ HDRAutostart envía comandos DDC/CI a los monitores KTC para controlar el Local 
 | **Estándar** | 3 | Local Dimming estándar |
 | **Alto** | 4 | Local Dimming máximo |
 
-> Clic derecho en el icono de bandeja → **Local Dimming SDR (KTC)**
-
 Ambos ajustes son independientes, por lo que puedes usar, por ejemplo, **Alto** para jugar en HDR y **Auto** (o **Desactivado**) para el uso normal del escritorio.
+
+> Configuración KTC → **Local Dimming** → HDR (KTC) / SDR (KTC)
+
+#### Nitidez
+
+Ajusta automáticamente el nivel de nitidez del monitor (VCP 0x57) vía DDC/CI al activar o desactivar el HDR. Dos valores independientes — uno para modo HDR y otro para modo SDR. Seleccionable de 0 a 100 en saltos de 10, o **Desactivado** para no enviar ningún comando.
+
+| Ajuste | Descripción |
+|---|---|
+| **Desactivado** | No se envían comandos de nitidez DDC. |
+| **0 – 100** | Nivel de nitidez enviado al monitor. Por defecto: **60**. |
+
+> Configuración KTC → **Nitidez (KTC)** → HDR (KTC) / SDR (KTC)
+
+#### Perfiles de juego
+
+Asigna valores personalizados de Local Dimming y Nitidez a ejecutables específicos. Cuando ese juego se lanza, se aplican los valores del perfil en lugar de los ajustes globales de KTC. Al cerrar el juego, se restauran automáticamente los valores globales estándar.
+
+- **Agregar** — selecciona un archivo `.exe` y elige los valores de Local Dimming y Nitidez (o **Usar valor global** para heredar el ajuste global).
+- **Editar** — selecciona un perfil y haz clic en Editar (o doble clic) para modificar sus valores.
+- **Eliminar** — borra el perfil seleccionado.
+
+> Configuración KTC → **Perfiles de juego…**
+
+---
 
 ### Navegadores compatibles (detección pantalla completa)
 
