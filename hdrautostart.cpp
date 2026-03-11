@@ -1071,6 +1071,8 @@ static DWORD WINAPI MonitorThread(LPVOID)
             sSharp = g_cfg.ktcSharpnessSdr;
             g_hdrSource[0] = '\0';
             LeaveCriticalSection(&g_cfgLock);
+            // Wait for monitor to stabilize after HDR→SDR transition
+            Sleep(500);
             // Restore dimming if any was sent this session (from global OR from a profile)
             if (dimSentForHdr) {
                 if (!sdrGames.empty() && sDim > 0) {
