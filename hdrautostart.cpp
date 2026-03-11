@@ -122,8 +122,9 @@ struct Config {
     std::vector<std::string> exclude;    // completely ignored — no HDR, no KTC dimming
     int    ktcLocalDimming    = 0;  // 0=Off(default) 1=Auto 2=Low 3=Std 4=High  (juegos HDR)
     int    ktcSdrLocalDimming = 0;  // 0=Off(default) 1=Auto 2=Low 3=Std 4=High  (juegos blacklist/SDR)
-    int    ktcSharpnessHdr    = 6;  // -1=off, 0-10 (VCP 0x87 on KTC)
-    int    ktcSharpnessSdr    = 6;  // -1=off, 0-10 (VCP 0x87 on KTC)
+    int    ktcSharpnessHdr     = 6;  // -1=off, 0-10 (VCP 0x87 on KTC) — applied when HDR activates
+    int    ktcSharpnessSdr     = 6;  // -1=off, 0-10 (VCP 0x87 on KTC) — applied during SDR dimming games
+    int    ktcSharpnessDesktop = 6;  // -1=off, 0-10 (VCP 0x87 on KTC) — restored when all fullscreen ends
     time_t lastUpdateAttempt  = 0;  // unix timestamp of last auto-update trigger (anti-loop)
     std::vector<GameProfile> profiles;
 };
@@ -171,8 +172,9 @@ static void SaveConfig()
     fprintf(f, "[settings]\n");
     fprintf(f, "ktc_local_dimming=%d\n",     g_cfg.ktcLocalDimming);
     fprintf(f, "ktc_sdr_local_dimming=%d\n", g_cfg.ktcSdrLocalDimming);
-    fprintf(f, "ktc_sharpness_hdr=%d\n", g_cfg.ktcSharpnessHdr);
-    fprintf(f, "ktc_sharpness_sdr=%d\n", g_cfg.ktcSharpnessSdr);
+    fprintf(f, "ktc_sharpness_hdr=%d\n",     g_cfg.ktcSharpnessHdr);
+    fprintf(f, "ktc_sharpness_sdr=%d\n",     g_cfg.ktcSharpnessSdr);
+    fprintf(f, "ktc_sharpness_desktop=%d\n", g_cfg.ktcSharpnessDesktop);
     if (g_cfg.lastUpdateAttempt)
         fprintf(f, "last_update_attempt=%lld\n", (long long)g_cfg.lastUpdateAttempt);
     fprintf(f, "[folders]\n");
@@ -275,6 +277,10 @@ static void LoadConfig()
                 int v = atoi(line + 18);
                 if (v > 10 && v <= 100 && (v % 10) == 0) v /= 10;  // migrate old 0-100 configs
                 if (v >= -1 && v <= 10) g_cfg.ktcSharpnessSdr = v;
+            }
+            if (strncmp(line, "ktc_sharpness_desktop=", 22) == 0) {
+                int v = atoi(line + 22);
+                if (v >= -1 && v <= 10) g_cfg.ktcSharpnessDesktop = v;
             }
             if (strncmp(line, "last_update_attempt=", 20) == 0)
                 g_cfg.lastUpdateAttempt = (time_t)atoll(line + 20);
@@ -1065,10 +1071,11 @@ static DWORD WINAPI MonitorThread(LPVOID)
         if (games.empty() && hdrActive) {
             Log("All HDR games closed — disabling HDR");
             SetHDR(false);
-            int sDim, sSharp;
+            int sDim, sSharp, sDeskSharp;
             EnterCriticalSection(&g_cfgLock);
-            sDim   = g_cfg.ktcSdrLocalDimming;
-            sSharp = g_cfg.ktcSharpnessSdr;
+            sDim       = g_cfg.ktcSdrLocalDimming;
+            sSharp     = g_cfg.ktcSharpnessSdr;
+            sDeskSharp = g_cfg.ktcSharpnessDesktop;
             g_hdrSource[0] = '\0';
             LeaveCriticalSection(&g_cfgLock);
             // Wait for monitor to stabilize after HDR→SDR transition
@@ -1084,7 +1091,8 @@ static DWORD WINAPI MonitorThread(LPVOID)
                 dimSentForHdr = false;
             }
             if (sharpSentForHdr) {
-                SetKTCSharpness(sSharp);
+                // Restore desktop sharpness (or SDR if SDR games still running)
+                SetKTCSharpness(sdrGames.empty() ? sDeskSharp : sSharp);
                 sharpSentForHdr = false;
             }
             hdrActive = false;
@@ -1213,7 +1221,7 @@ static DWORD WINAPI MonitorThread(LPVOID)
     // Shutdown cleanup
     if (hdrActive) {
         SetHDR(false);
-        int sh; EnterCriticalSection(&g_cfgLock); sh=g_cfg.ktcSharpnessSdr; LeaveCriticalSection(&g_cfgLock);
+        int sh; EnterCriticalSection(&g_cfgLock); sh=g_cfg.ktcSharpnessDesktop; LeaveCriticalSection(&g_cfgLock);
         if (dimSentForHdr)   SetKTCLocalDimming(1);
         if (sharpSentForHdr) SetKTCSharpness(sh);
         if (g_trayWnd) PostMessage(g_trayWnd, WM_HDRSTATUS, 0, 0);
@@ -1582,8 +1590,9 @@ cleanup:
 #define ID_TRAY_EXIT      204
 #define ID_TRAY_GITHUB    205
 #define ID_TRAY_PROFILES  207
-#define ID_KTC_SHARP_HDR  320
-#define ID_KTC_SHARP_SDR  321
+#define ID_KTC_SHARP_HDR   320
+#define ID_KTC_SHARP_SDR   321
+#define ID_KTC_SHARP_DESK  322
 #define ID_KTC_OFF          299
 #define ID_KTC_AUTO         300
 #define ID_KTC_LOW          301
@@ -1650,7 +1659,7 @@ static void CheckBrowserHDR()
     } else if (!isFS && g_browserHdrOn) {
         Log("Browser left fullscreen — disabling HDR");
         SetHDR(false);
-        { int d, sh; EnterCriticalSection(&g_cfgLock); d=g_cfg.ktcLocalDimming; sh=g_cfg.ktcSharpnessSdr; LeaveCriticalSection(&g_cfgLock); if(d>0) SetKTCLocalDimming(1); SetKTCSharpness(sh); }
+        { int d, sh; EnterCriticalSection(&g_cfgLock); d=g_cfg.ktcLocalDimming; sh=g_cfg.ktcSharpnessDesktop; LeaveCriticalSection(&g_cfgLock); if(d>0) SetKTCLocalDimming(1); SetKTCSharpness(sh); }
         g_hdrSource[0] = '\0';
         g_browserHdrOn = false;
         UpdateTray(false);
@@ -2141,12 +2150,13 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
 
             // Local Dimming parent menu
-            int d, ds, shdrv, ssdv;
+            int d, ds, shdrv, ssdv, sdeskv;
             EnterCriticalSection(&g_cfgLock);
-            d     = g_cfg.ktcLocalDimming;
-            ds    = g_cfg.ktcSdrLocalDimming;
-            shdrv = g_cfg.ktcSharpnessHdr;
-            ssdv  = g_cfg.ktcSharpnessSdr;
+            d      = g_cfg.ktcLocalDimming;
+            ds     = g_cfg.ktcSdrLocalDimming;
+            shdrv  = g_cfg.ktcSharpnessHdr;
+            ssdv   = g_cfg.ktcSharpnessSdr;
+            sdeskv = g_cfg.ktcSharpnessDesktop;
             LeaveCriticalSection(&g_cfgLock);
 
             HMENU sub = CreatePopupMenu();
@@ -2171,12 +2181,14 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             AppendMenuA(dimMenu, MF_POPUP, (UINT_PTR)subSDR, L->menuKTCSDR);
 
             // Sharpness submenu
-            char shdrLabel[64], ssdLabel[64];
-            snprintf(shdrLabel, sizeof(shdrLabel), "HDR (KTC): %d", shdrv);
-            snprintf(ssdLabel,  sizeof(ssdLabel),  "SDR (KTC): %d", ssdv);
+            char shdrLabel[64], ssdLabel[64], sdeskLabel[64];
+            snprintf(shdrLabel,  sizeof(shdrLabel),  "HDR (KTC): %d",     shdrv);
+            snprintf(ssdLabel,   sizeof(ssdLabel),   "SDR (KTC): %d",     ssdv);
+            snprintf(sdeskLabel, sizeof(sdeskLabel),  "Desktop (KTC): %d", sdeskv);
             HMENU sharpMenu = CreatePopupMenu();
-            AppendMenuA(sharpMenu, MF_STRING, ID_KTC_SHARP_HDR, shdrLabel);
-            AppendMenuA(sharpMenu, MF_STRING, ID_KTC_SHARP_SDR, ssdLabel);
+            AppendMenuA(sharpMenu, MF_STRING, ID_KTC_SHARP_HDR,  shdrLabel);
+            AppendMenuA(sharpMenu, MF_STRING, ID_KTC_SHARP_SDR,  ssdLabel);
+            AppendMenuA(sharpMenu, MF_STRING, ID_KTC_SHARP_DESK, sdeskLabel);
 
             // KTC Settings root submenu
             HMENU ktcMenu = CreatePopupMenu();
@@ -2228,6 +2240,8 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             ShowSharpnessDialog("Sharpness HDR (KTC)", &g_cfg.ktcSharpnessHdr); break;
         case ID_KTC_SHARP_SDR:
             ShowSharpnessDialog("Sharpness SDR (KTC)", &g_cfg.ktcSharpnessSdr); break;
+        case ID_KTC_SHARP_DESK:
+            ShowSharpnessDialog("Sharpness Desktop (KTC)", &g_cfg.ktcSharpnessDesktop); break;
         case ID_TRAY_PROFILES:
             ShowProfilesDialog(); break;
         case ID_TRAY_GITHUB:
