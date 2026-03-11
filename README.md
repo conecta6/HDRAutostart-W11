@@ -71,6 +71,8 @@ Useful for tools, benchmarks, or secondary launchers you never want HDRAutostart
 
 ### KTC Settings (KTC monitors only)
 
+> **Note for non-KTC users:** These features exist solely because KTC is the monitor the developer uses. They are completely optional. If you ignore the KTC Settings submenu entirely, HDR auto-switching works normally on any HDR-capable monitor or TV.
+
 All KTC-specific options are grouped under:
 
 > Right-click tray icon → **KTC Settings**
@@ -226,6 +228,8 @@ Ignora completamente ejecutables concretos o carpetas enteras — los elementos 
 ---
 
 ### Configuración KTC (solo monitores KTC)
+
+> **Nota para usuarios sin monitor KTC:** Estas funciones existen únicamente porque KTC es el monitor que usa el desarrollador. Son completamente opcionales. Si ignoras el submenú Configuración KTC, el cambio automático de HDR funciona con normalidad en cualquier monitor o televisor compatible con HDR.
 
 Todas las opciones específicas de KTC están agrupadas en:
 
