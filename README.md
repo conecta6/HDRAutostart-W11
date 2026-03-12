@@ -36,6 +36,38 @@ Windows 11 supports HDR, but it does not switch automatically. If you leave HDR 
 
 All settings are stored in `hdrautostart.ini` next to the executable.
 
+#### Tray menu reference
+
+The tray menu currently contains these entries:
+
+    HDRAutostart vX.Y.Z              (informational header, disabled)
+    Monitored folders...
+    Always enable HDR...
+    Never enable HDR...
+    Exclude...
+    KTC Settings
+      Local Dimming
+        HDR (KTC)
+          Off / Auto / Low / Standard / High
+        SDR (KTC)
+          Off / Auto / Low / Standard / High
+      Sharpness (KTC)
+        HDR (KTC): <current value>
+        SDR (KTC): <current value>
+        Desktop (KTC): <current value>
+      Game profiles...
+    Run at startup                   (checked when enabled)
+    GitHub
+    Exit
+
+- `Monitored folders...`, `Always enable HDR...`, `Never enable HDR...`, and `Exclude...` open the corresponding list dialogs.
+- `KTC Settings -> Local Dimming` stores the selected HDR and SDR dimming mode, showing a check mark on the active value.
+- `KTC Settings -> Sharpness (KTC)` shows the current HDR, SDR, and Desktop sharpness values and opens the value picker for each one.
+- `KTC Settings -> Game profiles...` opens the per-game override manager.
+- `Run at startup` toggles Windows startup registration.
+- `GitHub` opens the project repository in your browser.
+- `Exit` closes HDRAutostart.
+
 #### Monitored folders
 
 HDRAutostart comes pre-configured with your Steam library path (read from the registry). Any `.exe` that launches from inside a monitored folder will trigger HDR. You can add GOG, Epic, or any custom game folder.
@@ -193,6 +225,38 @@ Windows 11 soporta HDR, pero no lo activa automáticamente. Si dejas el HDR siem
 ### Configuración
 
 Todos los ajustes se guardan en `hdrautostart.ini` junto al ejecutable.
+
+#### Arbol del menu de bandeja
+
+El menu de la bandeja contiene actualmente estas opciones:
+
+    HDRAutostart vX.Y.Z              (cabecera informativa, deshabilitada)
+    Carpetas monitoreadas...
+    Activar HDR siempre...
+    Nunca activar HDR...
+    Excluir...
+    Configuracion KTC
+      Local Dimming
+        HDR (KTC)
+          Desactivado / Auto / Bajo / Estandar / Alto
+        SDR (KTC)
+          Desactivado / Auto / Bajo / Estandar / Alto
+      Nitidez (KTC)
+        HDR (KTC): <valor actual>
+        SDR (KTC): <valor actual>
+        Desktop (KTC): <valor actual>
+      Perfiles de juego...
+    Ejecutar al inicio               (con marca cuando esta activado)
+    GitHub
+    Salir
+
+- `Carpetas monitoreadas...`, `Activar HDR siempre...`, `Nunca activar HDR...` y `Excluir...` abren sus dialogos de lista correspondientes.
+- `Configuracion KTC -> Local Dimming` guarda el modo de dimming seleccionado para HDR y SDR, mostrando una marca en la opcion activa.
+- `Configuracion KTC -> Nitidez (KTC)` muestra los valores actuales de nitidez para HDR, SDR y Desktop, y abre el selector de valor para cada uno.
+- `Configuracion KTC -> Perfiles de juego...` abre el gestor de perfiles por juego.
+- `Ejecutar al inicio` activa o desactiva el arranque con Windows.
+- `GitHub` abre el repositorio del proyecto en el navegador.
+- `Salir` cierra HDRAutostart.
 
 #### Carpetas monitoreadas
 
