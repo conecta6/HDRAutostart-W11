@@ -192,6 +192,15 @@ static void SaveConfig()
     fclose(f);
 }
 
+static bool ParseSharpnessValue(const char* text, int& value)
+{
+    int v = atoi(text);
+    if (v > 10 && v <= 100 && (v % 10) == 0) v /= 10;  // migrate old 0-100 configs
+    if (v < -1 || v > 10) return false;
+    value = v;
+    return true;
+}
+
 static void LoadConfig()
 {
     // Detect Steam default path
@@ -247,6 +256,7 @@ static void LoadConfig()
 
     enum Section { SEC_NONE, SEC_SETTINGS, SEC_FOLDERS, SEC_WHITELIST, SEC_BLACKLIST, SEC_EXCLUDE, SEC_PROFILES };
     Section sec = SEC_NONE;
+    bool sawDesktopSharpness = false;
     char line[MAX_PATH];
     while (fgets(line, sizeof(line), f)) {
         size_t n = strlen(line);
@@ -269,18 +279,19 @@ static void LoadConfig()
                 if (v >= 1 && v <= 4) g_cfg.ktcSdrLocalDimming = v;
             }
             if (strncmp(line, "ktc_sharpness_hdr=", 18) == 0) {
-                int v = atoi(line + 18);
-                if (v > 10 && v <= 100 && (v % 10) == 0) v /= 10;  // migrate old 0-100 configs
-                if (v >= -1 && v <= 10) g_cfg.ktcSharpnessHdr = v;
+                int v = 0;
+                if (ParseSharpnessValue(line + 18, v)) g_cfg.ktcSharpnessHdr = v;
             }
             if (strncmp(line, "ktc_sharpness_sdr=", 18) == 0) {
-                int v = atoi(line + 18);
-                if (v > 10 && v <= 100 && (v % 10) == 0) v /= 10;  // migrate old 0-100 configs
-                if (v >= -1 && v <= 10) g_cfg.ktcSharpnessSdr = v;
+                int v = 0;
+                if (ParseSharpnessValue(line + 18, v)) g_cfg.ktcSharpnessSdr = v;
             }
             if (strncmp(line, "ktc_sharpness_desktop=", 22) == 0) {
-                int v = atoi(line + 22);
-                if (v >= -1 && v <= 10) g_cfg.ktcSharpnessDesktop = v;
+                int v = 0;
+                if (ParseSharpnessValue(line + 22, v)) {
+                    g_cfg.ktcSharpnessDesktop = v;
+                    sawDesktopSharpness = true;
+                }
             }
             if (strncmp(line, "last_update_attempt=", 20) == 0)
                 g_cfg.lastUpdateAttempt = (time_t)atoll(line + 20);
@@ -310,7 +321,16 @@ static void LoadConfig()
         }
     }
     fclose(f);
-    if (g_cfg.folders.empty()) { g_cfg.folders.push_back(steam); SaveConfig(); }
+    bool needSave = false;
+    if (!sawDesktopSharpness) {
+        g_cfg.ktcSharpnessDesktop = g_cfg.ktcSharpnessSdr;
+        needSave = true;
+    }
+    if (g_cfg.folders.empty()) {
+        g_cfg.folders.push_back(steam);
+        needSave = true;
+    }
+    if (needSave) SaveConfig();
 }
 
 // =============================================================================
@@ -673,6 +693,16 @@ static void SetKTCSharpness(int level)
     if (level < 0) return;
     Log("KTC Sharpness -> %d (VCP 0x87)", level);
     SetKTCVCP(0x87, level);
+}
+
+static void RestoreKTCSharpnessAfterHdrTransition(int level)
+{
+    if (level < 0) return;
+    // Some monitors ignore the first DDC write while finishing the HDR -> SDR switch.
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        if (attempt) Sleep(300);
+        SetKTCSharpness(level);
+    }
 }
 
 // =============================================================================
@@ -1095,7 +1125,7 @@ static DWORD WINAPI MonitorThread(LPVOID)
                 // explicitly set on entry, so always restore the target mode.
                 int restoreSharpness = sdrGames.empty() ? sDeskSharp : sSharp;
                 if (restoreSharpness >= 0 || sharpSentForHdr) {
-                    SetKTCSharpness(restoreSharpness);
+                    RestoreKTCSharpnessAfterHdrTransition(restoreSharpness);
                     sharpSentForHdr = false;
                 }
             }
@@ -1108,8 +1138,9 @@ static DWORD WINAPI MonitorThread(LPVOID)
             int sDim, sSharp;
             EnterCriticalSection(&g_cfgLock);
             sDim   = g_cfg.ktcSdrLocalDimming;
-            sSharp = g_cfg.ktcSharpnessSdr;
+            sSharp = g_cfg.ktcSharpnessDesktop;
             LeaveCriticalSection(&g_cfgLock);
+            if (sDim <= 0 && sSharp >= 0) SetKTCSharpness(sSharp);
             if (sDim > 0) { Log("All SDR games closed — reset dimming"); SetKTCLocalDimming(1); SetKTCSharpness(sSharp); }
             sdrDimmingActive = false;
         }
@@ -1228,11 +1259,11 @@ static DWORD WINAPI MonitorThread(LPVOID)
         int sh; EnterCriticalSection(&g_cfgLock); sh=g_cfg.ktcSharpnessDesktop; LeaveCriticalSection(&g_cfgLock);
         Sleep(500);
         if (dimSentForHdr)   SetKTCLocalDimming(1);
-        if (sh >= 0 || sharpSentForHdr) SetKTCSharpness(sh);
+        if (sh >= 0 || sharpSentForHdr) RestoreKTCSharpnessAfterHdrTransition(sh);
         if (g_trayWnd) PostMessage(g_trayWnd, WM_HDRSTATUS, 0, 0);
     }
     if (sdrDimmingActive) {
-        int d, sh; EnterCriticalSection(&g_cfgLock); d=g_cfg.ktcSdrLocalDimming; sh=g_cfg.ktcSharpnessSdr; LeaveCriticalSection(&g_cfgLock);
+        int d, sh; EnterCriticalSection(&g_cfgLock); d=g_cfg.ktcSdrLocalDimming; sh=g_cfg.ktcSharpnessDesktop; LeaveCriticalSection(&g_cfgLock);
         if (d > 0) { SetKTCLocalDimming(1); SetKTCSharpness(sh); }
     }
     for (auto& kv : games)    CloseHandle(kv.second);
@@ -1675,7 +1706,7 @@ static void CheckBrowserHDR()
             // after the monitor finishes the HDR -> SDR transition.
             Sleep(500);
             if (d > 0) SetKTCLocalDimming(1);
-            SetKTCSharpness(sh);
+            RestoreKTCSharpnessAfterHdrTransition(sh);
         }
         g_hdrSource[0] = '\0';
         g_browserHdrOn = false;
