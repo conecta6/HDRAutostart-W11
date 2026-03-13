@@ -1090,10 +1090,14 @@ static DWORD WINAPI MonitorThread(LPVOID)
                 }
                 dimSentForHdr = false;
             }
-            if (sharpSentForHdr) {
-                // Restore desktop sharpness (or SDR if SDR games still running)
-                SetKTCSharpness(sdrGames.empty() ? sDeskSharp : sSharp);
-                sharpSentForHdr = false;
+            {
+                // HDR -> SDR can reset VCP 0x87 even when HDR sharpness was not
+                // explicitly set on entry, so always restore the target mode.
+                int restoreSharpness = sdrGames.empty() ? sDeskSharp : sSharp;
+                if (restoreSharpness >= 0 || sharpSentForHdr) {
+                    SetKTCSharpness(restoreSharpness);
+                    sharpSentForHdr = false;
+                }
             }
             hdrActive = false;
             if (g_trayWnd) PostMessage(g_trayWnd, WM_HDRSTATUS, 0, 0);
@@ -1222,8 +1226,9 @@ static DWORD WINAPI MonitorThread(LPVOID)
     if (hdrActive) {
         SetHDR(false);
         int sh; EnterCriticalSection(&g_cfgLock); sh=g_cfg.ktcSharpnessDesktop; LeaveCriticalSection(&g_cfgLock);
+        Sleep(500);
         if (dimSentForHdr)   SetKTCLocalDimming(1);
-        if (sharpSentForHdr) SetKTCSharpness(sh);
+        if (sh >= 0 || sharpSentForHdr) SetKTCSharpness(sh);
         if (g_trayWnd) PostMessage(g_trayWnd, WM_HDRSTATUS, 0, 0);
     }
     if (sdrDimmingActive) {
@@ -1659,7 +1664,19 @@ static void CheckBrowserHDR()
     } else if (!isFS && g_browserHdrOn) {
         Log("Browser left fullscreen — disabling HDR");
         SetHDR(false);
-        { int d, sh; EnterCriticalSection(&g_cfgLock); d=g_cfg.ktcLocalDimming; sh=g_cfg.ktcSharpnessDesktop; LeaveCriticalSection(&g_cfgLock); if(d>0) SetKTCLocalDimming(1); SetKTCSharpness(sh); }
+        {
+            int d, sh;
+            EnterCriticalSection(&g_cfgLock);
+            d  = g_cfg.ktcLocalDimming;
+            sh = g_cfg.ktcSharpnessDesktop;
+            LeaveCriticalSection(&g_cfgLock);
+
+            // Match the game path so the desktop sharpness command is sent
+            // after the monitor finishes the HDR -> SDR transition.
+            Sleep(500);
+            if (d > 0) SetKTCLocalDimming(1);
+            SetKTCSharpness(sh);
+        }
         g_hdrSource[0] = '\0';
         g_browserHdrOn = false;
         UpdateTray(false);
