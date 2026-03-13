@@ -49,7 +49,7 @@ extern "C" {
 #pragma comment(lib, "urlmon.lib")
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")
 
-#define APP_VERSION "0.20"
+#define APP_VERSION "0.22"
 
 // =============================================================================
 // Localisation
@@ -1441,8 +1441,8 @@ static bool IsNewerVersion(const char* remote)
 {
     const char* r = (*remote == 'v' || *remote == 'V') ? remote + 1 : remote;
     int lMaj=0, lMin=0, lPat=0, rMaj=0, rMin=0, rPat=0;
-    sscanf(APP_VERSION, "%d.%d.%d", &lMaj, &lMin, &lPat);
-    sscanf(r,           "%d.%d.%d", &rMaj, &rMin, &rPat);
+    if (sscanf(APP_VERSION, "%d.%d.%d", &lMaj, &lMin, &lPat) < 2) return false;
+    if (sscanf(r,           "%d.%d.%d", &rMaj, &rMin, &rPat) < 2) return false;
     if (rMaj != lMaj) return rMaj > lMaj;
     if (rMin != lMin) return rMin > lMin;
     return rPat > lPat;
