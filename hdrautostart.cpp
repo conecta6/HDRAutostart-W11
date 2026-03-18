@@ -37,6 +37,7 @@ extern "C" {
 #include <ctime>
 #include <winhttp.h>
 #include <urlmon.h>
+#include <commctrl.h>
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -47,9 +48,10 @@ extern "C" {
 #pragma comment(lib, "dxva2.lib")
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "urlmon.lib")
+#pragma comment(lib, "comctl32.lib")
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")
 
-#define APP_VERSION "0.22"
+#define APP_VERSION "0.30"
 
 // =============================================================================
 // Localisation
@@ -69,6 +71,7 @@ struct Lang {
     const char *profDimLabel, *profSharpLabel, *profExeLabel;
     const char *profDimDefault;
     const char *menuKTCSettings;
+    const char *menuBrightness;
 };
 
 static const Lang kES = {
@@ -83,7 +86,8 @@ static const Lang kES = {
     "GitHub",
     "Perfiles de juego...", "Perfiles de juego", "Nitidez (KTC)",
     "Local Dimming:", "Nitidez (0-10):", "Ejecutable:", "Usar valor global",
-    "Configuraci\xf3n KTC"
+    "Configuraci\xf3n KTC",
+    "Brillo"
 };
 static const Lang kEN = {
     "Monitored folders...", "Always enable HDR...", "Never enable HDR...", "Exclude...",
@@ -97,7 +101,8 @@ static const Lang kEN = {
     "GitHub",
     "Game profiles...", "Game profiles", "Sharpness (KTC)",
     "Local Dimming:", "Sharpness (0-10):", "Executable:", "Global default",
-    "KTC Settings"
+    "KTC Settings",
+    "Brightness"
 };
 static const Lang* L = &kEN;
 
@@ -124,7 +129,9 @@ struct Config {
     int    ktcSdrLocalDimming = 0;  // 0=Off(default) 1=Auto 2=Low 3=Std 4=High  (juegos blacklist/SDR)
     int    ktcSharpnessHdr     = 6;  // -1=off, 0-10 (VCP 0x87 on KTC) — applied when HDR activates
     int    ktcSharpnessSdr     = 6;  // -1=off, 0-10 (VCP 0x87 on KTC) — applied during SDR dimming games
-    int    ktcSharpnessDesktop = 6;  // -1=off, 0-10 (VCP 0x87 on KTC) — restored when all fullscreen ends
+    int    ktcSharpnessDesktop  = 6;  // -1=off, 0-10 (VCP 0x87 on KTC) — restored when all fullscreen ends
+    int    ktcBrightnessDesktop = 22; // 0-100 (VCP 0x10) — brightness restored when no SDR game running
+    int    ktcBrightnessSdr     = 100;// 0-100 (VCP 0x10) — brightness applied when SDR game launches
     time_t lastUpdateAttempt  = 0;  // unix timestamp of last auto-update trigger (anti-loop)
     std::vector<GameProfile> profiles;
 };
@@ -174,7 +181,9 @@ static void SaveConfig()
     fprintf(f, "ktc_sdr_local_dimming=%d\n", g_cfg.ktcSdrLocalDimming);
     fprintf(f, "ktc_sharpness_hdr=%d\n",     g_cfg.ktcSharpnessHdr);
     fprintf(f, "ktc_sharpness_sdr=%d\n",     g_cfg.ktcSharpnessSdr);
-    fprintf(f, "ktc_sharpness_desktop=%d\n", g_cfg.ktcSharpnessDesktop);
+    fprintf(f, "ktc_sharpness_desktop=%d\n",   g_cfg.ktcSharpnessDesktop);
+    fprintf(f, "ktc_brightness_desktop=%d\n",  g_cfg.ktcBrightnessDesktop);
+    fprintf(f, "ktc_brightness_sdr=%d\n",      g_cfg.ktcBrightnessSdr);
     if (g_cfg.lastUpdateAttempt)
         fprintf(f, "last_update_attempt=%lld\n", (long long)g_cfg.lastUpdateAttempt);
     fprintf(f, "[folders]\n");
@@ -257,6 +266,7 @@ static void LoadConfig()
     enum Section { SEC_NONE, SEC_SETTINGS, SEC_FOLDERS, SEC_WHITELIST, SEC_BLACKLIST, SEC_EXCLUDE, SEC_PROFILES };
     Section sec = SEC_NONE;
     bool sawDesktopSharpness = false;
+    bool sawBrightnessDesktop = false, sawBrightnessSdr = false;
     char line[MAX_PATH];
     while (fgets(line, sizeof(line), f)) {
         size_t n = strlen(line);
@@ -293,6 +303,14 @@ static void LoadConfig()
                     sawDesktopSharpness = true;
                 }
             }
+            if (strncmp(line, "ktc_brightness_desktop=", 23) == 0) {
+                int v = atoi(line + 23);
+                if (v >= 0 && v <= 100) { g_cfg.ktcBrightnessDesktop = v; sawBrightnessDesktop = true; }
+            }
+            if (strncmp(line, "ktc_brightness_sdr=", 19) == 0) {
+                int v = atoi(line + 19);
+                if (v >= 0 && v <= 100) { g_cfg.ktcBrightnessSdr = v; sawBrightnessSdr = true; }
+            }
             if (strncmp(line, "last_update_attempt=", 20) == 0)
                 g_cfg.lastUpdateAttempt = (time_t)atoll(line + 20);
             break;
@@ -326,6 +344,7 @@ static void LoadConfig()
         g_cfg.ktcSharpnessDesktop = g_cfg.ktcSharpnessSdr;
         needSave = true;
     }
+    if (!sawBrightnessDesktop || !sawBrightnessSdr) needSave = true;
     if (g_cfg.folders.empty()) {
         g_cfg.folders.push_back(steam);
         needSave = true;
@@ -693,6 +712,13 @@ static void SetKTCSharpness(int level)
     if (level < 0) return;
     Log("KTC Sharpness -> %d (VCP 0x87)", level);
     SetKTCVCP(0x87, level);
+}
+
+static void SetKTCBrightness(int level)
+{
+    if (level < 0) return;
+    Log("KTC Brightness -> %d (VCP 0x10)", level);
+    SetKTCVCP(0x10, level);
 }
 
 static void RestoreKTCSharpnessAfterHdrTransition(int level)
@@ -1120,6 +1146,21 @@ static DWORD WINAPI MonitorThread(LPVOID)
                 }
                 dimSentForHdr = false;
             }
+            // Re-apply SDR brightness if SDR games are still running
+            if (!sdrGames.empty()) {
+                int sBright;
+                EnterCriticalSection(&g_cfgLock);
+                sBright = g_cfg.ktcBrightnessSdr;
+                LeaveCriticalSection(&g_cfgLock);
+                SetKTCBrightness(sBright);
+                sdrDimmingActive = true;
+            } else {
+                int sBrightDesk;
+                EnterCriticalSection(&g_cfgLock);
+                sBrightDesk = g_cfg.ktcBrightnessDesktop;
+                LeaveCriticalSection(&g_cfgLock);
+                SetKTCBrightness(sBrightDesk);
+            }
             {
                 // HDR -> SDR can reset VCP 0x87 even when HDR sharpness was not
                 // explicitly set on entry, so always restore the target mode.
@@ -1135,13 +1176,16 @@ static DWORD WINAPI MonitorThread(LPVOID)
 
         // --- All SDR games closed ---
         if (sdrGames.empty() && sdrDimmingActive && !hdrActive) {
-            int sDim, sSharp;
+            int sDim, sSharp, sBrightDesk;
             EnterCriticalSection(&g_cfgLock);
-            sDim   = g_cfg.ktcSdrLocalDimming;
-            sSharp = g_cfg.ktcSharpnessDesktop;
+            sDim        = g_cfg.ktcSdrLocalDimming;
+            sSharp      = g_cfg.ktcSharpnessDesktop;
+            sBrightDesk = g_cfg.ktcBrightnessDesktop;
             LeaveCriticalSection(&g_cfgLock);
+            Log("All SDR games closed — restoring desktop settings");
+            SetKTCBrightness(sBrightDesk);
             if (sDim <= 0 && sSharp >= 0) SetKTCSharpness(sSharp);
-            if (sDim > 0) { Log("All SDR games closed — reset dimming"); SetKTCLocalDimming(1); SetKTCSharpness(sSharp); }
+            if (sDim > 0) { SetKTCLocalDimming(1); SetKTCSharpness(sSharp); }
             sdrDimmingActive = false;
         }
 
@@ -1227,12 +1271,12 @@ static DWORD WINAPI MonitorThread(LPVOID)
 
                 } else if (cls == -1) {
                     // Blacklisted / SDR game
-                    int sDim, sSharp;
+                    int sDim, sSharp, sBright;
                     EnterCriticalSection(&g_cfgLock);
-                    sDim   = g_cfg.ktcSdrLocalDimming;
-                    sSharp = g_cfg.ktcSharpnessSdr;
+                    sDim    = g_cfg.ktcSdrLocalDimming;
+                    sSharp  = g_cfg.ktcSharpnessSdr;
+                    sBright = g_cfg.ktcBrightnessSdr;
                     LeaveCriticalSection(&g_cfgLock);
-                    if (sDim == 0) continue;  // SDR dimming disabled — ignore
 
                     Log("SDR game detected: %s (PID %lu)", base ? base + 1 : path.c_str(), pid);
                     HANDLE hProc = OpenProcess(
@@ -1240,9 +1284,9 @@ static DWORD WINAPI MonitorThread(LPVOID)
                     if (!hProc) { Log("  (cannot open SDR process)"); continue; }
 
                     if (sdrGames.empty() && !hdrActive) {
-                        Log("SDR dimming -> %d", sDim);
-                        SetKTCLocalDimming(sDim);
-                        SetKTCSharpness(sSharp);
+                        if (sDim > 0) { Log("SDR dimming -> %d", sDim); SetKTCLocalDimming(sDim); }
+                        if (sSharp >= 0) SetKTCSharpness(sSharp);
+                        SetKTCBrightness(sBright);
                         sdrDimmingActive = true;
                     }
                     sdrGames[pid] = hProc;
@@ -1263,7 +1307,13 @@ static DWORD WINAPI MonitorThread(LPVOID)
         if (g_trayWnd) PostMessage(g_trayWnd, WM_HDRSTATUS, 0, 0);
     }
     if (sdrDimmingActive) {
-        int d, sh; EnterCriticalSection(&g_cfgLock); d=g_cfg.ktcSdrLocalDimming; sh=g_cfg.ktcSharpnessDesktop; LeaveCriticalSection(&g_cfgLock);
+        int d, sh, bd;
+        EnterCriticalSection(&g_cfgLock);
+        d  = g_cfg.ktcSdrLocalDimming;
+        sh = g_cfg.ktcSharpnessDesktop;
+        bd = g_cfg.ktcBrightnessDesktop;
+        LeaveCriticalSection(&g_cfgLock);
+        SetKTCBrightness(bd);
         if (d > 0) { SetKTCLocalDimming(1); SetKTCSharpness(sh); }
     }
     for (auto& kv : games)    CloseHandle(kv.second);
@@ -1629,6 +1679,8 @@ cleanup:
 #define ID_KTC_SHARP_HDR   320
 #define ID_KTC_SHARP_SDR   321
 #define ID_KTC_SHARP_DESK  322
+#define ID_KTC_BRIGHT_DESK 323
+#define ID_KTC_BRIGHT_SDR  324
 #define ID_KTC_OFF          299
 #define ID_KTC_AUTO         300
 #define ID_KTC_LOW          301
@@ -1811,6 +1863,108 @@ static void ShowSharpnessDialog(const char* title, int* value)
     HWND hw = CreateWindowExA(
         WS_EX_TOPMOST,
         "HDRAutostartSharpDlg", title,
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT, W, H,
+        nullptr, nullptr, hInst, data);
+    if (hw) SetForegroundWindow(hw);
+    else    delete data;
+}
+
+// =============================================================================
+// Numeric input dialog (generic, e.g. brightness 0-100)
+// =============================================================================
+#define IDC_NUM_EDIT   430
+#define IDC_NUM_SPIN   431
+#define IDC_NUM_OK     432
+#define IDC_NUM_CANCEL 433
+
+struct NumDlgData { int* value; int minV; int maxV; HFONT hFont; };
+
+static LRESULT CALLBACK NumDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    NumDlgData* d = (NumDlgData*)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_CREATE: {
+        d = (NumDlgData*)((CREATESTRUCTA*)lp)->lpCreateParams;
+        SetWindowLongPtrA(hwnd, GWLP_USERDATA, (LONG_PTR)d);
+
+        typedef UINT(WINAPI* PFN_GetDpiForWindow)(HWND);
+        static auto pfnDpi = (PFN_GetDpiForWindow)GetProcAddress(GetModuleHandleA("user32.dll"), "GetDpiForWindow");
+        UINT dpi = pfnDpi ? pfnDpi(hwnd) : 96;
+        auto S = [&](int v){ return MulDiv(v, (int)dpi, 96); };
+
+        NONCLIENTMETRICSA ncm = {}; ncm.cbSize = sizeof(ncm);
+        SystemParametersInfoA(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
+        d->hFont = CreateFontIndirectA(&ncm.lfMessageFont);
+
+        int gap = S(8), bw = S(80), bh = S(26), lw = S(120), ew = S(60), sw = S(18);
+
+        char rangeLabel[32];
+        snprintf(rangeLabel, sizeof(rangeLabel), "Value (%d-%d):", d->minV, d->maxV);
+        HWND hLbl = CreateWindowA("STATIC", rangeLabel,
+            WS_CHILD | WS_VISIBLE, gap, gap + S(4), lw, S(20), hwnd, nullptr, nullptr, nullptr);
+        SendMessageA(hLbl, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+
+        HWND hEdit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", nullptr,
+            WS_CHILD | WS_VISIBLE | ES_NUMBER,
+            gap + lw + gap, gap, ew, S(22), hwnd, (HMENU)IDC_NUM_EDIT, nullptr, nullptr);
+        SendMessageA(hEdit, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+        char buf[8]; snprintf(buf, sizeof(buf), "%d", *d->value);
+        SetWindowTextA(hEdit, buf);
+
+        HWND hSpin = CreateWindowExA(0, UPDOWN_CLASSA, nullptr,
+            WS_CHILD | WS_VISIBLE | UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS,
+            0, 0, sw, S(22), hwnd, (HMENU)IDC_NUM_SPIN, nullptr, nullptr);
+        SendMessageA(hSpin, UDM_SETBUDDY,  (WPARAM)hEdit, 0);
+        SendMessageA(hSpin, UDM_SETRANGE32, d->minV, d->maxV);
+        SendMessageA(hSpin, UDM_SETPOS32,   0, *d->value);
+
+        int y2 = gap + S(36);
+        HWND hOk  = CreateWindowA("BUTTON", "OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+            gap,            y2, bw, bh, hwnd, (HMENU)IDC_NUM_OK,     nullptr, nullptr);
+        HWND hCan = CreateWindowA("BUTTON", "Cancel", WS_CHILD | WS_VISIBLE,
+            gap + bw + gap, y2, bw, bh, hwnd, (HMENU)IDC_NUM_CANCEL, nullptr, nullptr);
+        SendMessageA(hOk,  WM_SETFONT, (WPARAM)d->hFont, FALSE);
+        SendMessageA(hCan, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDC_NUM_OK) {
+            char buf[16] = {};
+            GetWindowTextA(GetDlgItem(hwnd, IDC_NUM_EDIT), buf, sizeof(buf));
+            int v = atoi(buf);
+            if (v < d->minV) v = d->minV;
+            if (v > d->maxV) v = d->maxV;
+            *d->value = v;
+            SaveConfig();
+            DestroyWindow(hwnd);
+        } else if (LOWORD(wp) == IDC_NUM_CANCEL) {
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    case WM_CLOSE:   DestroyWindow(hwnd); return 0;
+    case WM_DESTROY:
+        if (d && d->hFont) DeleteObject(d->hFont);
+        delete d;
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+static void ShowNumDialog(const char* title, int* value, int minV, int maxV)
+{
+    NumDlgData* data = new NumDlgData{value, minV, maxV, nullptr};
+    HINSTANCE hInst = (HINSTANCE)GetModuleHandleA(nullptr);
+
+    typedef UINT(WINAPI* PFN_GetDpiForSystem)();
+    static auto pfnDpiSys = (PFN_GetDpiForSystem)GetProcAddress(GetModuleHandleA("user32.dll"), "GetDpiForSystem");
+    UINT dpi = pfnDpiSys ? pfnDpiSys() : 96;
+    int W = MulDiv(280, (int)dpi, 96);
+    int H = MulDiv(110, (int)dpi, 96);
+
+    HWND hw = CreateWindowExA(
+        WS_EX_TOPMOST,
+        "HDRAutostartNumDlg", title,
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT, W, H,
         nullptr, nullptr, hInst, data);
@@ -2198,13 +2352,15 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
 
             // Local Dimming parent menu
-            int d, ds, shdrv, ssdv, sdeskv;
+            int d, ds, shdrv, ssdv, sdeskv, brightDesk, brightSdr;
             EnterCriticalSection(&g_cfgLock);
-            d      = g_cfg.ktcLocalDimming;
-            ds     = g_cfg.ktcSdrLocalDimming;
-            shdrv  = g_cfg.ktcSharpnessHdr;
-            ssdv   = g_cfg.ktcSharpnessSdr;
-            sdeskv = g_cfg.ktcSharpnessDesktop;
+            d          = g_cfg.ktcLocalDimming;
+            ds         = g_cfg.ktcSdrLocalDimming;
+            shdrv      = g_cfg.ktcSharpnessHdr;
+            ssdv       = g_cfg.ktcSharpnessSdr;
+            sdeskv     = g_cfg.ktcSharpnessDesktop;
+            brightDesk = g_cfg.ktcBrightnessDesktop;
+            brightSdr  = g_cfg.ktcBrightnessSdr;
             LeaveCriticalSection(&g_cfgLock);
 
             HMENU sub = CreatePopupMenu();
@@ -2238,10 +2394,19 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             AppendMenuA(sharpMenu, MF_STRING, ID_KTC_SHARP_SDR,  ssdLabel);
             AppendMenuA(sharpMenu, MF_STRING, ID_KTC_SHARP_DESK, sdeskLabel);
 
+            // Brightness submenu
+            char bDeskLabel[64], bSdrLabel[64];
+            snprintf(bDeskLabel, sizeof(bDeskLabel), "Desktop (KTC): %d", brightDesk);
+            snprintf(bSdrLabel,  sizeof(bSdrLabel),  "SDR Game (KTC): %d", brightSdr);
+            HMENU brightMenu = CreatePopupMenu();
+            AppendMenuA(brightMenu, MF_STRING, ID_KTC_BRIGHT_DESK, bDeskLabel);
+            AppendMenuA(brightMenu, MF_STRING, ID_KTC_BRIGHT_SDR,  bSdrLabel);
+
             // KTC Settings root submenu
             HMENU ktcMenu = CreatePopupMenu();
             AppendMenuA(ktcMenu, MF_POPUP,     (UINT_PTR)dimMenu,       L->menuLocalDimming);
             AppendMenuA(ktcMenu, MF_POPUP,     (UINT_PTR)sharpMenu,     L->menuSharpness);
+            AppendMenuA(ktcMenu, MF_POPUP,     (UINT_PTR)brightMenu,    L->menuBrightness);
             AppendMenuA(ktcMenu, MF_SEPARATOR, 0, nullptr);
             AppendMenuA(ktcMenu, MF_STRING,    ID_TRAY_PROFILES,        L->menuProfiles);
             AppendMenuA(m, MF_POPUP, (UINT_PTR)ktcMenu, L->menuKTCSettings);
@@ -2290,6 +2455,10 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             ShowSharpnessDialog("Sharpness SDR (KTC)", &g_cfg.ktcSharpnessSdr); break;
         case ID_KTC_SHARP_DESK:
             ShowSharpnessDialog("Sharpness Desktop (KTC)", &g_cfg.ktcSharpnessDesktop); break;
+        case ID_KTC_BRIGHT_DESK:
+            ShowNumDialog("Brightness Desktop (KTC)", &g_cfg.ktcBrightnessDesktop, 0, 100); break;
+        case ID_KTC_BRIGHT_SDR:
+            ShowNumDialog("Brightness SDR Game (KTC)", &g_cfg.ktcBrightnessSdr, 0, 100); break;
         case ID_TRAY_PROFILES:
             ShowProfilesDialog(); break;
         case ID_TRAY_GITHUB:
@@ -2341,7 +2510,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     DetectLang();
     InitializeCriticalSection(&g_cfgLock);
     LoadConfig();
-    g_cfg.lastUpdateAttempt = 0;  // reset on fresh start so update is always attempted
+    // Reset update timestamp only if it's older than 24h (prevents install-loop:
+    // installer relaunches the app which would re-trigger the update immediately)
+    if (g_cfg.lastUpdateAttempt != 0 &&
+        (time(nullptr) - g_cfg.lastUpdateAttempt) > 86400)
+        g_cfg.lastUpdateAttempt = 0;
     OpenLog();
     Log("=== HDRAutostart started ===");
     InitNVAPI();
@@ -2376,6 +2549,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     wc5.lpszClassName = "HDRAutostartProfEditDlg";  wc5.lpfnWndProc = ProfEditDlgProc;
     wc5.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     RegisterClassExA(&wc5);
+
+    WNDCLASSEXA wc6 = {};
+    wc6.cbSize = sizeof(wc6);  wc6.hInstance = hInst;
+    wc6.lpszClassName = "HDRAutostartNumDlg";  wc6.lpfnWndProc = NumDlgProc;
+    wc6.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    RegisterClassExA(&wc6);
 
     g_trayWnd = CreateWindowExA(0, "HDRAutostartTray", "HDRAutostart", 0,
         0, 0, 0, 0, HWND_MESSAGE, nullptr, hInst, nullptr);

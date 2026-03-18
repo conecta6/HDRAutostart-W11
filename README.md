@@ -21,6 +21,7 @@ Windows 11 supports HDR, but it does not switch automatically. If you leave HDR 
 | **Exclude** | Completely ignore specific executables or entire folders. Excluded items are never scanned — no HDR, no KTC dimming. Useful for tools, utilities, or whole directories you never want to trigger anything. |
 | **KTC Local Dimming** | For KTC monitors with DDC/CI support: automatically control the Local Dimming level (VCP 0xF4) when HDR switches on or off. Separate settings for HDR and SDR modes. Off by default — safe on any monitor. |
 | **KTC Sharpness** | Automatically set monitor sharpness (VCP 0x87) when HDR activates or deactivates. Configurable from 0 to 10. Default: 6. |
+| **KTC Brightness** | Automatically set monitor brightness (VCP 0x10) when an SDR game launches or exits. Desktop value default: 22. SDR game value default: 100. |
 | **Game profiles** | Assign per-game Local Dimming and Sharpness overrides to specific executables. When the game closes, standard global values are restored automatically. |
 | **Run at startup** | One-click option to launch HDRAutostart with Windows. |
 | **System tray** | Runs silently in the background. Orange icon = HDR active, grey icon = HDR inactive. Right-click for the menu. |
@@ -55,6 +56,9 @@ The tray menu currently contains these entries:
         HDR (KTC): <current value>
         SDR (KTC): <current value>
         Desktop (KTC): <current value>
+      Brightness
+        Desktop (KTC): <current value>
+        SDR Game (KTC): <current value>
       Game profiles...
     Run at startup                   (checked when enabled)
     GitHub
@@ -63,6 +67,7 @@ The tray menu currently contains these entries:
 - `Monitored folders...`, `Always enable HDR...`, `Never enable HDR...`, and `Exclude...` open the corresponding list dialogs.
 - `KTC Settings -> Local Dimming` stores the selected HDR and SDR dimming mode, showing a check mark on the active value.
 - `KTC Settings -> Sharpness (KTC)` shows the current HDR, SDR, and Desktop sharpness values and opens the value picker for each one.
+- `KTC Settings -> Brightness` shows the current Desktop and SDR Game brightness values and opens the numeric input for each one.
 - `KTC Settings -> Game profiles...` opens the per-game override manager.
 - `Run at startup` toggles Windows startup registration.
 - `GitHub` opens the project repository in your browser.
@@ -109,7 +114,7 @@ All KTC-specific options are grouped under:
 
 > Right-click tray icon → **KTC Settings**
 
-This submenu contains Local Dimming, Sharpness, and Game Profiles.
+This submenu contains Local Dimming, Sharpness, Brightness, and Game Profiles.
 
 #### Local Dimming
 
@@ -149,6 +154,19 @@ Automatically sets the monitor's sharpness level (VCP 0x87) via DDC/CI when HDR 
 | **0 – 10** | Sharpness level sent to the monitor. Default: **6**. |
 
 > KTC Settings → **Sharpness (KTC)** → HDR (KTC) / SDR (KTC)
+
+#### Brightness
+
+Automatically sets the monitor's brightness level (VCP 0x10) via DDC/CI when an SDR game (blacklisted executable) launches or exits. Two independent values:
+
+| Setting | Default | Description |
+|---|---|---|
+| **Desktop (KTC)** | 22 | Brightness restored when no SDR game is running. |
+| **SDR Game (KTC)** | 100 | Brightness applied when an SDR game launches. |
+
+Both values are in the 0–100 range. Click either entry to open the numeric input dialog.
+
+> KTC Settings → **Brightness** → Desktop (KTC) / SDR Game (KTC)
 
 #### Game profiles
 
@@ -211,6 +229,7 @@ Windows 11 soporta HDR, pero no lo activa automáticamente. Si dejas el HDR siem
 | **Excluir** | Ignora completamente ejecutables concretos o carpetas enteras. Los elementos excluidos no se procesan en absoluto — sin HDR, sin KTC dimming. Útil para herramientas, utilidades o directorios enteros que nunca quieres que disparen nada. |
 | **Local Dimming KTC** | Para monitores KTC con soporte DDC/CI: controla automáticamente el nivel de Local Dimming (VCP 0xF4) cuando el HDR se activa o desactiva. Ajustes independientes para modo HDR y SDR. Desactivado por defecto — seguro en cualquier monitor. |
 | **Nitidez KTC** | Ajusta automáticamente la nitidez del monitor (VCP 0x87) al activar o desactivar el HDR. Configurable de 0 a 10. Valor por defecto: 6. |
+| **Brillo KTC** | Ajusta automáticamente el brillo del monitor (VCP 0x10) cuando se lanza o cierra un juego SDR (lista negra). Valor escritorio por defecto: 22. Valor juego SDR por defecto: 100. |
 | **Perfiles de juego** | Asigna valores personalizados de Local Dimming y Nitidez a ejecutables específicos. Al cerrar el juego, se restauran automáticamente los valores globales estándar. |
 | **Ejecutar al inicio** | Opción con un clic para lanzar HDRAutostart con Windows. |
 | **Bandeja del sistema** | Se ejecuta silenciosamente en segundo plano. Icono naranja = HDR activo, icono gris = HDR inactivo. Clic derecho para el menú. |
@@ -245,6 +264,9 @@ El menu de la bandeja contiene actualmente estas opciones:
         HDR (KTC): <valor actual>
         SDR (KTC): <valor actual>
         Desktop (KTC): <valor actual>
+      Brillo
+        Desktop (KTC): <valor actual>
+        SDR Game (KTC): <valor actual>
       Perfiles de juego...
     Ejecutar al inicio               (con marca cuando esta activado)
     GitHub
@@ -253,6 +275,7 @@ El menu de la bandeja contiene actualmente estas opciones:
 - `Carpetas monitoreadas...`, `Activar HDR siempre...`, `Nunca activar HDR...` y `Excluir...` abren sus dialogos de lista correspondientes.
 - `Configuracion KTC -> Local Dimming` guarda el modo de dimming seleccionado para HDR y SDR, mostrando una marca en la opcion activa.
 - `Configuracion KTC -> Nitidez (KTC)` muestra los valores actuales de nitidez para HDR, SDR y Desktop, y abre el selector de valor para cada uno.
+- `Configuracion KTC -> Brillo` muestra los valores actuales de brillo para escritorio y juego SDR, y abre el selector numérico para cada uno.
 - `Configuracion KTC -> Perfiles de juego...` abre el gestor de perfiles por juego.
 - `Ejecutar al inicio` activa o desactiva el arranque con Windows.
 - `GitHub` abre el repositorio del proyecto en el navegador.
@@ -299,7 +322,7 @@ Todas las opciones específicas de KTC están agrupadas en:
 
 > Clic derecho en el icono de bandeja → **Configuración KTC**
 
-Este submenú contiene Local Dimming, Nitidez y Perfiles de juego.
+Este submenú contiene Local Dimming, Nitidez, Brillo y Perfiles de juego.
 
 #### Local Dimming
 
@@ -339,6 +362,19 @@ Ajusta automáticamente el nivel de nitidez del monitor (VCP 0x87) vía DDC/CI a
 | **0 – 10** | Nivel de nitidez enviado al monitor. Por defecto: **6**. |
 
 > Configuración KTC → **Nitidez (KTC)** → HDR (KTC) / SDR (KTC)
+
+#### Brillo
+
+Ajusta automáticamente el nivel de brillo del monitor (VCP 0x10) vía DDC/CI cuando se lanza o cierra un juego SDR (ejecutable en lista negra). Dos valores independientes:
+
+| Ajuste | Por defecto | Descripción |
+|---|---|---|
+| **Desktop (KTC)** | 22 | Brillo restaurado cuando no hay ningún juego SDR en ejecución. |
+| **SDR Game (KTC)** | 100 | Brillo aplicado cuando se lanza un juego SDR. |
+
+Ambos valores están en el rango 0–100. Haz clic en cualquiera de las entradas para abrir el selector numérico.
+
+> Configuración KTC → **Brillo** → Desktop (KTC) / SDR Game (KTC)
 
 #### Perfiles de juego
 
