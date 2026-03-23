@@ -123,12 +123,14 @@ Section "Instalar"
 
     ; -- Scheduled task (elevated, no UAC on startup) -------------------------
     ${If} $AllUsers == "1"
-        ; All-users install: exe in Program Files (accessible to all), task runs for every user
-        ExecWait 'schtasks /create /tn "${TASK_NAME}" /tr "\"$INSTDIR\${EXE_NAME}\"" /sc onlogon /rl highest /f'
+        ; All-users install: use PowerShell Register-ScheduledTask with -GroupId so the task
+        ; fires for EVERY user who logs on. schtasks without /ru, even from an elevated token,
+        ; stores the current user as principal — not "all users".
+        ExecWait "powershell -NonInteractive -NoProfile -ExecutionPolicy Bypass -Command $\"Register-ScheduledTask -TaskName '${TASK_NAME}' -Action (New-ScheduledTaskAction -Execute '$INSTDIR\${EXE_NAME}') -Trigger (New-ScheduledTaskTrigger -AtLogOn) -Principal (New-ScheduledTaskPrincipal -GroupId 'BUILTIN\Users' -RunLevel Highest) -Force$\""
     ${Else}
         ; Per-user install: exe in user's AppData — restrict task to this user only
         ; to avoid running the task for other users who cannot access these folders
-        ExecWait 'schtasks /create /tn "${TASK_NAME}" /tr "\"$INSTDIR\${EXE_NAME}\"" /sc onlogon /ru "$USERNAME" /rl highest /f'
+        ExecWait 'schtasks /create /tn "${TASK_NAME}" /tr "\"$INSTDIR\${EXE_NAME}\"" /sc onlogon /ru "$%USERNAME%" /rl highest /f'
     ${EndIf}
 
     ; -- Uninstaller ----------------------------------------------------------

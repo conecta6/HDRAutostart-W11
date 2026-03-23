@@ -888,9 +888,16 @@ static void SetStartup(bool on)
         char self[MAX_PATH] = {};  GetModuleFileNameA(nullptr, self, MAX_PATH);
         char cmd[1024] = {};  // needs MAX_PATH(260) + UNLEN(256) + ~80 literals in per-user branch
         if (IsAllUsersInstall()) {
-            // All-users install: task runs for every user (exe is in Program Files, accessible to all)
+            // All-users install: use PowerShell Register-ScheduledTask with -GroupId so the
+            // task fires for EVERY user who logs on. schtasks without /ru, even when called
+            // from an elevated token, stores the current user as principal — not "all users".
             snprintf(cmd, sizeof(cmd),
-                "schtasks /create /tn HDRAutostart /tr \"\\\"%s\\\"\" /sc onlogon /rl highest /f",
+                "powershell -NonInteractive -NoProfile -ExecutionPolicy Bypass -Command "
+                "\"Register-ScheduledTask -TaskName 'HDRAutostart' "
+                "-Action (New-ScheduledTaskAction -Execute '%s') "
+                "-Trigger (New-ScheduledTaskTrigger -AtLogOn) "
+                "-Principal (New-ScheduledTaskPrincipal -GroupId 'BUILTIN\\Users' -RunLevel Highest) "
+                "-Force\"",
                 self);
         } else {
             // Per-user install: restrict task to this user only to avoid running
