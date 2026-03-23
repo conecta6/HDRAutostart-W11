@@ -51,7 +51,7 @@ extern "C" {
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")
 
-#define APP_VERSION "0.30"
+#define APP_VERSION "0.35"
 
 // =============================================================================
 // Localisation
