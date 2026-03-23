@@ -167,15 +167,31 @@ static std::string ConfigDir()
         if (s.back() != '\\') s += '\\';
         return s;
     }
+    // Fallback: try standard per-user AppData locations before ExeDir().
+    // Helps when the HKCU registry key was lost (e.g., another user running this exe).
+    { char envBuf[MAX_PATH] = {};
+      if (ExpandEnvironmentStringsA("%APPDATA%\\HDRAutostart\\", envBuf, MAX_PATH) > 1) {
+          DWORD attr = GetFileAttributesA(envBuf);
+          if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
+              return std::string(envBuf);
+      }
+    }
+    { char envBuf[MAX_PATH] = {};
+      if (ExpandEnvironmentStringsA("%LOCALAPPDATA%\\HDRAutostart\\", envBuf, MAX_PATH) > 1) {
+          DWORD attr = GetFileAttributesA(envBuf);
+          if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
+              return std::string(envBuf);
+      }
+    }
     return ExeDir();
 }
 
 static void SaveConfig()
 {
     std::string path = ConfigDir() + "hdrautostart.ini";
-    FILE* f = fopen(path.c_str(), "w");
-    if (!f) return;
     EnterCriticalSection(&g_cfgLock);
+    FILE* f = fopen(path.c_str(), "w");
+    if (!f) { LeaveCriticalSection(&g_cfgLock); return; }
     fprintf(f, "[settings]\n");
     fprintf(f, "ktc_local_dimming=%d\n",     g_cfg.ktcLocalDimming);
     fprintf(f, "ktc_sdr_local_dimming=%d\n", g_cfg.ktcSdrLocalDimming);
@@ -245,7 +261,7 @@ static void LoadConfig()
     if (!f) {
         // Try: next to exe (when exe moved to dist\ subdirectory)
         { std::string o = ExeDir() + "steamhdr.ini";
-          if (CopyFileA(o.c_str(), path.c_str(), FALSE)) f = fopen(path.c_str(), "r"); }
+          if (CopyFileA(o.c_str(), path.c_str(), FALSE)) { DeleteFileA(o.c_str()); f = fopen(path.c_str(), "r"); } }
     }
     if (!f) {
         // Try: parent directory of exe (common case: old exe in hdr2\, new in hdr2\dist\)
@@ -254,7 +270,7 @@ static void LoadConfig()
         size_t p2 = exeD.rfind('\\');
         if (p2 != std::string::npos) {
             std::string o = exeD.substr(0, p2 + 1) + "steamhdr.ini";
-            if (CopyFileA(o.c_str(), path.c_str(), FALSE)) f = fopen(path.c_str(), "r");
+            if (CopyFileA(o.c_str(), path.c_str(), FALSE)) { DeleteFileA(o.c_str()); f = fopen(path.c_str(), "r"); }
         }
     }
     if (!f) {
@@ -267,7 +283,7 @@ static void LoadConfig()
     Section sec = SEC_NONE;
     bool sawDesktopSharpness = false;
     bool sawBrightnessDesktop = false, sawBrightnessSdr = false;
-    char line[MAX_PATH];
+    char line[4096];  // MAX_PATH(260) is not enough; Windows supports paths up to 32767 chars
     while (fgets(line, sizeof(line), f)) {
         size_t n = strlen(line);
         while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r')) line[--n] = '\0';
@@ -369,7 +385,7 @@ static void Log(const char* fmt, ...)
     struct tm t = {};  localtime_s(&t, &now);
     char ts[32];
     snprintf(ts, sizeof(ts), "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
-    char msg[512];
+    char msg[2048];
     va_list a;  va_start(a, fmt);  vsnprintf(msg, sizeof(msg), fmt, a);  va_end(a);
     if (g_log) { fprintf(g_log, "[%s] %s\n", ts, msg);  fflush(g_log); }
 }
@@ -602,16 +618,17 @@ static bool SetNVAPIVCP(BYTE vcp, DWORD value)
         return false;
     }
 
+    // DDC/CI Set VCP Feature (MCCS standard, section 7.4)
     NvU8 payload[7] = {
-        0x51,
-        0x84,
-        0x03,
-        vcp,
-        (NvU8)((value >> 8) & 0xFF),
-        (NvU8)(value & 0xFF),
-        0x00
+        0x51,              // source address: host (DDC/CI header)
+        0x84,              // length: 4 bytes of data follow (0x80 | 4)
+        0x03,              // command: Set VCP Feature (DDC/CI opcode)
+        vcp,               // VCP feature code (e.g. 0xF4=local dimming, 0x87=sharpness, 0x10=brightness)
+        (NvU8)((value >> 8) & 0xFF),  // value high byte
+        (NvU8)(value & 0xFF),          // value low byte
+        0x00               // checksum placeholder (filled below)
     };
-    NvU8 checksum = 0x6E;
+    NvU8 checksum = 0x6E;  // XOR seed: destination address (monitor = 0x6E)
     for (size_t i = 0; i < sizeof(payload) - 1; ++i) checksum ^= payload[i];
     payload[sizeof(payload) - 1] = checksum;
 
@@ -843,6 +860,15 @@ static bool RunAsShellUser(const char* cmd, DWORD timeoutMs, DWORD* exitCode = n
     return ok;
 }
 
+// Returns true if installed for all users (HKLM has ConfigPath).
+// Returns false for per-user install or portable/dev mode.
+static bool IsAllUsersInstall()
+{
+    char buf[MAX_PATH] = {};  DWORD sz = sizeof(buf);
+    return RegGetValueA(HKEY_LOCAL_MACHINE, "Software\\HDRAutostart", "ConfigPath",
+                        RRF_RT_REG_SZ, nullptr, buf, &sz) == ERROR_SUCCESS && buf[0];
+}
+
 // Check if the scheduled task exists (Task Scheduler stores tasks in registry).
 static bool IsInStartup()
 {
@@ -860,10 +886,21 @@ static void SetStartup(bool on)
 {
     if (on) {
         char self[MAX_PATH] = {};  GetModuleFileNameA(nullptr, self, MAX_PATH);
-        char cmd[MAX_PATH + 200] = {};
-        snprintf(cmd, sizeof(cmd),
-            "schtasks /create /tn HDRAutostart /tr \"\\\"%s\\\"\" /sc onlogon /rl highest /f",
-            self);
+        char cmd[1024] = {};  // needs MAX_PATH(260) + UNLEN(256) + ~80 literals in per-user branch
+        if (IsAllUsersInstall()) {
+            // All-users install: task runs for every user (exe is in Program Files, accessible to all)
+            snprintf(cmd, sizeof(cmd),
+                "schtasks /create /tn HDRAutostart /tr \"\\\"%s\\\"\" /sc onlogon /rl highest /f",
+                self);
+        } else {
+            // Per-user install: restrict task to this user only to avoid running
+            // the task for other users who cannot access this user's AppData folders.
+            char userName[256] = {};  DWORD userNameSize = sizeof(userName);
+            GetUserNameA(userName, &userNameSize);
+            snprintf(cmd, sizeof(cmd),
+                "schtasks /create /tn HDRAutostart /tr \"\\\"%s\\\"\" /sc onlogon /ru \"%s\" /rl highest /f",
+                self, userName);
+        }
         RunSilent(cmd);
         // Clean up old registry Run key if it existed
         HKEY hk;
@@ -1708,8 +1745,12 @@ static int  g_browserSkipTicks = 20;   // skip first 10s of browser checks at st
 
 static void UpdateTray(bool on)
 {
-    if (on && g_hdrSource[0])
-        snprintf(g_nid.szTip, sizeof(g_nid.szTip), "%s [%s]  v" APP_VERSION, L->tipOn, g_hdrSource);
+    char src[MAX_PATH] = {};
+    EnterCriticalSection(&g_cfgLock);
+    strncpy_s(src, g_hdrSource, _TRUNCATE);
+    LeaveCriticalSection(&g_cfgLock);
+    if (on && src[0])
+        snprintf(g_nid.szTip, sizeof(g_nid.szTip), "%s [%s]  v" APP_VERSION, L->tipOn, src);
     else
         snprintf(g_nid.szTip, sizeof(g_nid.szTip), "%s  v" APP_VERSION, on ? L->tipOn : L->tipOff);
     g_nid.hIcon = on ? g_icoOn : g_icoOff;
@@ -1741,7 +1782,9 @@ static void CheckBrowserHDR()
         SetKTCLocalDimming(dimming);
         // Sharpness: VCP 0x87 gets reset by HDR mode switch; wait then send
         if (sharpHdr >= 0) { Sleep(500); SetKTCSharpness(sharpHdr); }
+        EnterCriticalSection(&g_cfgLock);
         strncpy_s(g_hdrSource, "Browser", _TRUNCATE);
+        LeaveCriticalSection(&g_cfgLock);
         g_browserHdrOn = true;
         UpdateTray(true);
     } else if (!isFS && g_browserHdrOn) {
@@ -1760,7 +1803,9 @@ static void CheckBrowserHDR()
             if (d > 0) SetKTCLocalDimming(1);
             RestoreKTCSharpnessAfterHdrTransition(sh);
         }
+        EnterCriticalSection(&g_cfgLock);
         g_hdrSource[0] = '\0';
+        LeaveCriticalSection(&g_cfgLock);
         g_browserHdrOn = false;
         UpdateTray(false);
     }
@@ -1809,7 +1854,7 @@ static LRESULT CALLBACK SharpDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         // Off (-1), then 0, 1, 2 ... 10
         { int idx = (int)SendMessageA(hCbo, CB_ADDSTRING, 0, (LPARAM)"Off");
           SendMessageA(hCbo, CB_SETITEMDATA, idx, (LPARAM)(DWORD)-1); }
-        int selIdx = (*d->value == -1) ? 0 : 0;
+        int selIdx = 0;  // default to "Off" (index 0); updated below if value matches
         for (int v = 0; v <= 10; v++) {
             char buf[8]; snprintf(buf, sizeof(buf), "%d", v);
             int idx = (int)SendMessageA(hCbo, CB_ADDSTRING, 0, (LPARAM)buf);
@@ -2040,7 +2085,7 @@ static LRESULT CALLBACK ProfEditDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         {
             int idxG = (int)SendMessageA(hC2, CB_ADDSTRING, 0, (LPARAM)"Global default");
             SendMessageA(hC2, CB_SETITEMDATA, idxG, (LPARAM)(DWORD)-1);
-            int selSharp = (d->sharpness == -1) ? 0 : 0;
+            int selSharp = 0;  // default to "Global default" (index 0); updated below if value matches
             for (int v = 0; v <= 10; v++) {
                 char buf[8]; snprintf(buf, sizeof(buf), "%d", v);
                 int idx = (int)SendMessageA(hC2, CB_ADDSTRING, 0, (LPARAM)buf);
@@ -2312,7 +2357,9 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         strncpy_s(da->url,  info->dlUrl, _TRUNCATE);
         snprintf(da->path, sizeof(da->path),
             "%sHDRAutostartSetup_%s.exe", tmpDir, info->tag);
-        CloseHandle(CreateThread(nullptr, 0, DoSilentUpdate, da, 0, nullptr));
+        HANDLE ht = CreateThread(nullptr, 0, DoSilentUpdate, da, 0, nullptr);
+        if (ht) CloseHandle(ht);
+        else    delete da;
 
         delete info;
         return 0;

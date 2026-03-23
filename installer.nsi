@@ -122,7 +122,14 @@ Section "Instalar"
                     "$INSTDIR\Uninstall.exe"
 
     ; -- Scheduled task (elevated, no UAC on startup) -------------------------
-    ExecWait 'schtasks /create /tn "${TASK_NAME}" /tr "\"$INSTDIR\${EXE_NAME}\"" /sc onlogon /rl highest /f'
+    ${If} $AllUsers == "1"
+        ; All-users install: exe in Program Files (accessible to all), task runs for every user
+        ExecWait 'schtasks /create /tn "${TASK_NAME}" /tr "\"$INSTDIR\${EXE_NAME}\"" /sc onlogon /rl highest /f'
+    ${Else}
+        ; Per-user install: exe in user's AppData — restrict task to this user only
+        ; to avoid running the task for other users who cannot access these folders
+        ExecWait 'schtasks /create /tn "${TASK_NAME}" /tr "\"$INSTDIR\${EXE_NAME}\"" /sc onlogon /ru "$USERNAME" /rl highest /f'
+    ${EndIf}
 
     ; -- Uninstaller ----------------------------------------------------------
     WriteUninstaller "$INSTDIR\Uninstall.exe"
