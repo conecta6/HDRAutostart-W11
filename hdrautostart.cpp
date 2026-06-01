@@ -1316,10 +1316,18 @@ static DWORD WINAPI MonitorThread(LPVOID)
                 } else if (cls == -1) {
                     // Blacklisted / SDR game
                     int sDim, sSharp, sBright;
+                    std::string loPath2 = ToLower(path);
                     EnterCriticalSection(&g_cfgLock);
                     sDim    = g_cfg.ktcSdrLocalDimming;
                     sSharp  = g_cfg.ktcSharpnessSdr;
                     sBright = g_cfg.ktcBrightnessSdr;
+                    for (auto& prof : g_cfg.profiles) {
+                        if (prof.exe == loPath2) {
+                            if (prof.localDimming >= 0) sDim   = prof.localDimming;
+                            if (prof.sharpness    >= 0) sSharp = prof.sharpness;
+                            break;
+                        }
+                    }
                     LeaveCriticalSection(&g_cfgLock);
 
                     Log("SDR game detected: %s (PID %lu)", base ? base + 1 : path.c_str(), pid);
