@@ -1126,6 +1126,7 @@ static DWORD WINAPI MonitorThread(LPVOID)
     std::map<DWORD, GameProfile> activeProfiles;  // pid -> profile used
     bool hdrActive        = false;
     bool sdrDimmingActive = false;
+    bool sdrDimApplied    = false;  // dimming command actually sent this SDR session
     bool dimSentForHdr    = false;  // any dimming command sent this HDR session
     bool sharpSentForHdr  = false;  // any sharpness command sent this HDR session
 
@@ -1220,16 +1221,15 @@ static DWORD WINAPI MonitorThread(LPVOID)
 
         // --- All SDR games closed ---
         if (sdrGames.empty() && sdrDimmingActive && !hdrActive) {
-            int sDim, sSharp, sBrightDesk;
+            int sSharp, sBrightDesk;
             EnterCriticalSection(&g_cfgLock);
-            sDim        = g_cfg.ktcSdrLocalDimming;
             sSharp      = g_cfg.ktcSharpnessDesktop;
             sBrightDesk = g_cfg.ktcBrightnessDesktop;
             LeaveCriticalSection(&g_cfgLock);
             Log("All SDR games closed — restoring desktop settings");
             SetKTCBrightness(sBrightDesk);
-            if (sDim <= 0 && sSharp >= 0) SetKTCSharpness(sSharp);
-            if (sDim > 0) { SetKTCLocalDimming(1); SetKTCSharpness(sSharp); }
+            if (sdrDimApplied) { SetKTCLocalDimming(1); sdrDimApplied = false; }
+            if (sSharp >= 0) SetKTCSharpness(sSharp);
             sdrDimmingActive = false;
         }
 
@@ -1336,7 +1336,7 @@ static DWORD WINAPI MonitorThread(LPVOID)
                     if (!hProc) { Log("  (cannot open SDR process)"); continue; }
 
                     if (sdrGames.empty() && !hdrActive) {
-                        if (sDim > 0) { Log("SDR dimming -> %d", sDim); SetKTCLocalDimming(sDim); }
+                        if (sDim > 0) { Log("SDR dimming -> %d", sDim); SetKTCLocalDimming(sDim); sdrDimApplied = true; }
                         if (sSharp >= 0) SetKTCSharpness(sSharp);
                         SetKTCBrightness(sBright);
                         sdrDimmingActive = true;
