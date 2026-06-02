@@ -72,6 +72,8 @@ struct Lang {
     const char *profDimDefault;
     const char *menuKTCSettings;
     const char *menuBrightness;
+    const char *menuVideo;
+    const char *menuVideoBrowser;
 };
 
 static const Lang kES = {
@@ -87,7 +89,9 @@ static const Lang kES = {
     "Perfiles de juego...", "Perfiles de juego", "Nitidez (KTC)",
     "Local Dimming:", "Nitidez (0-10):", "Ejecutable:", "Usar valor global",
     "Configuraci\xf3n KTC",
-    "Brillo"
+    "Brillo",
+    "V\xed" "deo",
+    "HDR en navegador a pantalla completa"
 };
 static const Lang kEN = {
     "Monitored folders...", "Always enable HDR...", "Never enable HDR...", "Exclude...",
@@ -102,7 +106,9 @@ static const Lang kEN = {
     "Game profiles...", "Game profiles", "Sharpness (KTC)",
     "Local Dimming:", "Sharpness (0-10):", "Executable:", "Global default",
     "KTC Settings",
-    "Brightness"
+    "Brightness",
+    "Video",
+    "HDR on browser fullscreen"
 };
 static const Lang* L = &kEN;
 
@@ -133,6 +139,7 @@ struct Config {
     int    ktcBrightnessDesktop = 22; // 0-100 (VCP 0x10) — brightness restored when no SDR game running
     int    ktcBrightnessSdr     = 100;// 0-100 (VCP 0x10) — brightness applied when SDR game launches
     time_t lastUpdateAttempt  = 0;  // unix timestamp of last auto-update trigger (anti-loop)
+    bool   browserHdrEnabled  = false;
     std::vector<GameProfile> profiles;
 };
 
@@ -200,6 +207,7 @@ static void SaveConfig()
     fprintf(f, "ktc_sharpness_desktop=%d\n",   g_cfg.ktcSharpnessDesktop);
     fprintf(f, "ktc_brightness_desktop=%d\n",  g_cfg.ktcBrightnessDesktop);
     fprintf(f, "ktc_brightness_sdr=%d\n",      g_cfg.ktcBrightnessSdr);
+    fprintf(f, "browser_hdr=%d\n",          g_cfg.browserHdrEnabled ? 1 : 0);
     if (g_cfg.lastUpdateAttempt)
         fprintf(f, "last_update_attempt=%lld\n", (long long)g_cfg.lastUpdateAttempt);
     fprintf(f, "[folders]\n");
@@ -329,6 +337,8 @@ static void LoadConfig()
             }
             if (strncmp(line, "last_update_attempt=", 20) == 0)
                 g_cfg.lastUpdateAttempt = (time_t)atoll(line + 20);
+            if (strncmp(line, "browser_hdr=", 12) == 0)
+                g_cfg.browserHdrEnabled = atoi(line + 12) != 0;
             break;
         case SEC_FOLDERS:   g_cfg.folders.push_back(line);   break;
         case SEC_WHITELIST: g_cfg.whitelist.push_back(line); break;
@@ -1743,6 +1753,8 @@ cleanup:
 #define ID_KTC_SDR_STANDARD 312
 #define ID_KTC_SDR_HIGH     313
 
+#define ID_VIDEO_BROWSER  314
+
 #define TIMER_BROWSER     1   // 500ms browser fullscreen check
 #define TIMER_TRAY_RETRY  2   // 1s retry when Shell_NotifyIcon(NIM_ADD) fails at logon
 
@@ -1775,6 +1787,32 @@ static void CheckBrowserHDR()
 {
     // Skip the first ~10 seconds after startup to let the shell settle
     if (g_browserSkipTicks > 0) { --g_browserSkipTicks; return; }
+
+    // Feature disabled — turn off browser HDR if it was on and bail
+    {
+        bool enabled;
+        EnterCriticalSection(&g_cfgLock);
+        enabled = g_cfg.browserHdrEnabled;
+        LeaveCriticalSection(&g_cfgLock);
+        if (!enabled) {
+            if (g_browserHdrOn) {
+                Log("Browser HDR disabled — disabling HDR");
+                SetHDR(false);
+                int d, sh;
+                EnterCriticalSection(&g_cfgLock);
+                d  = g_cfg.ktcLocalDimming;
+                sh = g_cfg.ktcSharpnessDesktop;
+                g_hdrSource[0] = '\0';
+                LeaveCriticalSection(&g_cfgLock);
+                Sleep(500);
+                if (d > 0) SetKTCLocalDimming(1);
+                RestoreKTCSharpnessAfterHdrTransition(sh);
+                g_browserHdrOn = false;
+                UpdateTray(false);
+            }
+            return;
+        }
+    }
 
     // Game controls HDR while running — don't interfere
     if (g_gameHdrOn) {
@@ -2414,14 +2452,16 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
             // Local Dimming parent menu
             int d, ds, shdrv, ssdv, sdeskv, brightDesk, brightSdr;
+            bool browserHdrOn;
             EnterCriticalSection(&g_cfgLock);
-            d          = g_cfg.ktcLocalDimming;
-            ds         = g_cfg.ktcSdrLocalDimming;
-            shdrv      = g_cfg.ktcSharpnessHdr;
-            ssdv       = g_cfg.ktcSharpnessSdr;
-            sdeskv     = g_cfg.ktcSharpnessDesktop;
-            brightDesk = g_cfg.ktcBrightnessDesktop;
-            brightSdr  = g_cfg.ktcBrightnessSdr;
+            d            = g_cfg.ktcLocalDimming;
+            ds           = g_cfg.ktcSdrLocalDimming;
+            shdrv        = g_cfg.ktcSharpnessHdr;
+            ssdv         = g_cfg.ktcSharpnessSdr;
+            sdeskv       = g_cfg.ktcSharpnessDesktop;
+            brightDesk   = g_cfg.ktcBrightnessDesktop;
+            brightSdr    = g_cfg.ktcBrightnessSdr;
+            browserHdrOn = g_cfg.browserHdrEnabled;
             LeaveCriticalSection(&g_cfgLock);
 
             HMENU sub = CreatePopupMenu();
@@ -2471,6 +2511,12 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             AppendMenuA(ktcMenu, MF_SEPARATOR, 0, nullptr);
             AppendMenuA(ktcMenu, MF_STRING,    ID_TRAY_PROFILES,        L->menuProfiles);
             AppendMenuA(m, MF_POPUP, (UINT_PTR)ktcMenu, L->menuKTCSettings);
+
+            // Video submenu
+            HMENU videoMenu = CreatePopupMenu();
+            AppendMenuA(videoMenu, MF_STRING | (browserHdrOn ? MF_CHECKED : 0u),
+                        ID_VIDEO_BROWSER, L->menuVideoBrowser);
+            AppendMenuA(m, MF_POPUP, (UINT_PTR)videoMenu, L->menuVideo);
             AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
 
             UINT startFlag = MF_STRING | (IsInStartup() ? MF_CHECKED : 0u);
@@ -2522,6 +2568,8 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             ShowNumDialog("Brightness SDR Game (KTC)", &g_cfg.ktcBrightnessSdr, 0, 100); break;
         case ID_TRAY_PROFILES:
             ShowProfilesDialog(); break;
+        case ID_VIDEO_BROWSER:
+            { EnterCriticalSection(&g_cfgLock); g_cfg.browserHdrEnabled = !g_cfg.browserHdrEnabled; LeaveCriticalSection(&g_cfgLock); SaveConfig(); } break;
         case ID_TRAY_GITHUB:
             ShellExecuteA(nullptr, "open", "https://github.com/conecta6/HDRAutostart-W11", nullptr, nullptr, SW_SHOWNORMAL);
             break;
