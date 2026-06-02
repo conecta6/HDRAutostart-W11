@@ -1246,27 +1246,28 @@ static DWORD WINAPI MonitorThread(LPVOID)
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (snap == INVALID_HANDLE_VALUE) continue;
 
+        std::set<DWORD> alive;  // PIDs alive this scan — used to purge dead PIDs from 'seen'
         PROCESSENTRY32 pe = {};  pe.dwSize = sizeof(pe);
         if (Process32First(snap, &pe)) {
             do {
                 DWORD pid = pe.th32ProcessID;
+                alive.insert(pid);
                 if (seen.count(pid) || games.count(pid) || sdrGames.count(pid)) continue;
-                seen.insert(pid);
 
                 std::string path = GetProcessPath(pid);
-                if (path.empty()) continue;
+                if (path.empty()) { seen.insert(pid); continue; }  // no accessible path — remember
 
                 int cls = ClassifyProcess(path);
-                if (cls == 0) continue;
+                if (cls == 0) { seen.insert(pid); continue; }      // not a game — remember
 
                 const char* base = strrchr(path.c_str(), '\\');
 
                 if (cls == 1) {
                     // HDR game
-                    Log("Game detected: %s (PID %lu)", base ? base + 1 : path.c_str(), pid);
                     HANDLE hProc = OpenProcess(
                         SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-                    if (!hProc) { Log("  (cannot open process)"); continue; }
+                    if (!hProc) continue;  // transient open failure — retry next tick (don't burn into 'seen')
+                    Log("Game detected: %s (PID %lu)", base ? base + 1 : path.c_str(), pid);
 
                     if (games.empty()) {
                         // Check for per-game profile
@@ -1339,10 +1340,10 @@ static DWORD WINAPI MonitorThread(LPVOID)
                     }
                     LeaveCriticalSection(&g_cfgLock);
 
-                    Log("SDR game detected: %s (PID %lu)", base ? base + 1 : path.c_str(), pid);
                     HANDLE hProc = OpenProcess(
                         SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-                    if (!hProc) { Log("  (cannot open SDR process)"); continue; }
+                    if (!hProc) continue;  // transient open failure — retry next tick (don't burn into 'seen')
+                    Log("SDR game detected: %s (PID %lu)", base ? base + 1 : path.c_str(), pid);
 
                     if (sdrGames.empty() && !hdrActive) {
                         if (sDim > 0) { Log("SDR dimming -> %d", sDim); SetKTCLocalDimming(sDim); }
@@ -1356,6 +1357,11 @@ static DWORD WINAPI MonitorThread(LPVOID)
             } while (Process32Next(snap, &pe));
         }
         CloseHandle(snap);
+
+        // Purge dead PIDs from 'seen' so a recycled PID (e.g. a relaunched game)
+        // is classified again instead of being skipped forever.
+        for (auto it = seen.begin(); it != seen.end(); )
+            if (!alive.count(*it)) it = seen.erase(it); else ++it;
     }
 
     // Shutdown cleanup
