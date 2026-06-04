@@ -977,32 +977,43 @@ static const char* kLauncherExes[] = {
     nullptr
 };
 
+// Match a config-list entry against a process path (both compared lowercase):
+//   - entry ending in '\'        -> recursive folder prefix match
+//   - entry containing a '\'     -> exact full-path match
+//   - entry with no '\' (a name) -> match by executable basename
+// The basename form lets the user block/exclude auxiliary processes (e.g. a
+// game's crash handler "handler.exe") regardless of which folder they live in.
+static bool MatchListEntry(const std::string& entry,
+                           const std::string& fullLo, const std::string& baseLo)
+{
+    std::string elo = ToLower(entry);
+    if (elo.empty()) return false;
+    if (elo.back() == '\\')                  return fullLo.find(elo) == 0;  // folder prefix
+    if (elo.find('\\') != std::string::npos) return elo == fullLo;         // full path
+    return elo == baseLo;                                                  // bare exe name
+}
+
 // Returns  1 = activate HDR
 //          0 = ignore
 //         -1 = block (blacklist)
 static int ClassifyProcess(const std::string& path)
 {
     std::string lo = ToLower(path);
+    const char* bb = strrchr(lo.c_str(), '\\');
+    std::string base = bb ? std::string(bb + 1) : lo;  // executable basename, lowercase
 
     // Always ignore known platform launchers (even if inside a monitored folder)
-    {
-        const char* p = lo.c_str();
-        const char* b = strrchr(p, '\\');
-        b = b ? b + 1 : p;
-        for (int i = 0; kLauncherExes[i]; ++i)
-            if (!strcmp(b, kLauncherExes[i])) return 0;
-    }
+    for (int i = 0; kLauncherExes[i]; ++i)
+        if (base == kLauncherExes[i]) return 0;
+
     EnterCriticalSection(&g_cfgLock);
-    // User-defined exclude list: exact exe match or recursive folder prefix match
-    for (auto& e : g_cfg.exclude) {
-        std::string elo = ToLower(e);
-        bool match = (!elo.empty() && elo.back() == '\\') ? (lo.find(elo) == 0) : (elo == lo);
-        if (match) { LeaveCriticalSection(&g_cfgLock); return 0; }
-    }
+    // User lists: each entry matches by folder prefix, full path, or bare exe name
+    for (auto& e : g_cfg.exclude)
+        if (MatchListEntry(e, lo, base)) { LeaveCriticalSection(&g_cfgLock); return 0; }
     for (auto& e : g_cfg.blacklist)
-        if (ToLower(e) == lo) { LeaveCriticalSection(&g_cfgLock); return -1; }
+        if (MatchListEntry(e, lo, base)) { LeaveCriticalSection(&g_cfgLock); return -1; }
     for (auto& e : g_cfg.whitelist)
-        if (ToLower(e) == lo) { LeaveCriticalSection(&g_cfgLock); return 1; }
+        if (MatchListEntry(e, lo, base)) { LeaveCriticalSection(&g_cfgLock); return 1; }
     for (auto& f : g_cfg.folders)
         if (lo.find(ToLower(f)) == 0) { LeaveCriticalSection(&g_cfgLock); return 1; }
     LeaveCriticalSection(&g_cfgLock);
