@@ -16,15 +16,13 @@ Windows 11 supports HDR, but it does not switch automatically. If you leave HDR 
 
 | Feature | Description |
 |---|---|
-| **Game auto-detection** | Monitors Steam / GOG / Epic (and any custom folder) for new game processes and enables HDR the moment a game launches. Games already open when the app starts are detected too, and an HDR left on by a previous run is turned off. HDR is disabled automatically 2 seconds after the last game closes. |
-| **Browser fullscreen** | When Chrome, Edge, Firefox, Brave, Vivaldi, Opera, or other supported browsers enter fullscreen, HDR is enabled. It is disabled again as soon as the browser leaves fullscreen. Off by default: enable it from the tray menu (**Video** → **HDR on browser fullscreen**). To watch HDR videos, simply put the browser in fullscreen mode — usually by pressing **F11** or clicking the fullscreen button on the video player. |
-| **Whitelist** | Add individual `.exe` files that should always trigger HDR, regardless of their folder location. |
-| **Blacklist** | Add individual `.exe` files that should never trigger HDR (e.g. launchers inside game folders you don't want triggering HDR). |
-| **Exclude** | Completely ignore specific executables or entire folders. Excluded items are never scanned — no HDR, no KTC dimming. Useful for tools, utilities, or whole directories you never want to trigger anything. |
-| **KTC Local Dimming** | For KTC monitors with DDC/CI support: automatically control the Local Dimming level (VCP 0xF4) when HDR switches on or off. Separate settings for HDR and SDR modes. Off by default — safe on any monitor. |
-| **KTC Sharpness** | Automatically set monitor sharpness (VCP 0x87) when HDR activates or deactivates. Configurable from 0 to 10. Default: 6. |
-| **KTC Brightness** | Automatically set monitor brightness (VCP 0x10) when an SDR game launches or exits. Desktop value default: 22. SDR game value default: 100. |
-| **Game profiles** | Assign per-game Local Dimming and Sharpness overrides to specific executables. When the game closes, standard global values are restored automatically. |
+| **Game detection (by profile)** | Only programs that have a game profile are watched. When one launches, HDR is enabled the moment it starts (if its profile has HDR on). Games already open when the app starts are detected too, and an HDR left on by a previous run is turned off. HDR is disabled automatically 2 seconds after the last HDR game closes. |
+| **Browser fullscreen** | When Chrome, Edge, Firefox, Brave, Vivaldi, Opera, or other supported browsers enter fullscreen, HDR is enabled. It is disabled again as soon as the browser leaves fullscreen. Off by default: enable it from the tray menu (**Video** → **HDR on browser fullscreen**). To watch HDR videos, simply put the browser in fullscreen mode — usually by pressing **F11** or clicking the fullscreen button on the video player. Its Local Dimming and Sharpness are set in the **Video** submenu. |
+| **Desktop values (KTC)** | The only "general" settings: the Local Dimming, Sharpness and Brightness the monitor goes back to when no game (and no HDR browser video) is active. Changing one from the tray menu applies it at once if nothing is holding the monitor. |
+| **KTC Local Dimming** | For KTC monitors with DDC/CI support: set the Local Dimming level (VCP 0xF4) for the desktop, for each game profile and for HDR video in a browser. **Don't change** sends no command (the monitor keeps whatever value it has at that moment, it is not switched off), so it is safe on any monitor. |
+| **KTC Sharpness** | Set the monitor sharpness (VCP 0x87) from 0 to 10 (or Don't change = send nothing) for the desktop, for each game profile and for HDR video in a browser. Default: 6. |
+| **KTC Brightness** | Set the monitor brightness (VCP 0x10): the Desktop value (default 22) and, in profiles with HDR off, the profile's own value. HDR games leave the brightness to the monitor. |
+| **Game profiles** | A profile is an executable plus **HDR on/off**, Local Dimming, Sharpness and Brightness. Every profile carries its own values; there is no general fallback. A new profile starts with HDR on and the Desktop values as a base, and you change them. HDR on: HDR is enabled while the game runs. HDR off (an SDR game): HDR is not enabled, but the profile's dimming, sharpness and brightness are applied. When the last game closes, the monitor returns to the Desktop values. Creating, editing or removing a profile while its game is open takes effect without restarting the game. |
 | **Run at startup** | Launches HDRAutostart with Windows through a scheduled task (no UAC prompt). The installer creates it; you can turn it on or off from the tray menu. |
 | **System tray** | Runs silently in the background. Orange icon = HDR active, grey icon = HDR inactive. Right-click for the menu. |
 
@@ -50,144 +48,130 @@ All settings are stored in `hdrautostart.ini`. Its location depends on how you i
 The tray menu currently contains these entries:
 
     HDRAutostart vX.Y.Z              (informational header, disabled)
-    Monitored folders...
-    Always enable HDR...
-    Never enable HDR...
-    Exclude...
-    KTC Settings
+    Game profiles...
+    Desktop (KTC)
       Local Dimming
-        HDR (KTC)
-          Off / Auto / Low / Standard / High
-        SDR (KTC)
-          Off / Auto / Low / Standard / High
-      Sharpness (KTC)
-        HDR (KTC): <current value>
-        SDR (KTC): <current value>
-        Desktop (KTC): <current value>
-      Brightness
-        Desktop (KTC): <current value>
-        SDR Game (KTC): <current value>
-      Game profiles...
+        Don't change / Auto / Low / Standard / High
+      Sharpness: <current value>...
+      Brightness: <current value>...
     Video
       HDR on browser fullscreen      (checked when enabled)
+      Local Dimming
+        Don't change / Auto / Low / Standard / High
+      Sharpness: <current value>...
     Run at startup                   (checked when enabled)
     GitHub
     Exit
 
-- `Monitored folders...`, `Always enable HDR...`, `Never enable HDR...`, and `Exclude...` open the corresponding list dialogs.
-- `KTC Settings -> Local Dimming` stores the selected HDR and SDR dimming mode, showing a check mark on the active value.
-- `KTC Settings -> Sharpness (KTC)` shows the current HDR, SDR, and Desktop sharpness values and opens the value picker for each one.
-- `KTC Settings -> Brightness` shows the current Desktop and SDR Game brightness values and opens the numeric input for each one.
-- `KTC Settings -> Game profiles...` opens the per-game override manager.
+- `Game profiles...` opens the game profile manager (see below).
+- `Desktop (KTC)` holds the values the monitor goes back to when no game (and no HDR browser video) is active. `Local Dimming` shows a check mark on the active value; `Sharpness` and `Brightness` show the current value and open the picker / numeric input. A change applies at once if no game or HDR video is holding the monitor.
 - `Video -> HDR on browser fullscreen` turns browser fullscreen HDR on or off (off by default).
+- `Video -> Local Dimming` and `Video -> Sharpness` are the values used while an HDR video plays in a fullscreen browser. They apply the next time a video goes fullscreen.
 - `Run at startup` toggles Windows startup registration.
 - `GitHub` opens the project repository in your browser.
 - `Exit` closes HDRAutostart.
 
-#### Monitored folders
+#### Game profiles
 
-HDRAutostart comes pre-configured with your Steam library path (read from the registry). Any `.exe` that launches from inside a monitored folder will trigger HDR. You can add GOG, Epic, or any custom game folder.
+HDRAutostart only watches programs that have a game profile. A profile is an executable plus:
 
-> Right-click tray icon → **Monitored folders…**
+- **Enable HDR for this game** — checked: HDR is turned on while the game is open. Unchecked: SDR game — HDR is not enabled, but the profile's own values are applied.
+- **Local Dimming** (field *Local Dimming:*) — Don't change (nothing is sent: the monitor keeps whatever value it has), Auto, Low, Standard or High.
+- **Sharpness** — Don't change (nothing is sent: the monitor keeps whatever value it has) or 0–10.
+- **Brightness (0-100)** — only used when HDR is off (greyed out while the HDR box is checked). HDR games leave the brightness to the monitor.
 
-#### Always enable HDR (Whitelist)
+Every profile has its own values; there is no "use the general value" option.
 
-Add specific `.exe` files that should always trigger HDR no matter where they are located. Useful for games installed outside your normal library folders.
+To add a game:
 
-> Right-click tray icon → **Always enable HDR…**
+1. Right-click tray icon → **Game profiles…**
+2. Click **Add** and pick the game's `.exe`.
+3. The **Profile settings** dialog opens with HDR checked and the Desktop values (Local Dimming, Sharpness, Brightness) as a starting point. Change what you need.
+4. Click **OK**.
 
-#### Never enable HDR (Blacklist)
+Use **Edit** (or double-click) to change a profile and **Remove** to delete it. Adding an `.exe` that already has a profile opens that profile for editing. When the game closes, the monitor returns to the Desktop values.
 
-Add `.exe` files that should never trigger HDR. Useful for launchers (e.g. `EpicGamesLauncher.exe`) that live inside a monitored folder but are not games.
+Profile changes take effect without restarting the game: a new profile is picked up by a game that is already open, a removed one stops being tracked (HDR goes off after the usual 2 s), and switching HDR on or off in a profile switches it for the running game. Edited values are re-sent straight away only when a single game is open; with several, they apply from the next launch.
 
-> Right-click tray icon → **Never enable HDR…**
+#### The `.ini` file
 
-#### Exclude
+Settings go under `[settings]` and one profile per line under `[profiles]`, as `exe|dimming|sharpness|hdr|brightness`. Dimming is `0` (don't change) or `1`–`4` (Auto, Low, Standard, High); sharpness is `-1` (don't change) or `0`–`10`; hdr is `1` (HDR on) or `0` (SDR game); brightness is `0`–`100` and is only used when hdr is `0` (HDR profiles keep the field but ignore it). In `[settings]`, `ktc_dimming_desktop`, `ktc_sharpness_desktop` and `ktc_brightness_desktop` are the Desktop values, `video_dimming` and `video_sharpness` are the Video values (same scales as above) and `browser_hdr` is the browser fullscreen switch (`1` = on). Example:
 
-Completely ignore specific executables or entire folders — the excluded items are never processed at all (no HDR, no KTC dimming, no blacklist logic).
+```ini
+[settings]
+ktc_dimming_desktop=1
+ktc_sharpness_desktop=6
+ktc_brightness_desktop=22
+video_dimming=4
+video_sharpness=6
+browser_hdr=0
+[profiles]
+c:\games\cyberpunk 2077\bin\x64\cyberpunk2077.exe|4|8|1|22
+eldenring.exe|4|-1|1|22
+d:\retro\|0|-1|0|80
+```
 
-- **Add file** — pick a specific `.exe` to exclude.
-- **Add folder** — pick a folder; all executables inside it and any subfolder are excluded recursively.
+The first field can be a full path (the only form the interface creates), an executable name (`eldenring.exe`, matches it wherever it is installed) or a folder prefix ending in `\` (`d:\retro\`, matches every program inside). The last two forms can only be set by editing the `.ini` by hand, with HDRAutostart closed (the app rewrites the file when you change a setting). If several entries match, a full path wins over a name, and a name wins over a folder.
 
-Useful for tools, benchmarks, or secondary launchers you never want HDRAutostart to react to, even if they run from inside a monitored game folder.
+**Upgrading from an earlier version:** older versions detected games through monitored folders (e.g. your whole Steam library) plus whitelist, blacklist and exclude lists, and used general Local Dimming / Sharpness values for HDR and for SDR (plus a general SDR brightness). Those no longer exist: the only general values left are the Desktop ones, and every profile carries its own. On first start the old `.ini` is converted automatically and a copy is saved as `hdrautostart.ini.bak` (an existing `.bak` is never overwritten):
 
-> Right-click tray icon → **Exclude…**
+- Whitelist entries become profiles with HDR on, blacklist entries become profiles with HDR off, existing profiles keep their values (their HDR on/off is worked out from the old lists), and folders and exclusions are discarded.
+- A profile that used the "general value" gets the old general value of its mode (HDR or SDR) for Local Dimming and Sharpness, and every profile takes the old SDR brightness.
+- The Video values take the old HDR Local Dimming and Sharpness. Desktop Sharpness and Brightness are kept; Desktop Local Dimming starts at Auto, so set it again from the menu if you want something else.
 
-> **Note:** Common platform launchers (Steam, GOG Galaxy, Epic, Xbox, Ubisoft Connect, EA App) are always excluded automatically and do not need to be added manually.
+**Games that were detected only because they were inside a monitored folder stop being detected until you create a profile for them.**
 
 ---
 
-### KTC Settings (KTC monitors only)
+### KTC values (KTC monitors only)
 
-> **Note:** HDRAutostart only works with KTC monitors: HDR switching and everything in this submenu are sent only to a KTC display, and other connected monitors are left alone.
+> **Note:** HDRAutostart only works with KTC monitors: HDR switching and everything in this section are sent only to a KTC display, and other connected monitors are left alone.
 
-All KTC-specific options are grouped under:
+The KTC values live in three places:
 
-> Right-click tray icon → **KTC Settings**
-
-This submenu contains Local Dimming, Sharpness, Brightness, and Game Profiles.
+> Right-click tray icon → **Desktop (KTC)** — what the monitor goes back to when no game is open
+>
+> Right-click tray icon → **Video** — HDR video in a fullscreen browser
+>
+> Right-click tray icon → **Game profiles…** — each game's own values
 
 #### Local Dimming
 
-HDRAutostart sends DDC/CI commands to KTC monitors to control Local Dimming automatically when HDR switches on or off. There are two independent settings — one for each mode:
-
-**Local Dimming HDR (KTC)** — level applied when HDR is active (e.g. while playing a game):
+HDRAutostart sends DDC/CI commands to KTC monitors to set the Local Dimming level (VCP 0xF4). The same five choices are used in all three places:
 
 | Setting | VCP value | Description |
 |---|---|---|
-| **Off** *(default)* | — | No DDC commands sent. Safe for all monitors. |
+| **Don't change** | — | No DDC command sent: the monitor keeps whatever value it has (it does not switch dimming off). Safe for all monitors. |
 | **Auto** | 1 | Monitor controls dimming automatically |
 | **Low** | 2 | Low Local Dimming |
 | **Standard** | 3 | Standard Local Dimming |
 | **High** | 4 | Maximum Local Dimming — recommended for HDR gaming on KTC |
 
-**Local Dimming SDR (KTC)** — level applied when HDR is deactivated (normal desktop, SDR use):
+Default: **Auto** for Desktop and Video. A new profile copies the Desktop value.
 
-| Setting | VCP value | Description |
-|---|---|---|
-| **Off** *(default)* | — | No DDC commands sent. |
-| **Auto** | 1 | Monitor manages dimming automatically in SDR |
-| **Low** | 2 | Low Local Dimming |
-| **Standard** | 3 | Standard Local Dimming |
-| **High** | 4 | Maximum Local Dimming |
-
-Both settings are independent so you can, for example, use **High** for HDR gaming and **Auto** (or **Off**) for normal desktop use.
-
-> KTC Settings → **Local Dimming** → HDR (KTC) / SDR (KTC)
+> Desktop (KTC) → **Local Dimming**, Video → **Local Dimming**, or the Local Dimming field of a profile
 
 #### Sharpness
 
-Automatically sets the monitor's sharpness level (VCP 0x87) via DDC/CI when HDR activates or deactivates. Two independent values — one for HDR mode and one for SDR mode. Select from 0 to 10, or **Off** to send no command.
+Sets the monitor's sharpness level (VCP 0x87) via DDC/CI. Because switching HDR on or off resets it, the value is sent again after each switch. Select from 0 to 10, or **Don't change** to send no command.
 
 | Setting | Description |
 |---|---|
-| **Off** | No DDC sharpness commands sent. |
+| **Don't change** | No DDC sharpness command sent: the monitor keeps whatever value it has. |
 | **0 – 10** | Sharpness level sent to the monitor. Default: **6**. |
 
-> KTC Settings → **Sharpness (KTC)** → HDR (KTC) / SDR (KTC)
+> Desktop (KTC) → **Sharpness**, Video → **Sharpness**, or the Sharpness field of a profile
 
 #### Brightness
 
-Automatically sets the monitor's brightness level (VCP 0x10) via DDC/CI when an SDR game (blacklisted executable) launches or exits. Two independent values:
+Sets the monitor's brightness level (VCP 0x10) via DDC/CI, in the 0–100 range. It is sent in two cases only; with HDR on, the monitor handles brightness itself.
 
 | Setting | Default | Description |
 |---|---|---|
-| **Desktop (KTC)** | 22 | Brightness restored when no SDR game is running. |
-| **SDR Game (KTC)** | 100 | Brightness applied when an SDR game launches. |
+| **Desktop (KTC)** | 22 | Brightness restored when no game is running. |
+| **Profile with HDR off** | Desktop value when created | Brightness applied while that SDR game runs. |
 
-Both values are in the 0–100 range. Click either entry to open the numeric input dialog.
-
-> KTC Settings → **Brightness** → Desktop (KTC) / SDR Game (KTC)
-
-#### Game profiles
-
-Assign per-game Local Dimming and Sharpness overrides to specific executables. When that game launches, the profile values are applied instead of the global KTC settings. When the game closes, the global standard values are automatically restored.
-
-- **Add** — pick a `.exe` file, then choose Local Dimming and Sharpness overrides (or **Global default** to inherit the global setting).
-- **Edit** — select a profile and click Edit (or double-click) to modify its values.
-- **Remove** — delete the selected profile.
-
-> KTC Settings → **Game profiles…**
+> Desktop (KTC) → **Brightness** (click to open the numeric input), or the Brightness field of a profile
 
 ---
 
@@ -235,15 +219,13 @@ Windows 11 soporta HDR, pero no lo activa automáticamente. Si dejas el HDR siem
 
 | Función | Descripción |
 |---|---|
-| **Detección automática de juegos** | Monitorea Steam / GOG / Epic (y cualquier carpeta personalizada) en busca de nuevos procesos de juego y activa el HDR en cuanto el juego abre. También detecta los juegos que ya estaban abiertos al iniciar la app, y apaga un HDR que hubiera quedado encendido de una ejecución anterior. El HDR se desactiva automáticamente 2 segundos después de cerrarse el último juego. |
-| **Pantalla completa en navegador** | Cuando Chrome, Edge, Firefox, Brave, Vivaldi, Opera u otros navegadores compatibles entran en pantalla completa, se activa el HDR. Se desactiva en cuanto el navegador sale de pantalla completa. Está desactivado por defecto: actívalo desde el menú de la bandeja (**Vídeo** → **HDR en navegador a pantalla completa**). Para ver videos en HDR, simplemente pon el navegador en pantalla completa — normalmente pulsando **F11** o el botón de pantalla completa del reproductor de video. |
-| **Lista blanca** | Agrega archivos `.exe` individuales que siempre deben activar el HDR, independientemente de su carpeta. |
-| **Lista negra** | Agrega archivos `.exe` individuales que nunca deben activar el HDR (p. ej. launchers dentro de carpetas de juegos que no quieres que disparen el HDR). |
-| **Excluir** | Ignora completamente ejecutables concretos o carpetas enteras. Los elementos excluidos no se procesan en absoluto — sin HDR, sin KTC dimming. Útil para herramientas, utilidades o directorios enteros que nunca quieres que disparen nada. |
-| **Local Dimming KTC** | Para monitores KTC con soporte DDC/CI: controla automáticamente el nivel de Local Dimming (VCP 0xF4) cuando el HDR se activa o desactiva. Ajustes independientes para modo HDR y SDR. Desactivado por defecto — seguro en cualquier monitor. |
-| **Nitidez KTC** | Ajusta automáticamente la nitidez del monitor (VCP 0x87) al activar o desactivar el HDR. Configurable de 0 a 10. Valor por defecto: 6. |
-| **Brillo KTC** | Ajusta automáticamente el brillo del monitor (VCP 0x10) cuando se lanza o cierra un juego SDR (lista negra). Valor escritorio por defecto: 22. Valor juego SDR por defecto: 100. |
-| **Perfiles de juego** | Asigna valores personalizados de Local Dimming y Nitidez a ejecutables específicos. Al cerrar el juego, se restauran automáticamente los valores globales estándar. |
+| **Detección de juegos (por perfil)** | Solo se vigilan los programas que tienen un perfil de juego. Cuando uno se lanza, el HDR se activa en cuanto abre (si su perfil tiene el HDR activado). También detecta los juegos que ya estaban abiertos al iniciar la app, y apaga un HDR que hubiera quedado encendido de una ejecución anterior. El HDR se desactiva automáticamente 2 segundos después de cerrarse el último juego con HDR. |
+| **Pantalla completa en navegador** | Cuando Chrome, Edge, Firefox, Brave, Vivaldi, Opera u otros navegadores compatibles entran en pantalla completa, se activa el HDR. Se desactiva en cuanto el navegador sale de pantalla completa. Está desactivado por defecto: actívalo desde el menú de la bandeja (**Vídeo** → **HDR en navegador a pantalla completa**). Para ver videos en HDR, simplemente pon el navegador en pantalla completa — normalmente pulsando **F11** o el botón de pantalla completa del reproductor de video. Su Local Dimming y su Nitidez se ajustan en el submenú **Vídeo**. |
+| **Valores de escritorio (KTC)** | Son los únicos ajustes "generales": el Local Dimming, la Nitidez y el Brillo a los que vuelve el monitor cuando no hay ningún juego (ni vídeo HDR de navegador) activo. Si cambias uno desde el menú de la bandeja, se aplica al momento si nada está controlando el monitor. |
+| **Local Dimming KTC** | Para monitores KTC con soporte DDC/CI: fija el nivel de Local Dimming (VCP 0xF4) del escritorio, de cada perfil de juego y del vídeo HDR en navegador. **No tocar** no envía ningún comando (el monitor conserva el valor que tenga en ese momento, no se apaga), así que es seguro en cualquier monitor. |
+| **Nitidez KTC** | Fija la nitidez del monitor (VCP 0x87) de 0 a 10 (o No tocar = no enviar nada) para el escritorio, cada perfil de juego y el vídeo HDR en navegador. Valor por defecto: 6. |
+| **Brillo KTC** | Fija el brillo del monitor (VCP 0x10): el valor de escritorio (por defecto 22) y, en los perfiles con el HDR desactivado, el valor propio del perfil. Los juegos con HDR dejan el brillo al propio monitor. |
+| **Perfiles de juego** | Un perfil es un ejecutable más **HDR sí/no**, Local Dimming, Nitidez y Brillo. Cada perfil lleva sus propios valores; no hay valor general de reserva. Un perfil nuevo arranca con el HDR marcado y los valores de escritorio como base, y tú los cambias. HDR sí: el HDR se activa mientras el juego está abierto. HDR no (juego SDR): no se activa el HDR, pero se aplican la atenuación, la nitidez y el brillo del perfil. Al cerrarse el último juego, el monitor vuelve a los valores de escritorio. Crear, editar o borrar un perfil con su juego abierto se aplica sin reiniciar el juego. |
 | **Ejecutar al inicio** | Lanza HDRAutostart con Windows mediante una tarea programada (sin aviso de UAC). La crea el instalador; puedes activarla o desactivarla desde el menú de la bandeja. |
 | **Bandeja del sistema** | Se ejecuta silenciosamente en segundo plano. Icono naranja = HDR activo, icono gris = HDR inactivo. Clic derecho para el menú. |
 
@@ -269,144 +251,130 @@ Todos los ajustes se guardan en `hdrautostart.ini`. Su ubicación depende de có
 El menu de la bandeja contiene actualmente estas opciones:
 
     HDRAutostart vX.Y.Z              (cabecera informativa, deshabilitada)
-    Carpetas monitoreadas...
-    Activar HDR siempre...
-    Nunca activar HDR...
-    Excluir...
-    Configuracion KTC
+    Perfiles de juego...
+    Escritorio (KTC)
       Local Dimming
-        HDR (KTC)
-          Desactivado / Auto / Bajo / Estandar / Alto
-        SDR (KTC)
-          Desactivado / Auto / Bajo / Estandar / Alto
-      Nitidez (KTC)
-        HDR (KTC): <valor actual>
-        SDR (KTC): <valor actual>
-        Desktop (KTC): <valor actual>
-      Brillo
-        Desktop (KTC): <valor actual>
-        SDR Game (KTC): <valor actual>
-      Perfiles de juego...
+        No tocar / Auto / Bajo / Estándar / Alto
+      Nitidez: <valor actual>...
+      Brillo: <valor actual>...
     Vídeo
-      HDR en navegador a pantalla completa   (con marca cuando esta activado)
-    Ejecutar al inicio               (con marca cuando esta activado)
+      HDR en navegador a pantalla completa   (con marca cuando está activado)
+      Local Dimming
+        No tocar / Auto / Bajo / Estándar / Alto
+      Nitidez: <valor actual>...
+    Ejecutar al inicio               (con marca cuando está activado)
     GitHub
     Salir
 
-- `Carpetas monitoreadas...`, `Activar HDR siempre...`, `Nunca activar HDR...` y `Excluir...` abren sus dialogos de lista correspondientes.
-- `Configuracion KTC -> Local Dimming` guarda el modo de dimming seleccionado para HDR y SDR, mostrando una marca en la opcion activa.
-- `Configuracion KTC -> Nitidez (KTC)` muestra los valores actuales de nitidez para HDR, SDR y Desktop, y abre el selector de valor para cada uno.
-- `Configuracion KTC -> Brillo` muestra los valores actuales de brillo para escritorio y juego SDR, y abre el selector numérico para cada uno.
-- `Configuracion KTC -> Perfiles de juego...` abre el gestor de perfiles por juego.
+- `Perfiles de juego...` abre el gestor de perfiles de juego (ver más abajo).
+- `Escritorio (KTC)` guarda los valores a los que vuelve el monitor cuando no hay ningún juego (ni vídeo HDR de navegador) activo. `Local Dimming` muestra una marca en el valor activo; `Nitidez` y `Brillo` muestran el valor actual y abren el selector / la entrada numérica. Un cambio se aplica al momento si ningún juego ni vídeo HDR está controlando el monitor.
 - `Vídeo -> HDR en navegador a pantalla completa` activa o desactiva el HDR en navegador a pantalla completa (desactivado por defecto).
+- `Vídeo -> Local Dimming` y `Vídeo -> Nitidez` son los valores que se usan mientras se reproduce un vídeo HDR en un navegador a pantalla completa. Se aplican la próxima vez que un vídeo pase a pantalla completa.
 - `Ejecutar al inicio` activa o desactiva el arranque con Windows.
 - `GitHub` abre el repositorio del proyecto en el navegador.
 - `Salir` cierra HDRAutostart.
 
-#### Carpetas monitoreadas
+#### Perfiles de juego
 
-HDRAutostart viene pre-configurado con la ruta de tu biblioteca de Steam (leída del registro). Cualquier `.exe` que se lance desde dentro de una carpeta monitorizada activará el HDR. Puedes agregar carpetas de GOG, Epic o cualquier carpeta de juegos personalizada.
+HDRAutostart solo vigila los programas que tienen un perfil de juego. Un perfil es un ejecutable más:
 
-> Clic derecho en el icono de bandeja → **Carpetas monitoreadas…**
+- **Activar HDR con este juego** — marcada: el HDR se enciende mientras el juego está abierto. Desmarcada: juego SDR — no se activa el HDR, pero se aplican los valores propios del perfil.
+- **Atenuación local** — No tocar (no se envía nada: el monitor conserva el valor que tenga), Auto, Bajo, Estándar o Alto.
+- **Nitidez** — No tocar (no se envía nada: el monitor conserva el valor que tenga) o 0–10.
+- **Brillo (0-100)** — solo se usa con el HDR desactivado (aparece atenuado mientras la casilla de HDR está marcada). Los juegos con HDR dejan el brillo al propio monitor.
 
-#### Activar HDR siempre (Lista blanca)
+Cada perfil tiene sus propios valores; no existe la opción "usar el valor general".
 
-Agrega archivos `.exe` específicos que siempre deben activar el HDR sin importar dónde estén ubicados. Útil para juegos instalados fuera de tus carpetas de biblioteca habituales.
+Para añadir un juego:
 
-> Clic derecho en el icono de bandeja → **Activar HDR siempre…**
+1. Clic derecho en el icono de bandeja → **Perfiles de juego…**
+2. Pulsa **Agregar** y elige el `.exe` del juego.
+3. Se abre el diálogo **Ajustes del perfil** con el HDR marcado y los valores de escritorio (Local Dimming, Nitidez, Brillo) como punto de partida. Cambia lo que necesites.
+4. Pulsa **Aceptar**.
 
-#### Nunca activar HDR (Lista negra)
+Usa **Editar** (o doble clic) para cambiar un perfil y **Eliminar** para borrarlo. Si agregas un `.exe` que ya tiene perfil, se abre ese perfil para editarlo. Al cerrar el juego, el monitor vuelve a los valores de escritorio.
 
-Agrega archivos `.exe` que nunca deben activar el HDR. Útil para launchers (p. ej. `EpicGamesLauncher.exe`) que viven dentro de una carpeta monitorizada pero no son juegos.
+Los cambios de perfil se aplican sin reiniciar el juego: un perfil nuevo lo recoge un juego que ya está abierto, uno borrado deja de vigilarse (el HDR se apaga tras los 2 s de siempre) y cambiar el HDR sí/no de un perfil lo cambia también para el juego en marcha. Los valores editados se reenvían al momento solo cuando hay un único juego abierto; con varios, se aplican desde el siguiente arranque.
 
-> Clic derecho en el icono de bandeja → **Nunca activar HDR…**
+#### El archivo `.ini`
 
-#### Excluir
+Los ajustes van en `[settings]` y cada perfil en una línea de `[profiles]`, con el formato `exe|dimming|nitidez|hdr|brillo`. Dimming es `0` (no tocar) o `1`–`4` (Auto, Bajo, Estándar, Alto); nitidez es `-1` (no tocar) o `0`–`10`; hdr es `1` (HDR sí) o `0` (juego SDR); brillo es `0`–`100` y solo se usa cuando hdr es `0` (los perfiles con HDR conservan el campo pero lo ignoran). En `[settings]`, `ktc_dimming_desktop`, `ktc_sharpness_desktop` y `ktc_brightness_desktop` son los valores de escritorio, `video_dimming` y `video_sharpness` son los de vídeo (mismas escalas) y `browser_hdr` es el interruptor de pantalla completa en navegador (`1` = activado). Ejemplo:
 
-Ignora completamente ejecutables concretos o carpetas enteras — los elementos excluidos no se procesan en absoluto (sin HDR, sin KTC dimming, sin lógica de lista negra).
+```ini
+[settings]
+ktc_dimming_desktop=1
+ktc_sharpness_desktop=6
+ktc_brightness_desktop=22
+video_dimming=4
+video_sharpness=6
+browser_hdr=0
+[profiles]
+c:\games\cyberpunk 2077\bin\x64\cyberpunk2077.exe|4|8|1|22
+eldenring.exe|4|-1|1|22
+d:\retro\|0|-1|0|80
+```
 
-- **Agregar archivo** — selecciona un `.exe` concreto para excluir.
-- **Agregar carpeta** — selecciona una carpeta; todos los ejecutables dentro de ella y sus subcarpetas quedan excluidos de forma recursiva.
+El primer campo puede ser una ruta completa (la única forma que crea la interfaz), un nombre de ejecutable (`eldenring.exe`, vale donde esté instalado) o un prefijo de carpeta terminado en `\` (`d:\retro\`, vale para todos los programas de dentro). Las dos últimas formas solo se pueden poner editando el `.ini` a mano, con HDRAutostart cerrado (la app reescribe el archivo cuando cambias un ajuste). Si coinciden varias entradas, la ruta completa gana al nombre, y el nombre gana a la carpeta.
 
-Útil para herramientas, benchmarks o lanzadores secundarios a los que nunca quieres que HDRAutostart reaccione, aunque estén dentro de una carpeta monitorizada.
+**Si actualizas desde una versión anterior:** las versiones antiguas detectaban los juegos con carpetas monitoreadas (p. ej. toda tu biblioteca de Steam) y listas blanca, negra y de exclusión, y usaban valores generales de Local Dimming / Nitidez para HDR y para SDR (más un brillo SDR general). Ya no existen: los únicos valores generales que quedan son los de escritorio, y cada perfil lleva los suyos. Al arrancar por primera vez, el `.ini` antiguo se convierte solo y se guarda una copia como `hdrautostart.ini.bak` (si ya existe un `.bak`, no se sobrescribe):
 
-> Clic derecho en el icono de bandeja → **Excluir…**
+- Las entradas de la lista blanca pasan a ser perfiles con HDR sí, las de la lista negra pasan a ser perfiles con HDR no, los perfiles existentes conservan sus valores (su HDR sí/no se deduce de las listas antiguas), y las carpetas y exclusiones se descartan.
+- Un perfil que usaba el "valor general" recibe el valor general antiguo de su modo (HDR o SDR) para Local Dimming y Nitidez, y todos los perfiles toman el brillo SDR antiguo.
+- Los valores de vídeo toman el Local Dimming y la Nitidez HDR antiguos. La Nitidez y el Brillo de escritorio se conservan; el Local Dimming de escritorio empieza en Auto, así que vuelve a ponerlo desde el menú si quieres otro.
 
-> **Nota:** Los launchers de las plataformas principales (Steam, GOG Galaxy, Epic, Xbox, Ubisoft Connect, EA App) se excluyen automáticamente y no es necesario agregarlos.
+**Los juegos que solo se detectaban por estar dentro de una carpeta monitoreada dejan de detectarse hasta que les crees un perfil.**
 
 ---
 
-### Configuración KTC (solo monitores KTC)
+### Valores KTC (solo monitores KTC)
 
-> **Nota:** HDRAutostart solo funciona con monitores KTC: el cambio de HDR y todo lo de este submenú se envía únicamente a una pantalla KTC, y los demás monitores conectados no se tocan.
+> **Nota:** HDRAutostart solo funciona con monitores KTC: el cambio de HDR y todo lo de esta sección se envía únicamente a una pantalla KTC, y los demás monitores conectados no se tocan.
 
-Todas las opciones específicas de KTC están agrupadas en:
+Los valores KTC viven en tres sitios:
 
-> Clic derecho en el icono de bandeja → **Configuración KTC**
-
-Este submenú contiene Local Dimming, Nitidez, Brillo y Perfiles de juego.
+> Clic derecho en el icono de bandeja → **Escritorio (KTC)** — a qué vuelve el monitor cuando no hay ningún juego abierto
+>
+> Clic derecho en el icono de bandeja → **Vídeo** — vídeo HDR en un navegador a pantalla completa
+>
+> Clic derecho en el icono de bandeja → **Perfiles de juego…** — los valores propios de cada juego
 
 #### Local Dimming
 
-HDRAutostart envía comandos DDC/CI a los monitores KTC para controlar el Local Dimming automáticamente cada vez que el HDR se activa o desactiva. Hay dos ajustes independientes, uno para cada modo:
-
-**Local Dimming HDR (KTC)** — nivel que se aplica cuando el HDR está activo (p. ej. mientras juegas):
+HDRAutostart envía comandos DDC/CI a los monitores KTC para fijar el nivel de Local Dimming (VCP 0xF4). Las mismas cinco opciones se usan en los tres sitios:
 
 | Ajuste | Valor VCP | Descripción |
 |---|---|---|
-| **Desactivado** *(por defecto)* | — | No se envían comandos DDC. Seguro para todos los monitores. |
+| **No tocar** | — | No se envía ningún comando DDC: el monitor conserva el valor que tenga (no apaga la atenuación). Seguro para todos los monitores. |
 | **Auto** | 1 | El monitor controla el dimming automáticamente |
 | **Bajo** | 2 | Local Dimming bajo |
 | **Estándar** | 3 | Local Dimming estándar |
 | **Alto** | 4 | Local Dimming máximo — recomendado para jugar en HDR en KTC |
 
-**Local Dimming SDR (KTC)** — nivel que se aplica cuando el HDR se desactiva (escritorio normal, uso en SDR):
+Por defecto: **Auto** en Escritorio y en Vídeo. Un perfil nuevo copia el valor de escritorio.
 
-| Ajuste | Valor VCP | Descripción |
-|---|---|---|
-| **Desactivado** *(por defecto)* | — | No se envían comandos DDC. |
-| **Auto** | 1 | El monitor gestiona el dimming automáticamente en SDR |
-| **Bajo** | 2 | Local Dimming bajo |
-| **Estándar** | 3 | Local Dimming estándar |
-| **Alto** | 4 | Local Dimming máximo |
-
-Ambos ajustes son independientes, por lo que puedes usar, por ejemplo, **Alto** para jugar en HDR y **Auto** (o **Desactivado**) para el uso normal del escritorio.
-
-> Configuración KTC → **Local Dimming** → HDR (KTC) / SDR (KTC)
+> Escritorio (KTC) → **Local Dimming**, Vídeo → **Local Dimming**, o el campo Atenuación local de un perfil
 
 #### Nitidez
 
-Ajusta automáticamente el nivel de nitidez del monitor (VCP 0x87) vía DDC/CI al activar o desactivar el HDR. Dos valores independientes — uno para modo HDR y otro para modo SDR. Seleccionable de 0 a 10, o **Desactivado** para no enviar ningún comando.
+Ajusta el nivel de nitidez del monitor (VCP 0x87) vía DDC/CI. Como al activar o desactivar el HDR se reinicia, el valor se vuelve a enviar después de cada cambio. Seleccionable de 0 a 10, o **No tocar** para no enviar ningún comando.
 
 | Ajuste | Descripción |
 |---|---|
-| **Desactivado** | No se envían comandos de nitidez DDC. |
+| **No tocar** | No se envía ningún comando de nitidez DDC: el monitor conserva el valor que tenga. |
 | **0 – 10** | Nivel de nitidez enviado al monitor. Por defecto: **6**. |
 
-> Configuración KTC → **Nitidez (KTC)** → HDR (KTC) / SDR (KTC)
+> Escritorio (KTC) → **Nitidez**, Vídeo → **Nitidez**, o el campo Nitidez de un perfil
 
 #### Brillo
 
-Ajusta automáticamente el nivel de brillo del monitor (VCP 0x10) vía DDC/CI cuando se lanza o cierra un juego SDR (ejecutable en lista negra). Dos valores independientes:
+Ajusta el nivel de brillo del monitor (VCP 0x10) vía DDC/CI, en el rango 0–100. Solo se envía en dos casos; con el HDR activado, el brillo lo gestiona el propio monitor.
 
 | Ajuste | Por defecto | Descripción |
 |---|---|---|
-| **Desktop (KTC)** | 22 | Brillo restaurado cuando no hay ningún juego SDR en ejecución. |
-| **SDR Game (KTC)** | 100 | Brillo aplicado cuando se lanza un juego SDR. |
+| **Escritorio (KTC)** | 22 | Brillo que se restaura cuando no hay ningún juego en ejecución. |
+| **Perfil con HDR desactivado** | Valor de escritorio al crearlo | Brillo aplicado mientras ese juego SDR está en ejecución. |
 
-Ambos valores están en el rango 0–100. Haz clic en cualquiera de las entradas para abrir el selector numérico.
-
-> Configuración KTC → **Brillo** → Desktop (KTC) / SDR Game (KTC)
-
-#### Perfiles de juego
-
-Asigna valores personalizados de Local Dimming y Nitidez a ejecutables específicos. Cuando ese juego se lanza, se aplican los valores del perfil en lugar de los ajustes globales de KTC. Al cerrar el juego, se restauran automáticamente los valores globales estándar.
-
-- **Agregar** — selecciona un archivo `.exe` y elige los valores de Local Dimming y Nitidez (o **Usar valor global** para heredar el ajuste global).
-- **Editar** — selecciona un perfil y haz clic en Editar (o doble clic) para modificar sus valores.
-- **Eliminar** — borra el perfil seleccionado.
-
-> Configuración KTC → **Perfiles de juego…**
+> Escritorio (KTC) → **Brillo** (haz clic para abrir la entrada numérica), o el campo Brillo de un perfil
 
 ---
 

@@ -228,6 +228,6 @@ Section "Uninstall"
     DeleteRegKey HKCU "${REG_APP}"
 
     ; NOTE: config files in ProgramData / AppData are intentionally kept
-    ; so the user does not lose their whitelist/blacklist/settings.
+    ; so the user does not lose their profiles/settings.
 
 SectionEnd

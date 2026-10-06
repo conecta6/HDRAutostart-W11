@@ -1,6 +1,6 @@
 // =============================================================================
 // hdrautostart.cpp  v3 — system-tray HDR auto-activator (HDRAutostart)
-//   · Steam/game folders trigger HDR
+//   · Per-game profiles decide HDR / SDR handling (matched by exe path, name or folder)
 //   · Browser fullscreen triggers HDR (auto-off when leaving fullscreen)
 //   · KTC Local Dimming via DDC/CI (VCP 0xF4)
 // =============================================================================
@@ -10,7 +10,6 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
-#include <shlobj.h>
 #include <commdlg.h>
 // DDC/CI — declared manually to avoid WIN32_LEAN_AND_MEAN conflicts
 #define PHYSICAL_MONITOR_DESCRIPTION_SIZE 128
@@ -29,6 +28,7 @@ extern "C" {
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
+#include <climits>
 #include <string>
 #include <vector>
 #include <map>
@@ -57,58 +57,64 @@ extern "C" {
 // Localisation
 // =============================================================================
 struct Lang {
-    const char *menuFolders, *menuWhitelist, *menuBlacklist, *menuExclude, *menuStartup, *menuExit;
-    const char *dlgFolders,  *dlgWhitelist,  *dlgBlacklist,  *dlgExclude;
-    const char *btnAdd, *btnRemove, *btnClose;
-    const char *btnAddFolder, *btnAddFile;
+    const char *menuStartup, *menuExit;
+    const char *btnAdd, *btnRemove, *btnClose, *btnOk, *btnCancel;
     const char *tipOn, *tipOff;
-    const char *menuLocalDimming, *menuKTC, *menuKTCSDR;
-    const char *ktcOff, *ktcAuto, *ktcLow, *ktcStd, *ktcHigh;
+    const char *menuLocalDimming, *menuDesktop;
+    const char *ktcKeep, *ktcAuto, *ktcLow, *ktcStd, *ktcHigh;
     const char *menuGithub;
     const char *menuProfiles;
     const char *dlgProfiles;
     const char *menuSharpness;
-    const char *profDimLabel, *profSharpLabel, *profExeLabel;
-    const char *profDimDefault;
-    const char *menuKTCSettings;
+    const char *profDimLabel;                // profile list: short dimming label
     const char *menuBrightness;
     const char *menuVideo;
     const char *menuVideoBrowser;
+    const char *profHdrCheck, *profSharpShort;
+    const char *msgFoldersDropped;           // balloon: old config migrated, its monitored folders were discarded
+    const char *profTagName, *profTagFolder; // profile list: name-only and folder entries
+    const char *dlgProfEdit;                 // profile edit dialog: title and field labels
+    const char *profDimField, *profBrightField, *profBrightShort;
+    const char *numValueFmt;                 // numeric dialog label, printf(min, max)
 };
 
 static const Lang kES = {
-    "Carpetas monitoreadas...", "Activar HDR siempre...", "Nunca activar HDR...", "Excluir...",
     "Ejecutar al inicio", "Salir",
-    "Carpetas monitoreadas", "Activar HDR siempre", "Nunca activar HDR", "Excluir",
-    "Agregar", "Eliminar", "Cerrar",
-    "Agregar carpeta", "Agregar archivo",
+    "Agregar", "Eliminar", "Cerrar", "Aceptar", "Cancelar",
     "HDRAutostart \x97 HDR activo", "HDRAutostart \x97 HDR inactivo",
-    "Local Dimming", "HDR (KTC)", "SDR (KTC)",
-    "Desactivado", "Auto", "Bajo", "Est\xe1ndar", "Alto",
+    "Local Dimming", "Escritorio (KTC)",
+    "No tocar", "Auto", "Bajo", "Est\xe1ndar", "Alto",
     "GitHub",
-    "Perfiles de juego...", "Perfiles de juego", "Nitidez (KTC)",
-    "Local Dimming:", "Nitidez (0-10):", "Ejecutable:", "Usar valor global",
-    "Configuraci\xf3n KTC",
+    "Perfiles de juego...", "Perfiles de juego", "Nitidez",
+    "Atenuaci\xf3n:",
     "Brillo",
     "V\xed" "deo",
-    "HDR en navegador a pantalla completa"
+    "HDR en navegador a pantalla completa",
+    "Activar HDR con este juego", "Nitidez:",
+    "Ahora los juegos se detectan solo por perfil. A\xf1" "ade tus juegos en Perfiles de juego.",
+    "(cualquier carpeta)", "[carpeta]",
+    "Ajustes del perfil",
+    "Atenuaci\xf3n local:", "Brillo (0-100):", "Brillo:",
+    "Valor (%d-%d):"
 };
 static const Lang kEN = {
-    "Monitored folders...", "Always enable HDR...", "Never enable HDR...", "Exclude...",
     "Run at startup", "Exit",
-    "Monitored folders", "Always enable HDR", "Never enable HDR", "Exclude",
-    "Add", "Remove", "Close",
-    "Add folder", "Add file",
+    "Add", "Remove", "Close", "OK", "Cancel",
     "HDRAutostart \x97 HDR active", "HDRAutostart \x97 HDR inactive",
-    "Local Dimming", "HDR (KTC)", "SDR (KTC)",
-    "Off", "Auto", "Low", "Standard", "High",
+    "Local Dimming", "Desktop (KTC)",
+    "Don't change", "Auto", "Low", "Standard", "High",
     "GitHub",
-    "Game profiles...", "Game profiles", "Sharpness (KTC)",
-    "Local Dimming:", "Sharpness (0-10):", "Executable:", "Global default",
-    "KTC Settings",
+    "Game profiles...", "Game profiles", "Sharpness",
+    "Dimming:",
     "Brightness",
     "Video",
-    "HDR on browser fullscreen"
+    "HDR on browser fullscreen",
+    "Enable HDR for this game", "Sharpness:",
+    "Games are now detected by profile only. Add your games in Game profiles.",
+    "(any folder)", "[folder]",
+    "Profile settings",
+    "Local Dimming:", "Brightness (0-100):", "Brightness:",
+    "Value (%d-%d):"
 };
 static const Lang* L = &kEN;
 
@@ -120,24 +126,26 @@ static void DetectLang()
 // =============================================================================
 // Config  (hdrautostart.ini next to exe)
 // =============================================================================
+// A profile is what makes a program a "game". 'exe' is matched like this (lowercase):
+//   - ends with a backslash       -> folder prefix
+//   - contains a backslash        -> exact full path
+//   - otherwise                   -> executable name
 struct GameProfile {
-    std::string exe;   // full path, stored lowercase
-    int localDimming;  // -1 = use global, 0 = off, 1-4 = override
-    int sharpness;     // -1 = use global, 0-10 = override
+    std::string exe;           // see above, stored lowercase
+    bool hdr          = true;  // true = enable HDR while running, false = SDR game
+    int  localDimming = 1;     // 0 = leave alone, 1=Auto 2=Low 3=Std 4=High
+    int  sharpness    = 6;     // -1 = leave alone, 0-10 (VCP 0x87)
+    int  brightness   = 100;   // 0-100 (VCP 0x10); only sent to SDR games (-1 only while loading)
 };
 
+// General settings = the desktop: what the monitor goes back to when no game (and no
+// browser video) is running. Each profile carries its own values.
 struct Config {
-    std::vector<std::string> folders;    // paths that trigger HDR (prefix match)
-    std::vector<std::string> whitelist;  // specific exe paths that always trigger
-    std::vector<std::string> blacklist;  // specific exe paths that never trigger HDR but may trigger KTC dimming
-    std::vector<std::string> exclude;    // completely ignored — no HDR, no KTC dimming
-    int    ktcLocalDimming    = 0;  // 0=Off(default) 1=Auto 2=Low 3=Std 4=High  (juegos HDR)
-    int    ktcSdrLocalDimming = 0;  // 0=Off(default) 1=Auto 2=Low 3=Std 4=High  (juegos blacklist/SDR)
-    int    ktcSharpnessHdr     = 6;  // -1=off, 0-10 (VCP 0x87 on KTC) — applied when HDR activates
-    int    ktcSharpnessSdr     = 6;  // -1=off, 0-10 (VCP 0x87 on KTC) — applied during SDR dimming games
-    int    ktcSharpnessDesktop  = 6;  // -1=off, 0-10 (VCP 0x87 on KTC) — restored when all fullscreen ends
-    int    ktcBrightnessDesktop = 22; // 0-100 (VCP 0x10) — brightness restored when no SDR game running
-    int    ktcBrightnessSdr     = 100;// 0-100 (VCP 0x10) — brightness applied when SDR game launches
+    int    ktcDimmingDesktop    = 1;   // 0 = leave alone, 1=Auto 2=Low 3=Std 4=High (VCP 0xF4)
+    int    ktcSharpnessDesktop  = 6;   // -1=off, 0-10 (VCP 0x87 on KTC)
+    int    ktcBrightnessDesktop = 22;  // 0-100 (VCP 0x10)
+    int    videoDimming         = 1;   // same scale as ktcDimmingDesktop — HDR video in a browser
+    int    videoSharpness       = 6;   // -1=off, 0-10 — HDR video in a browser
     time_t lastUpdateAttempt  = 0;  // unix timestamp of last auto-update trigger (anti-loop)
     bool   browserHdrEnabled  = false;
     std::vector<GameProfile> profiles;
@@ -145,6 +153,19 @@ struct Config {
 
 static CRITICAL_SECTION g_cfgLock;
 static Config           g_cfg;
+// Bumped every time the profiles dialog adds, edits or removes a profile (after g_cfg.profiles
+// changed): MonitorThread then reclassifies running processes without needing a restart.
+static volatile LONG    g_profilesGen = 0;
+// Bumped when a desktop setting changes from the menu: MonitorThread then sends the new
+// values at once if nothing (no game, no browser video) is holding the monitor.
+static volatile LONG    g_desktopGen = 0;
+static void DesktopSettingsChanged() { InterlockedIncrement(&g_desktopGen); }
+// Set by LoadConfig when the migration of an old config discarded its monitored folders (the
+// games they used to detect are no longer detected until they get a profile)
+static bool             g_migratedDroppedFolders = false;
+// Set by LoadConfig when an old .ini could not be copied to .bak and so was left untouched:
+// SaveConfig tries the copy again before it replaces the file
+static bool             g_bakPending = false;
 
 static std::string ExeDir()
 {
@@ -205,29 +226,39 @@ static void SaveConfig()
     FILE* f = fopen(tmp.c_str(), "w");
     if (!f) { LeaveCriticalSection(&g_cfgLock); return; }
     fprintf(f, "[settings]\n");
-    fprintf(f, "ktc_local_dimming=%d\n",     g_cfg.ktcLocalDimming);
-    fprintf(f, "ktc_sdr_local_dimming=%d\n", g_cfg.ktcSdrLocalDimming);
-    fprintf(f, "ktc_sharpness_hdr=%d\n",     g_cfg.ktcSharpnessHdr);
-    fprintf(f, "ktc_sharpness_sdr=%d\n",     g_cfg.ktcSharpnessSdr);
+    fprintf(f, "ktc_dimming_desktop=%d\n",    g_cfg.ktcDimmingDesktop);
     fprintf(f, "ktc_sharpness_desktop=%d\n",   g_cfg.ktcSharpnessDesktop);
     fprintf(f, "ktc_brightness_desktop=%d\n",  g_cfg.ktcBrightnessDesktop);
-    fprintf(f, "ktc_brightness_sdr=%d\n",      g_cfg.ktcBrightnessSdr);
+    fprintf(f, "video_dimming=%d\n",           g_cfg.videoDimming);
+    fprintf(f, "video_sharpness=%d\n",         g_cfg.videoSharpness);
     fprintf(f, "browser_hdr=%d\n",          g_cfg.browserHdrEnabled ? 1 : 0);
     if (g_cfg.lastUpdateAttempt)
         fprintf(f, "last_update_attempt=%lld\n", (long long)g_cfg.lastUpdateAttempt);
-    fprintf(f, "[folders]\n");
-    for (auto& s : g_cfg.folders)   fprintf(f, "%s\n", s.c_str());
-    fprintf(f, "[whitelist]\n");
-    for (auto& s : g_cfg.whitelist) fprintf(f, "%s\n", s.c_str());
-    fprintf(f, "[blacklist]\n");
-    for (auto& s : g_cfg.blacklist) fprintf(f, "%s\n", s.c_str());
-    fprintf(f, "[exclude]\n");
-    for (auto& s : g_cfg.exclude)   fprintf(f, "%s\n", s.c_str());
-    fprintf(f, "[profiles]\n");
+    fprintf(f, "[profiles]\n");  // exe|dimming|sharpness|hdr|brightness
     for (auto& p : g_cfg.profiles)
-        fprintf(f, "%s|%d|%d\n", p.exe.c_str(), p.localDimming, p.sharpness);
+        fprintf(f, "%s|%d|%d|%d|%d\n", p.exe.c_str(), p.localDimming, p.sharpness, p.hdr ? 1 : 0, p.brightness);
     bool ok = !ferror(f);
     if (fclose(f) != 0) ok = false;
+    // An old .ini that could not be backed up when it was loaded: try the copy again before
+    // the file is replaced. If it keeps failing the user's change is saved anyway.
+    if (ok && g_bakPending) {
+        std::string bak = path + ".bak";
+        if (CopyFileA(path.c_str(), bak.c_str(), TRUE)) {
+            Log("SaveConfig: old file saved as %s", bak.c_str());
+            g_bakPending = false;
+        } else {
+            DWORD bakErr = GetLastError();
+            if (bakErr == ERROR_FILE_EXISTS) {
+                Log("SaveConfig: %s already exists, kept as is", bak.c_str());
+                g_bakPending = false;
+            } else if (bakErr == ERROR_FILE_NOT_FOUND || bakErr == ERROR_PATH_NOT_FOUND) {
+                g_bakPending = false;  // nothing to back up any more
+            } else {
+                Log("SaveConfig: could not save %s (error %lu) — the old file is overwritten WITHOUT a backup",
+                    bak.c_str(), bakErr);
+            }
+        }
+    }
     // Swap inside the lock: two threads saving at once must not share the temp file
     // The swap can fail transiently (antivirus / indexer holding the target): retry a few times
     bool  moved   = false;
@@ -247,9 +278,38 @@ static void SaveConfig()
     LeaveCriticalSection(&g_cfgLock);
 }
 
+// A numeric .ini field is valid only if, after optional blanks, it starts with a digit or with
+// '-' and a digit (atoi would turn "abc" into 0). Text after the number is ignored.
+static bool ParseInt64Field(const char* text, long long& value)
+{
+    while (*text == ' ' || *text == '\t') text++;
+    const char* d = (*text == '-') ? text + 1 : text;
+    if (*d < '0' || *d > '9') return false;
+    value = atoll(text);
+    return true;
+}
+
+static bool ParseIntField(const char* text, int& value)
+{
+    long long v = 0;
+    if (!ParseInt64Field(text, v) || v < INT_MIN || v > INT_MAX) return false;
+    value = (int)v;
+    return true;
+}
+
+// Numeric field within [lo, hi]
+static bool ParseIntRange(const char* text, int lo, int hi, int& value)
+{
+    int v = 0;
+    if (!ParseIntField(text, v) || v < lo || v > hi) return false;
+    value = v;
+    return true;
+}
+
 static bool ParseSharpnessValue(const char* text, int& value)
 {
-    int v = atoi(text);
+    int v = 0;
+    if (!ParseIntField(text, v)) return false;
     if (v > 10 && v <= 100 && (v % 10) == 0) v /= 10;  // migrate old 0-100 configs
     if (v < -1 || v > 10) return false;
     value = v;
@@ -258,21 +318,39 @@ static bool ParseSharpnessValue(const char* text, int& value)
 
 static std::string ToLower(std::string s);  // defined below (used by LoadConfig)
 
+// Executable name of a path (text after the last backslash, or the whole string)
+static std::string PathBase(const std::string& s)
+{
+    size_t p = s.rfind('\\');
+    return p == std::string::npos ? s : s.substr(p + 1);
+}
+
+// Match a profile entry against a process path (all three arguments lowercase):
+//   - entry ending in a backslash    -> folder prefix match
+//   - entry containing a backslash   -> exact full-path match
+//   - entry with no backslash (name) -> match by executable name
+// Returns 0 = no match, otherwise the specificity: 1 = folder, 2 = name, 3 = full path.
+// The name form lets one profile cover a program wherever it is installed.
+static int MatchProfileEntry(const std::string& entryLo,
+                             const std::string& pathLo, const std::string& baseLo)
+{
+    if (entryLo.empty()) return 0;
+    if (entryLo.back() == '\\')
+        return pathLo.compare(0, entryLo.size(), entryLo) == 0 ? 1 : 0;
+    if (entryLo.find('\\') != std::string::npos)
+        return entryLo == pathLo ? 3 : 0;
+    return entryLo == baseLo ? 2 : 0;
+}
+
+// Value of an "key=value" .ini line (pointer just after the '='), nullptr if the line is another key
+static const char* IniValue(const char* line, const char* key)
+{
+    size_t n = strlen(key);
+    return (strncmp(line, key, n) == 0 && line[n] == '=') ? line + n + 1 : nullptr;
+}
+
 static void LoadConfig()
 {
-    // Detect Steam default path
-    char val[MAX_PATH] = {};  DWORD sz = sizeof(val);
-    std::string steam;
-    if (RegGetValueA(HKEY_CURRENT_USER, "Software\\Valve\\Steam", "SteamPath",
-                     RRF_RT_REG_SZ, nullptr, val, &sz) == ERROR_SUCCESS && val[0]) {
-        steam = val;
-        std::replace(steam.begin(), steam.end(), '/', '\\');
-        if (steam.back() != '\\') steam += '\\';
-        steam += "steamapps\\common\\";
-    } else {
-        steam = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\";
-    }
-
     std::string cfgDir = ConfigDir();
     std::string path   = cfgDir + "hdrautostart.ini";
 
@@ -321,104 +399,266 @@ static void LoadConfig()
         }
     }
     if (!f) {
-        g_cfg.folders.push_back(steam);
-        SaveConfig();
+        SaveConfig();  // fresh install: no profiles yet
         return;
     }
 
     enum Section { SEC_NONE, SEC_SETTINGS, SEC_FOLDERS, SEC_WHITELIST, SEC_BLACKLIST, SEC_EXCLUDE, SEC_PROFILES };
     Section sec = SEC_NONE;
-    bool sawDesktopSharpness = false;
-    bool sawBrightnessDesktop = false, sawBrightnessSdr = false;
+    bool sawDimDesktop = false, sawDesktopSharpness = false, sawBrightnessDesktop = false;
+    bool sawVideoDim = false, sawVideoSharp = false;
+    // Settings of the pre-"desktop" format (general HDR / SDR values): read only to migrate them
+    // into the profiles and the video values below. Defaults are the old ones.
+    bool sawOldKey = false;
+    int  oldDimHdr = 0, oldDimSdr = 0, oldSharpHdr = 6, oldSharpSdr = 6, oldBrightSdr = 100;
+    // Legacy lists (pre-profile .ini): read only to migrate them into profiles below
+    std::vector<std::string> oldFolders, oldWhitelist, oldBlacklist, oldExclude;
+    std::vector<size_t> legacyProfiles;  // indexes into g_cfg.profiles of 3-field lines (no hdr yet)
+    // The pre-profile versions always wrote these four headers: seeing any of them is what
+    // marks the file as an old one (only then is a 3-field profile line a legacy line)
+    bool sawOldHeader = false;
     char line[4096];  // MAX_PATH(260) is not enough; Windows supports paths up to 32767 chars
     while (fgets(line, sizeof(line), f)) {
         size_t n = strlen(line);
         while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r')) line[--n] = '\0';
         if (!n) continue;
         if (!strcmp(line, "[settings]"))  { sec = SEC_SETTINGS;  continue; }
-        if (!strcmp(line, "[folders]"))   { sec = SEC_FOLDERS;   continue; }
-        if (!strcmp(line, "[whitelist]")) { sec = SEC_WHITELIST; continue; }
-        if (!strcmp(line, "[blacklist]")) { sec = SEC_BLACKLIST; continue; }
-        if (!strcmp(line, "[exclude]"))   { sec = SEC_EXCLUDE;   continue; }
+        if (!strcmp(line, "[folders]"))   { sec = SEC_FOLDERS;   sawOldHeader = true; continue; }
+        if (!strcmp(line, "[whitelist]")) { sec = SEC_WHITELIST; sawOldHeader = true; continue; }
+        if (!strcmp(line, "[blacklist]")) { sec = SEC_BLACKLIST; sawOldHeader = true; continue; }
+        if (!strcmp(line, "[exclude]"))   { sec = SEC_EXCLUDE;   sawOldHeader = true; continue; }
         if (!strcmp(line, "[profiles]"))  { sec = SEC_PROFILES;  continue; }
         switch (sec) {
-        case SEC_SETTINGS:
-            if (strncmp(line, "ktc_local_dimming=", 18) == 0) {
-                int v = atoi(line + 18);
-                if (v >= 1 && v <= 4) g_cfg.ktcLocalDimming = v;
+        case SEC_SETTINGS: {
+            const char* v;
+            int i = 0;
+            // A value that is not a valid number (or is out of range) is ignored: the key keeps its default
+            if ((v = IniValue(line, "ktc_dimming_desktop"))) {
+                if (ParseIntRange(v, 0, 4, i)) { g_cfg.ktcDimmingDesktop = i; sawDimDesktop = true; }
+            } else if ((v = IniValue(line, "ktc_sharpness_desktop"))) {
+                if (ParseSharpnessValue(v, i)) { g_cfg.ktcSharpnessDesktop = i; sawDesktopSharpness = true; }
+            } else if ((v = IniValue(line, "ktc_brightness_desktop"))) {
+                if (ParseIntRange(v, 0, 100, i)) { g_cfg.ktcBrightnessDesktop = i; sawBrightnessDesktop = true; }
+            } else if ((v = IniValue(line, "video_dimming"))) {
+                if (ParseIntRange(v, 0, 4, i)) { g_cfg.videoDimming = i; sawVideoDim = true; }
+            } else if ((v = IniValue(line, "video_sharpness"))) {
+                if (ParseSharpnessValue(v, i)) { g_cfg.videoSharpness = i; sawVideoSharp = true; }
+            } else if ((v = IniValue(line, "last_update_attempt"))) {
+                long long ts = 0;
+                if (ParseInt64Field(v, ts)) g_cfg.lastUpdateAttempt = (time_t)ts;
+            } else if ((v = IniValue(line, "browser_hdr"))) {
+                if (ParseIntField(v, i)) g_cfg.browserHdrEnabled = i != 0;
+            } else if ((v = IniValue(line, "ktc_local_dimming"))) {
+                sawOldKey = true;
+                if (ParseIntRange(v, 0, 4, i)) oldDimHdr = i;
+            } else if ((v = IniValue(line, "ktc_sdr_local_dimming"))) {
+                sawOldKey = true;
+                if (ParseIntRange(v, 0, 4, i)) oldDimSdr = i;
+            } else if ((v = IniValue(line, "ktc_sharpness_hdr"))) {
+                sawOldKey = true;
+                if (ParseSharpnessValue(v, i)) oldSharpHdr = i;
+            } else if ((v = IniValue(line, "ktc_sharpness_sdr"))) {
+                sawOldKey = true;
+                if (ParseSharpnessValue(v, i)) oldSharpSdr = i;
+            } else if ((v = IniValue(line, "ktc_brightness_sdr"))) {
+                sawOldKey = true;
+                if (ParseIntRange(v, 0, 100, i)) oldBrightSdr = i;
             }
-            if (strncmp(line, "ktc_sdr_local_dimming=", 22) == 0) {
-                int v = atoi(line + 22);
-                if (v >= 1 && v <= 4) g_cfg.ktcSdrLocalDimming = v;
-            }
-            if (strncmp(line, "ktc_sharpness_hdr=", 18) == 0) {
-                int v = 0;
-                if (ParseSharpnessValue(line + 18, v)) g_cfg.ktcSharpnessHdr = v;
-            }
-            if (strncmp(line, "ktc_sharpness_sdr=", 18) == 0) {
-                int v = 0;
-                if (ParseSharpnessValue(line + 18, v)) g_cfg.ktcSharpnessSdr = v;
-            }
-            if (strncmp(line, "ktc_sharpness_desktop=", 22) == 0) {
-                int v = 0;
-                if (ParseSharpnessValue(line + 22, v)) {
-                    g_cfg.ktcSharpnessDesktop = v;
-                    sawDesktopSharpness = true;
-                }
-            }
-            if (strncmp(line, "ktc_brightness_desktop=", 23) == 0) {
-                int v = atoi(line + 23);
-                if (v >= 0 && v <= 100) { g_cfg.ktcBrightnessDesktop = v; sawBrightnessDesktop = true; }
-            }
-            if (strncmp(line, "ktc_brightness_sdr=", 19) == 0) {
-                int v = atoi(line + 19);
-                if (v >= 0 && v <= 100) { g_cfg.ktcBrightnessSdr = v; sawBrightnessSdr = true; }
-            }
-            if (strncmp(line, "last_update_attempt=", 20) == 0)
-                g_cfg.lastUpdateAttempt = (time_t)atoll(line + 20);
-            if (strncmp(line, "browser_hdr=", 12) == 0)
-                g_cfg.browserHdrEnabled = atoi(line + 12) != 0;
             break;
-        case SEC_FOLDERS:   g_cfg.folders.push_back(line);   break;
-        case SEC_WHITELIST: g_cfg.whitelist.push_back(line); break;
-        case SEC_BLACKLIST: g_cfg.blacklist.push_back(line); break;
-        case SEC_EXCLUDE:   g_cfg.exclude.push_back(line);   break;
+        }
+        case SEC_FOLDERS:   oldFolders.push_back(ToLower(line));   break;
+        case SEC_WHITELIST: oldWhitelist.push_back(ToLower(line)); break;
+        case SEC_BLACKLIST: oldBlacklist.push_back(ToLower(line)); break;
+        case SEC_EXCLUDE:   oldExclude.push_back(ToLower(line));   break;
         case SEC_PROFILES: {
-            // format: path|dimming|sharpness
+            // format: exe|dimming|sharpness|hdr|brightness
+            // (older forms: 3 fields have no hdr; without brightness it is filled in below.
+            //  In the pre-"desktop" format -1 in dimming / sharpness meant "use the general value")
+            // Every line that is dropped is logged with its text
             char* p1 = strchr(line, '|');
-            if (p1) {
-                char* p2 = strchr(p1 + 1, '|');
-                if (p2) {
-                    GameProfile gp;
-                    // Lowercase: MonitorThread compares against the lowercased process path
-                    gp.exe = ToLower(std::string(line, p1 - line));
-                    gp.localDimming = atoi(p1 + 1);
-                    int sharp = 0;
-                    // Drop malformed lines: dimming must be -1..4, sharpness -1..10 (old 0-100 migrated)
-                    if (gp.localDimming >= -1 && gp.localDimming <= 4 &&
-                        ParseSharpnessValue(p2 + 1, sharp)) {
-                        gp.sharpness = sharp;
-                        g_cfg.profiles.push_back(gp);
-                    }
-                }
+            char* p2 = p1 ? strchr(p1 + 1, '|') : nullptr;
+            if (!p2) { Log("Config: profile line ignored (not exe|dimming|sharpness...): %s", line); break; }
+            GameProfile gp;
+            gp.brightness = -1;  // "missing" until a valid fifth field says otherwise
+            // Lowercase: MonitorThread compares against the lowercased process path
+            gp.exe = ToLower(std::string(line, p1 - line));
+            int sharp = 0, hdrVal = 1;
+            // Dimming must be -1..4, sharpness -1..10 (old 0-100 migrated), hdr 0 or 1:
+            // a missing, non-numeric or out-of-range value drops the line
+            char* p3 = strchr(p2 + 1, '|');
+            char* p4 = p3 ? strchr(p3 + 1, '|') : nullptr;
+            if (gp.exe.empty() || !ParseIntRange(p1 + 1, -1, 4, gp.localDimming) ||
+                !ParseSharpnessValue(p2 + 1, sharp) || (p3 && !ParseIntRange(p3 + 1, 0, 1, hdrVal))) {
+                Log("Config: profile line ignored (invalid or out of range): %s", line);
+                break;
             }
+            gp.sharpness = sharp;
+            if (p3) gp.hdr = hdrVal != 0;
+            // Brightness: an invalid or missing value stays -1 and gets its default below
+            if (p4) {
+                int b = 0;
+                if (ParseIntRange(p4 + 1, 0, 100, b)) gp.brightness = b;
+            }
+            // Ignore a second profile for the same entry (first one wins)
+            bool dup = false;
+            for (auto& q : g_cfg.profiles) if (q.exe == gp.exe) { dup = true; break; }
+            if (dup) { Log("Config: profile line ignored (duplicate entry): %s", line); break; }
+            if (!p3) legacyProfiles.push_back(g_cfg.profiles.size());
+            g_cfg.profiles.push_back(gp);
             break;
         }
         default: break;
         }
     }
     fclose(f);
-    bool needSave = false;
-    if (!sawDesktopSharpness) {
-        g_cfg.ktcSharpnessDesktop = g_cfg.ktcSharpnessSdr;
+    // No old-style header (headers may come after [profiles], hence the check here):
+    // 3-field lines keep the default hdr = true and nothing needs migrating
+    if (!sawOldHeader) legacyProfiles.clear();
+    // Only a removed general key (sawOldKey) means the file has old general values to move into
+    // the profiles and the video values. A file that merely lacks ktc_dimming_desktop (e.g. a new
+    // .ini edited by hand) is completed with defaults and its profiles are left as written.
+    // Either way the file is about to be rewritten, so it gets a backup first.
+    const bool oldFormat = sawOldKey || !sawDimDesktop;
+    bool needSave = !sawDimDesktop || !sawDesktopSharpness || !sawBrightnessDesktop ||
+                    !sawVideoDim || !sawVideoSharp;
+    bool skipSave = false;  // old file that could not be backed up: leave it untouched
+    if (sawOldKey) {
+        if (!sawDesktopSharpness) g_cfg.ktcSharpnessDesktop = oldSharpSdr;
+        if (!sawVideoDim)   g_cfg.videoDimming   = oldDimHdr;
+        if (!sawVideoSharp) g_cfg.videoSharpness = oldSharpHdr;
+    }
+
+    const bool listMigration = !legacyProfiles.empty() || !oldFolders.empty() ||
+                               !oldWhitelist.empty() || !oldBlacklist.empty() || !oldExclude.empty();
+
+    // --- Migration: folders / whitelist / blacklist / exclude lists -> profiles ---
+    if (listMigration) {
+        // Entries that matched the old exclusion list were ignored by the old versions: they
+        // are not migrated. A candidate entry is compared as if it were a process path:
+        // a name matches an equal name or the final name of an excluded path; a path matches
+        // an equal path, an excluded folder prefix or an excluded name equal to its file name.
+        auto excludedByOld = [&](const std::string& cand) {
+            std::string base = PathBase(cand);
+            for (auto& e : oldExclude) {
+                if (MatchProfileEntry(e, cand, base)) return true;
+                if (cand.find('\\') == std::string::npos && e.find('\\') != std::string::npos &&
+                    e.back() != '\\' && PathBase(e) == cand) return true;
+            }
+            return false;
+        };
+        int excludedProfiles = 0, excludedEntries = 0;
+        {
+            // Drop excluded 3-field profiles (indexes in 'legacyProfiles' are ascending)
+            std::vector<size_t> kept;
+            std::vector<GameProfile> rest;
+            size_t li = 0;
+            for (size_t i = 0; i < g_cfg.profiles.size(); i++) {
+                bool legacy = li < legacyProfiles.size() && legacyProfiles[li] == i;
+                if (legacy) li++;
+                if (legacy && excludedByOld(g_cfg.profiles[i].exe)) { excludedProfiles++; continue; }
+                if (legacy) kept.push_back(rest.size());
+                rest.push_back(g_cfg.profiles[i]);
+            }
+            g_cfg.profiles.swap(rest);
+            legacyProfiles.swap(kept);
+        }
+        // 3-field profiles get their mode from the old lists: blacklist -> SDR;
+        // whitelist or monitored folder -> HDR; no match -> SDR
+        for (size_t idx : legacyProfiles) {
+            GameProfile& gp = g_cfg.profiles[idx];
+            std::string base = PathBase(gp.exe);
+            bool blocked = false, hdr = false;
+            for (auto& e : oldBlacklist)
+                if (MatchProfileEntry(e, gp.exe, base)) { blocked = true; break; }
+            if (!blocked) {
+                for (auto& e : oldWhitelist)
+                    if (MatchProfileEntry(e, gp.exe, base)) { hdr = true; break; }
+                for (auto& e : oldFolders)
+                    if (!e.empty() && gp.exe.compare(0, e.size(), e) == 0) { hdr = true; break; }
+            }
+            gp.hdr = hdr;
+        }
+        // List entries without a profile become one (blacklist first: it used to win over the whitelist)
+        int migratedBl = 0, migratedWl = 0;
+        for (int pass = 0; pass < 2; pass++) {
+            const std::vector<std::string>& src = pass == 0 ? oldBlacklist : oldWhitelist;
+            for (auto& e : src) {
+                if (e.empty()) continue;
+                if (excludedByOld(e)) { excludedEntries++; continue; }
+                bool have = false;
+                for (auto& q : g_cfg.profiles) if (q.exe == e) { have = true; break; }
+                if (have) continue;
+                GameProfile gp;
+                gp.exe = e;
+                gp.hdr = (pass == 1);
+                // No values of its own: it takes the old general ones of its mode (the defaults
+                // of those if the file had none)
+                gp.localDimming = gp.hdr ? oldDimHdr   : oldDimSdr;
+                gp.sharpness    = gp.hdr ? oldSharpHdr : oldSharpSdr;
+                gp.brightness   = oldBrightSdr;
+                g_cfg.profiles.push_back(gp);
+                if (pass == 0) migratedBl++; else migratedWl++;
+            }
+        }
+        Log("Config migration: %zu profile(s) got a mode, %d whitelist and %d blacklist entries "
+            "became profiles, %zu folder(s) and %zu exclusion(s) discarded",
+            legacyProfiles.size(), migratedWl, migratedBl, oldFolders.size(), oldExclude.size());
+        if (excludedProfiles || excludedEntries)
+            Log("Config migration: %d profile(s) and %d list entries matched the exclusion list and were not migrated",
+                excludedProfiles, excludedEntries);
+        // The games those folders used to detect are no longer detected: tell the user once
+        if (!oldFolders.empty()) g_migratedDroppedFolders = true;
+    }
+
+    // --- Profiles: fill in the values a line (or a list entry) did not carry ---
+    // Old general keys seen: -1 in dimming / sharpness meant "use the general value of its mode",
+    // and a missing brightness is the old general SDR brightness. Otherwise -1 sharpness is
+    // "don't change" (kept); a stray -1 dimming is read as "don't change" (0).
+    int filledProfiles = 0;
+    for (auto& gp : g_cfg.profiles) {
+        bool filled = false;
+        if (gp.localDimming < 0) {
+            gp.localDimming = sawOldKey ? (gp.hdr ? oldDimHdr : oldDimSdr) : 0;
+            filled = true;
+        }
+        if (sawOldKey && gp.sharpness < 0) {
+            gp.sharpness = gp.hdr ? oldSharpHdr : oldSharpSdr;  // may stay -1: "don't change"
+            filled = true;
+        }
+        if (gp.brightness < 0) {
+            gp.brightness = sawOldKey ? oldBrightSdr : 100;
+            filled = true;
+        }
+        if (filled) filledProfiles++;
+    }
+
+    if (listMigration || oldFormat) {
+        if (sawOldKey)
+            Log("Config migration: general settings became desktop / video values "
+                "(old dimming HDR=%d SDR=%d, sharpness HDR=%d SDR=%d, brightness SDR=%d); "
+                "%d profile(s) got their own values",
+                oldDimHdr, oldDimSdr, oldSharpHdr, oldSharpSdr, oldBrightSdr, filledProfiles);
+        // Keep the old file once (never overwrite an existing backup) before rewriting it
+        std::string bak = path + ".bak";
+        if (CopyFileA(path.c_str(), bak.c_str(), TRUE)) {
+            Log("Config migration: old file saved as %s", bak.c_str());
+        } else {
+            DWORD bakErr = GetLastError();
+            if (bakErr == ERROR_FILE_EXISTS) {
+                Log("Config migration: %s already exists, kept as is", bak.c_str());
+            } else {
+                // No backup: do not rewrite the old file on this load (the migration stays applied
+                // in memory and is repeated on the next start). The first SaveConfig after a
+                // user change tries the copy again (g_bakPending) before replacing the file.
+                Log("Config migration: could not save %s (error %lu) — old file left untouched",
+                    bak.c_str(), bakErr);
+                skipSave = true;
+                g_bakPending = true;
+            }
+        }
         needSave = true;
     }
-    if (!sawBrightnessDesktop || !sawBrightnessSdr) needSave = true;
-    if (g_cfg.folders.empty()) {
-        g_cfg.folders.push_back(steam);
-        needSave = true;
-    }
-    if (needSave) SaveConfig();
+    if (needSave && !skipSave) SaveConfig();
 }
 
 // =============================================================================
@@ -961,6 +1201,10 @@ static BOOL CALLBACK KTCSetVCPProc(HMONITOR hmon, HDC, LPRECT, LPARAM lParam)
             WideCharToMultiByte(CP_UTF8, 0, mons[i].szPhysicalMonitorDescription, -1,
                                 desc, sizeof(desc) - 1, nullptr, nullptr);
             BOOL ok = SetVCPFeature(mons[i].hPhysicalMonitor, vcp, val);
+            // The monitor silently drops a command sent right after another one (seen on the
+            // KTC M27P6: dimming + brightness back-to-back left brightness unchanged).
+            // DDC/CI asks for ~50 ms after a write; 120 ms was reliable in testing.
+            Sleep(120);
             DWORD vcpType = 0, curVal = 0, maxVal = 0;
             BOOL readOk = GetVCPFeatureAndVCPFeatureReply(
                 mons[i].hPhysicalMonitor, vcp, &vcpType, &curVal, &maxVal);
@@ -1209,73 +1453,37 @@ static std::string ToLower(std::string s)
     return s;
 }
 
-static bool FileExists(const std::string& path)
+// Best profile for a process path: full path > executable name > folder prefix
+// (the longest folder wins among folders). Returns false when no profile applies;
+// 'out' is then left untouched.
+static bool FindProfile(const std::string& path, GameProfile& out)
 {
-    DWORD attrs = GetFileAttributesA(path.c_str());
-    return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+    std::string lo   = ToLower(path);
+    std::string base = PathBase(lo);
+    int    bestRank = 0;
+    size_t bestLen  = 0;
+    EnterCriticalSection(&g_cfgLock);
+    for (auto& p : g_cfg.profiles) {
+        int rank = MatchProfileEntry(p.exe, lo, base);
+        if (!rank) continue;
+        if (rank > bestRank || (rank == 1 && bestRank == 1 && p.exe.size() > bestLen)) {
+            bestRank = rank;
+            bestLen  = p.exe.size();
+            out      = p;
+        }
+    }
+    LeaveCriticalSection(&g_cfgLock);
+    return bestRank > 0;
 }
 
-// Launchers/platform clients always ignored regardless of folder location
-static const char* kLauncherExes[] = {
-    // Steam
-    "steam.exe", "steamwebhelper.exe", "steamservice.exe", "streaming_client.exe",
-    // GOG Galaxy
-    "gogalaxy.exe", "galaxyclient.exe", "galaxyclient helper.exe", "gogcomwebhelper.exe",
-    // Xbox / Game Bar
-    "xboxapp.exe", "gamebar.exe", "gamebarftserver.exe", "xboxpcappftserver.exe",
-        "gameinputsvc.exe", "xgpuuncapsvc.exe",
-    // Epic Games
-    "epicgameslauncher.exe", "epicwebhelper.exe", "unrealcefsubprocess.exe",
-    // Ubisoft Connect
-    "ubisoft connect.exe", "ubisoftconnect.exe", "uplay.exe",
-        "ubisoftgamelauncher.exe", "uplaywebcore.exe",
-    // EA App
-    "eadesktop.exe", "ealauncher.exe", "eabackgroundservice.exe",
-        "eaconnect_me.exe", "eacefsubproc.exe", "link2ea.exe",
-    nullptr
-};
-
-// Match a config-list entry against a process path (both compared lowercase):
-//   - entry ending in '\'        -> recursive folder prefix match
-//   - entry containing a '\'     -> exact full-path match
-//   - entry with no '\' (a name) -> match by executable basename
-// The basename form lets the user block/exclude auxiliary processes (e.g. a
-// game's crash handler "handler.exe") regardless of which folder they live in.
-static bool MatchListEntry(const std::string& entry,
-                           const std::string& fullLo, const std::string& baseLo)
-{
-    std::string elo = ToLower(entry);
-    if (elo.empty()) return false;
-    if (elo.back() == '\\')                  return fullLo.find(elo) == 0;  // folder prefix
-    if (elo.find('\\') != std::string::npos) return elo == fullLo;         // full path
-    return elo == baseLo;                                                  // bare exe name
-}
-
-// Returns  1 = activate HDR
-//          0 = ignore
-//         -1 = block (blacklist)
+// Returns  1 = HDR game (profile with HDR enabled)
+//          0 = no profile: ignore
+//         -1 = SDR game (profile with HDR disabled: KTC dimming/sharpness/brightness only)
 static int ClassifyProcess(const std::string& path)
 {
-    std::string lo = ToLower(path);
-    const char* bb = strrchr(lo.c_str(), '\\');
-    std::string base = bb ? std::string(bb + 1) : lo;  // executable basename, lowercase
-
-    // Always ignore known platform launchers (even if inside a monitored folder)
-    for (int i = 0; kLauncherExes[i]; ++i)
-        if (base == kLauncherExes[i]) return 0;
-
-    EnterCriticalSection(&g_cfgLock);
-    // User lists: each entry matches by folder prefix, full path, or bare exe name
-    for (auto& e : g_cfg.exclude)
-        if (MatchListEntry(e, lo, base)) { LeaveCriticalSection(&g_cfgLock); return 0; }
-    for (auto& e : g_cfg.blacklist)
-        if (MatchListEntry(e, lo, base)) { LeaveCriticalSection(&g_cfgLock); return -1; }
-    for (auto& e : g_cfg.whitelist)
-        if (MatchListEntry(e, lo, base)) { LeaveCriticalSection(&g_cfgLock); return 1; }
-    for (auto& f : g_cfg.folders)
-        if (lo.find(ToLower(f)) == 0) { LeaveCriticalSection(&g_cfgLock); return 1; }
-    LeaveCriticalSection(&g_cfgLock);
-    return 0;
+    GameProfile prof;
+    if (!FindProfile(path, prof)) return 0;
+    return prof.hdr ? 1 : -1;
 }
 
 // =============================================================================
@@ -1400,21 +1608,82 @@ static HICON CreateHDRIcon(bool active)
 static HANDLE g_stopEvent = nullptr;
 static HWND   g_trayWnd   = nullptr;
 static char   g_hdrSource[MAX_PATH] = {};  // who activated HDR (game exe name or "Browser")
+// 1 while HDR was switched on for a fullscreen browser video. Written by the tray thread
+// (TIMER_BROWSER), read by MonitorThread: it must not touch the monitor in that state.
+static volatile LONG g_browserHdrOn = 0;
 
 // Grace period before turning HDR off once the last HDR game exits. A launcher
 // closing and handing off to the real game would otherwise toggle HDR off/on.
 static const DWORD kHdrOffGraceMs = 2000;
 
+// Full image path of a process through a handle MonitorThread already holds ("" if unavailable)
+static std::string HandlePath(HANDLE h)
+{
+    char path[MAX_PATH] = {};  DWORD sz = MAX_PATH;
+    if (!QueryFullProcessImageNameA(h, 0, path, &sz)) return "";
+    return path;
+}
+
+// The desktop values as a profile-shaped set (what the monitor returns to)
+static GameProfile DesktopProfile()
+{
+    GameProfile p;
+    EnterCriticalSection(&g_cfgLock);
+    p.localDimming = g_cfg.ktcDimmingDesktop;
+    p.sharpness    = g_cfg.ktcSharpnessDesktop;
+    p.brightness   = g_cfg.ktcBrightnessDesktop;
+    LeaveCriticalSection(&g_cfgLock);
+    return p;
+}
+
+// Profile of a running game. If it was removed since the game was classified, the desktop
+// values stand in for it (nothing game-specific is applied).
+static GameProfile ProfileOrDesktop(const std::string& path)
+{
+    GameProfile p;
+    if (!path.empty() && FindProfile(path, p)) return p;
+    return DesktopProfile();
+}
+
+// Sends a set of KTC values: dimming (0 = leave alone), brightness (only when asked: HDR
+// games are driven by the monitor itself) and sharpness (-1 = leave alone).
+// afterHdrOff: an HDR -> SDR switch just happened, so wait for the monitor to settle and
+// send sharpness with retries (the switch resets VCP 0x87).
+static void ApplyProfileValues(const GameProfile& p, bool withBrightness, bool afterHdrOff)
+{
+    if (afterHdrOff) Sleep(500);
+    SetKTCLocalDimming(p.localDimming);
+    if (withBrightness) SetKTCBrightness(p.brightness);
+    if (afterHdrOff) RestoreKTCSharpnessAfterHdrTransition(p.sharpness);
+    else             SetKTCSharpness(p.sharpness);
+}
+
+// Back to the desktop: dimming, sharpness and brightness, always all three
+static void ApplyDesktopValues(bool afterHdrOff)
+{
+    ApplyProfileValues(DesktopProfile(), true, afterHdrOff);
+}
+
+// HDR is off now and no HDR game is left: an SDR game still running (e.g. its profile was
+// switched from HDR to SDR) gets its own values, otherwise the monitor goes back to the desktop.
+// Returns true when an SDR game's values were applied.
+static bool ApplyAfterHdrOff(const std::map<DWORD, HANDLE>& sdrGames)
+{
+    if (!sdrGames.empty()) {
+        ApplyProfileValues(ProfileOrDesktop(HandlePath(sdrGames.begin()->second)), true, true);
+        return true;
+    }
+    ApplyDesktopValues(true);
+    return false;
+}
+
 static DWORD WINAPI MonitorThread(LPVOID)
 {
     Log("Monitor started");
-    std::map<DWORD, HANDLE> games;     // HDR games (whitelist/folders)
-    std::map<DWORD, HANDLE> sdrGames;  // SDR/blacklisted games (KTC dimming only)
-    std::map<DWORD, GameProfile> activeProfiles;  // pid -> profile used
+    std::map<DWORD, HANDLE> games;     // HDR games (profile with hdr=1)
+    std::map<DWORD, HANDLE> sdrGames;  // SDR games (profile with hdr=0: KTC values only)
     bool hdrActive        = false;
     bool sdrDimmingActive = false;
-    bool dimSentForHdr    = false;  // any dimming command sent this HDR session
-    bool sharpSentForHdr  = false;  // any sharpness command sent this HDR session
     ULONGLONG hdrIdleSince = 0;     // tick when 'games' became empty (0 = not idle)
     bool hdrEnablePending = false;  // game HDR enable failed; main loop keeps retrying
     ULONGLONG hdrEnableLastTry = 0; // tick of the last enable attempt
@@ -1428,6 +1697,8 @@ static DWORD WINAPI MonitorThread(LPVOID)
     std::map<DWORD, int> openFails;  // pid -> consecutive OpenProcess failures
     const int kMaxOpenFails = 20;    // give up on a PID after this many failed opens
     bool startupChecked = false;  // one-time "HDR left on" check after the first full scan
+    LONG profilesSeen = g_profilesGen;  // last profile-list generation this thread acted on
+    LONG desktopSeen  = g_desktopGen;   // last desktop-settings generation this thread acted on
 
     while (WaitForSingleObject(g_stopEvent, 100) == WAIT_TIMEOUT)
     {
@@ -1439,7 +1710,6 @@ static DWORD WINAPI MonitorThread(LPVOID)
                 const char* base = strrchr(name, '\\');
                 Log("Game exited: %s (PID %lu)", base ? base + 1 : name, it->first);
                 CloseHandle(it->second);
-                activeProfiles.erase(it->first);
                 it = games.erase(it);
             } else ++it;
         }
@@ -1456,6 +1726,51 @@ static DWORD WINAPI MonitorThread(LPVOID)
             } else ++it;
         }
 
+        // --- Profiles changed in the dialog: apply them to programs already running ---
+        {
+            LONG gen = g_profilesGen;
+            if (gen != profilesSeen) {
+                profilesSeen = gen;
+                // Programs that had no profile get classified again by this iteration's scan
+                seen.clear();
+                openFails.clear();
+                // Tracked games whose class changed (to 0, or between HDR and SDR) are dropped
+                // WITHOUT going into 'seen': the scan below detects them again with their new
+                // class, and the "closed" blocks below do the HDR/SDR transitions.
+                // (A game that keeps its class gets its edited values re-sent below,
+                // but only when it is the only game running.)
+                for (int pass = 0; pass < 2; pass++) {
+                    std::map<DWORD, HANDLE>& tracked = (pass == 0) ? games : sdrGames;
+                    const int ownClass = (pass == 0) ? 1 : -1;
+                    for (auto it = tracked.begin(); it != tracked.end(); ) {
+                        std::string tp = HandlePath(it->second);
+                        if (!tp.empty() && ClassifyProcess(tp) != ownClass) {
+                            const char* tb = strrchr(tp.c_str(), '\\');
+                            Log("Profile changed: %s (PID %lu) is no longer an %s game — classifying again",
+                                tb ? tb + 1 : tp.c_str(), it->first, pass == 0 ? "HDR" : "SDR");
+                            CloseHandle(it->second);
+                            it = tracked.erase(it);
+                        } else ++it;
+                    }
+                }
+                // A profile edited while its game runs (same mode): send its values again.
+                // Only for a single open game; with several, the edit applies from the next launch.
+                // Not while an HDR browser video holds the monitor (patch: browser video and games
+                // are not unified yet, see the pending item in CLAUDE.md).
+                if (games.size() + sdrGames.size() == 1) {
+                    bool hdrGame = !games.empty();
+                    std::string tp = HandlePath(hdrGame ? games.begin()->second : sdrGames.begin()->second);
+                    if (!tp.empty() && hdrGame == hdrActive && !g_browserHdrOn) {
+                        GameProfile prof = ProfileOrDesktop(tp);
+                        Log("Profile changed: sending the values of the running %s game again",
+                            hdrGame ? "HDR" : "SDR");
+                        ApplyProfileValues(prof, !hdrGame, false);
+                        if (hdrGame) hdrSessionSharpness = prof.sharpness;
+                    }
+                }
+            }
+        }
+
         // --- All HDR games closed ---
         bool hdrOffDue = false;
         if (games.empty() && hdrActive) {
@@ -1470,68 +1785,16 @@ static DWORD WINAPI MonitorThread(LPVOID)
         if (hdrOffDue) {
             Log("All HDR games closed — disabling HDR");
             if (!SetHDRRetry(false)) Log("HDR disable FAILED after retries");
-            int sDim, sSharp, sDeskSharp;
             EnterCriticalSection(&g_cfgLock);
-            sDim       = g_cfg.ktcSdrLocalDimming;
-            sSharp     = g_cfg.ktcSharpnessSdr;
-            sDeskSharp = g_cfg.ktcSharpnessDesktop;
             g_hdrSource[0] = '\0';
             LeaveCriticalSection(&g_cfgLock);
-            // Wait for monitor to stabilize after HDR→SDR transition
-            Sleep(500);
-            // Restore dimming if any was sent this session (from global OR from a profile)
-            if (dimSentForHdr) {
-                if (!sdrGames.empty() && sDim > 0) {
-                    SetKTCLocalDimming(sDim);
-                    sdrDimmingActive = true;
-                } else {
-                    SetKTCLocalDimming(1);  // reset to Auto
-                }
-                dimSentForHdr = false;
-            }
-            // Re-apply SDR brightness if SDR games are still running
-            if (!sdrGames.empty()) {
-                int sBright;
-                EnterCriticalSection(&g_cfgLock);
-                sBright = g_cfg.ktcBrightnessSdr;
-                LeaveCriticalSection(&g_cfgLock);
-                SetKTCBrightness(sBright);
-                sdrDimmingActive = true;
-            } else {
-                int sBrightDesk;
-                EnterCriticalSection(&g_cfgLock);
-                sBrightDesk = g_cfg.ktcBrightnessDesktop;
-                LeaveCriticalSection(&g_cfgLock);
-                SetKTCBrightness(sBrightDesk);
-            }
-            {
-                // HDR -> SDR can reset VCP 0x87 even when HDR sharpness was not
-                // explicitly set on entry, so always restore the target mode.
-                int restoreSharpness = sdrGames.empty() ? sDeskSharp : sSharp;
-                if (restoreSharpness >= 0 || sharpSentForHdr) {
-                    RestoreKTCSharpnessAfterHdrTransition(restoreSharpness);
-                    sharpSentForHdr = false;
-                }
-            }
+            // The monitor settles, then the remaining SDR game's values (or the desktop's) go out
+            if (ApplyAfterHdrOff(sdrGames)) sdrDimmingActive = true;
             hdrActive = false;
             hdrEnablePending = false;
             hdrEnableTries = 0;
             hdrIdleSince = 0;
             if (g_trayWnd) PostMessage(g_trayWnd, WM_HDRSTATUS, 0, 0);
-        }
-
-        // --- All SDR games closed ---
-        if (sdrGames.empty() && sdrDimmingActive && !hdrActive) {
-            int sSharp, sBrightDesk;
-            EnterCriticalSection(&g_cfgLock);
-            sSharp      = g_cfg.ktcSharpnessDesktop;
-            sBrightDesk = g_cfg.ktcBrightnessDesktop;
-            LeaveCriticalSection(&g_cfgLock);
-            Log("All SDR games closed — restoring desktop settings");
-            SetKTCBrightness(sBrightDesk);
-            SetKTCLocalDimming(1);
-            if (sSharp >= 0) SetKTCSharpness(sSharp);
-            sdrDimmingActive = false;
         }
 
         // --- Late retry of a failed HDR enable (single non-blocking attempt) ---
@@ -1600,24 +1863,11 @@ static DWORD WINAPI MonitorThread(LPVOID)
                     Log("Game detected: %s (PID %lu)", base ? base + 1 : path.c_str(), pid);
 
                     if (games.empty()) {
-                        // Check for per-game profile
-                        int profileDimming = -1, profileSharpness = -1;
-                        std::string loPath = ToLower(path);
+                        // The game's own values (the desktop's if its profile was removed since classification)
+                        GameProfile prof = ProfileOrDesktop(path);
                         EnterCriticalSection(&g_cfgLock);
-                        for (auto& prof : g_cfg.profiles) {
-                            if (prof.exe == loPath) {
-                                profileDimming   = prof.localDimming;
-                                profileSharpness = prof.sharpness;
-                                break;
-                            }
-                        }
-                        int hdrDimming  = g_cfg.ktcLocalDimming;
-                        int hdrSharpness = g_cfg.ktcSharpnessHdr;
                         strncpy_s(g_hdrSource, base ? base + 1 : path.c_str(), _TRUNCATE);
                         LeaveCriticalSection(&g_cfgLock);
-
-                        int effectiveDimming   = (profileDimming  >= 0) ? profileDimming  : hdrDimming;
-                        int effectiveSharpness = (profileSharpness >= 0) ? profileSharpness : hdrSharpness;
 
                         // Enable HDR
                         Log("Enabling HDR...");
@@ -1633,19 +1883,16 @@ static DWORD WINAPI MonitorThread(LPVOID)
                             hdrEnablePending     = !ok;
                             hdrEnableLastTry     = GetTickCount64();
                             hdrEnableTries       = 0;
-                            hdrSessionSharpness  = effectiveSharpness;
+                            hdrSessionSharpness  = prof.sharpness;
 
-                            // Local dimming after HDR (KTC proprietary VCP — survives mode switch)
-                            if (effectiveDimming > 0) {
-                                SetKTCLocalDimming(effectiveDimming);
-                                dimSentForHdr = true;
-                            }
+                            // Local dimming after HDR (KTC proprietary VCP — survives mode switch).
+                            // No brightness: in HDR mode the monitor drives it.
+                            SetKTCLocalDimming(prof.localDimming);
                             // Sharpness: VCP 0x87 gets reset by HDR mode switch.
                             // Wait for monitor to stabilize, then send.
-                            if (effectiveSharpness >= 0) {
+                            if (prof.sharpness >= 0) {
                                 Sleep(500);
-                                SetKTCSharpness(effectiveSharpness);
-                                sharpSentForHdr = true;
+                                SetKTCSharpness(prof.sharpness);
                             }
 
                             sdrDimmingActive = false;  // HDR takes precedence
@@ -1653,32 +1900,11 @@ static DWORD WINAPI MonitorThread(LPVOID)
                             // Orange icon only once HDR is really on; a pending enable sends it on late success
                             if (ok && g_trayWnd) PostMessage(g_trayWnd, WM_HDRSTATUS, 1, 0);
                         }
-
-                        GameProfile usedProfile;
-                        usedProfile.exe          = loPath;
-                        usedProfile.localDimming = profileDimming;
-                        usedProfile.sharpness    = profileSharpness;
-                        activeProfiles[pid]      = usedProfile;
                     }
                     games[pid] = hProc;
 
                 } else if (cls == -1) {
-                    // Blacklisted / SDR game
-                    int sDim, sSharp, sBright;
-                    std::string loPath2 = ToLower(path);
-                    EnterCriticalSection(&g_cfgLock);
-                    sDim    = g_cfg.ktcSdrLocalDimming;
-                    sSharp  = g_cfg.ktcSharpnessSdr;
-                    sBright = g_cfg.ktcBrightnessSdr;
-                    for (auto& prof : g_cfg.profiles) {
-                        if (prof.exe == loPath2) {
-                            if (prof.localDimming >= 0) sDim   = prof.localDimming;
-                            if (prof.sharpness    >= 0) sSharp = prof.sharpness;
-                            break;
-                        }
-                    }
-                    LeaveCriticalSection(&g_cfgLock);
-
+                    // SDR game
                     HANDLE hProc = OpenProcess(
                         SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
                     DWORD openErr = GetLastError();
@@ -1700,9 +1926,9 @@ static DWORD WINAPI MonitorThread(LPVOID)
                     Log("SDR game detected: %s (PID %lu)", base ? base + 1 : path.c_str(), pid);
 
                     if (sdrGames.empty() && !hdrActive) {
-                        if (sDim > 0) { Log("SDR dimming -> %d", sDim); SetKTCLocalDimming(sDim); }
-                        if (sSharp >= 0) SetKTCSharpness(sSharp);
-                        SetKTCBrightness(sBright);
+                        // Browser HDR video on: track the game but leave the monitor to the video
+                        // (patch until browser video and games are unified)
+                        if (!g_browserHdrOn) ApplyProfileValues(ProfileOrDesktop(path), true, false);
                         sdrDimmingActive = true;
                     }
                     sdrGames[pid] = hProc;
@@ -1712,8 +1938,24 @@ static DWORD WINAPI MonitorThread(LPVOID)
         }
         CloseHandle(snap);
 
+        // --- All SDR games closed ---
+        // After the scan on purpose: a game whose profile just changed to HDR is detected above
+        // (which clears sdrDimmingActive) before this runs, so no desktop values go out in between.
+        // With a browser HDR video on, the state is updated but nothing is sent: the desktop values
+        // go out when the video ends (patch until browser video and games are unified).
+        if (sdrGames.empty() && sdrDimmingActive && !hdrActive) {
+            if (g_browserHdrOn) {
+                Log("All SDR games closed — browser HDR video active, desktop settings go out when it ends");
+            } else {
+                Log("All SDR games closed — restoring desktop settings");
+                ApplyDesktopValues(false);
+            }
+            sdrDimmingActive = false;
+        }
+
         // First completed scan: if HDR was left on by a previous run (app killed,
-        // shutdown) and no game is running, turn it off once. KTC values untouched.
+        // shutdown) and no game is running, turn it off once. The KTC values of the SDR game that
+        // is open (or the desktop's) are sent afterwards, since the switch resets sharpness.
         if (!startupChecked) {
             startupChecked = true;
             if (games.empty() && !hdrActive && IsHDROn()) {
@@ -1721,14 +1963,29 @@ static DWORD WINAPI MonitorThread(LPVOID)
                 if (!SetHDRRetry(false)) {
                     Log("HDR disable FAILED after retries");
                 } else {
-                    // The HDR -> SDR switch resets the monitor sharpness (VCP 0x87): restore it
-                    int sh;
-                    EnterCriticalSection(&g_cfgLock);
-                    sh = !sdrGames.empty() ? g_cfg.ktcSharpnessSdr : g_cfg.ktcSharpnessDesktop;
-                    LeaveCriticalSection(&g_cfgLock);
-                    Sleep(500);
-                    RestoreKTCSharpnessAfterHdrTransition(sh);
+                    // The HDR -> SDR switch resets the monitor sharpness (VCP 0x87): send the
+                    // values of the SDR game that is running, or the desktop's
+                    ApplyAfterHdrOff(sdrGames);
                 }
+            }
+        }
+
+        // --- Desktop settings changed in the menu: send them now if nothing holds the monitor ---
+        {
+            LONG dg = g_desktopGen;
+            if (dg != desktopSeen) {
+                if (startupChecked && games.empty() && sdrGames.empty() && !hdrActive && !g_browserHdrOn) {
+                    desktopSeen = dg;
+                    Log("Desktop settings changed — applying them");
+                    ApplyDesktopValues(false);
+                } else if (hdrActive || sdrDimmingActive || g_browserHdrOn) {
+                    // Something holds the monitor and sends the desktop values when it lets go
+                    // (HDR off, last SDR game closed, browser video ended): nothing to do now
+                    desktopSeen = dg;
+                }
+                // Otherwise (e.g. an HDR game is tracked but HDR never came on because there is no
+                // KTC HDR display) the change stays pending and goes out as soon as nothing is
+                // tracked. No DDC traffic meanwhile: the send condition above is simply false.
             }
         }
 
@@ -1740,25 +1997,13 @@ static DWORD WINAPI MonitorThread(LPVOID)
             if (!alive.count(it->first)) it = openFails.erase(it); else ++it;
     }
 
-    // Shutdown cleanup
+    // Shutdown cleanup: back to the desktop values
     if (hdrActive) {
         if (!SetHDRRetry(false)) Log("HDR disable FAILED after retries");
-        int sh; EnterCriticalSection(&g_cfgLock); sh=g_cfg.ktcSharpnessDesktop; LeaveCriticalSection(&g_cfgLock);
-        Sleep(500);
-        if (dimSentForHdr)   SetKTCLocalDimming(1);
-        if (sh >= 0 || sharpSentForHdr) RestoreKTCSharpnessAfterHdrTransition(sh);
+        ApplyDesktopValues(true);
         if (g_trayWnd) PostMessage(g_trayWnd, WM_HDRSTATUS, 0, 0);
-    }
-    if (sdrDimmingActive) {
-        int d, sh, bd;
-        EnterCriticalSection(&g_cfgLock);
-        d  = g_cfg.ktcSdrLocalDimming;
-        sh = g_cfg.ktcSharpnessDesktop;
-        bd = g_cfg.ktcBrightnessDesktop;
-        LeaveCriticalSection(&g_cfgLock);
-        SetKTCBrightness(bd);
-        if (d > 0) SetKTCLocalDimming(1);
-        SetKTCSharpness(sh);  // no-op when sharpness is disabled (-1)
+    } else if (sdrDimmingActive) {
+        ApplyDesktopValues(false);
     }
     for (auto& kv : games)    CloseHandle(kv.second);
     for (auto& kv : sdrGames) CloseHandle(kv.second);
@@ -1767,198 +2012,10 @@ static DWORD WINAPI MonitorThread(LPVOID)
 }
 
 // =============================================================================
-// List-management dialog  (generic: folder list or exe list)
-// =============================================================================
-#define IDC_LBOX       100
-#define IDC_ADD        101
-#define IDC_DEL        102
-#define IDC_CLOSE2     103
-#define IDC_ADD_FOLDER 104
-
-// mode: 0=files only  1=folders only  2=both (files + folders, used by Exclude dialog)
-struct ListDlgData { std::vector<std::string>* items; int mode; HFONT hFont = nullptr; };
-
-static void Populate(HWND lb, std::vector<std::string>* items)
-{
-    SendMessageA(lb, LB_RESETCONTENT, 0, 0);
-    HDC hdc = GetDC(lb);
-    HFONT hf = (HFONT)SendMessageA(lb, WM_GETFONT, 0, 0);
-    HGDIOBJ old = SelectObject(hdc, hf ? hf : GetStockObject(DEFAULT_GUI_FONT));
-    int maxW = 0;
-    EnterCriticalSection(&g_cfgLock);
-    for (auto& s : *items) {
-        SendMessageA(lb, LB_ADDSTRING, 0, (LPARAM)s.c_str());
-        SIZE sz = {};
-        GetTextExtentPoint32A(hdc, s.c_str(), (int)s.size(), &sz);
-        if (sz.cx > maxW) maxW = sz.cx;
-    }
-    LeaveCriticalSection(&g_cfgLock);
-    SelectObject(hdc, old);
-    ReleaseDC(lb, hdc);
-    SendMessageA(lb, LB_SETHORIZONTALEXTENT, maxW + 8, 0);
-}
-
-static LRESULT CALLBACK ListDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
-{
-    ListDlgData* d = (ListDlgData*)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
-
-    switch (msg) {
-    case WM_CREATE: {
-        d = (ListDlgData*)((CREATESTRUCTA*)lp)->lpCreateParams;
-        SetWindowLongPtrA(hwnd, GWLP_USERDATA, (LONG_PTR)d);
-
-        // DPI-aware dimensions
-        typedef UINT(WINAPI* PFN_GetDpiForWindow)(HWND);
-        static auto pfnDpi = (PFN_GetDpiForWindow)GetProcAddress(GetModuleHandleA("user32.dll"), "GetDpiForWindow");
-        UINT dpi = pfnDpi ? pfnDpi(hwnd) : 96;
-        auto S = [&](int v){ return MulDiv(v, (int)dpi, 96); };
-
-        // System message font (DPI-aware)
-        NONCLIENTMETRICSA ncm = {}; ncm.cbSize = sizeof(ncm);
-        SystemParametersInfoA(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
-        d->hFont = CreateFontIndirectA(&ncm.lfMessageFont);
-
-        RECT rc;  GetClientRect(hwnd, &rc);
-        int gap = S(8), bw = S(90), bh = S(28);
-        int lbH = rc.bottom - bh - gap * 3;
-
-        HWND lb = CreateWindowExA(WS_EX_CLIENTEDGE, "LISTBOX", nullptr,
-            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
-            gap, gap, rc.right - gap * 2, lbH,
-            hwnd, (HMENU)IDC_LBOX, nullptr, nullptr);
-        SendMessageA(lb, WM_SETFONT, (WPARAM)d->hFont, FALSE);
-
-        int y = lbH + gap * 2;
-        if (d->mode == 2) {
-            // Exclude dialog: Add folder + Add file + Remove + Close
-            HWND bAddF = CreateWindowA("BUTTON", L->btnAddFolder, WS_CHILD | WS_VISIBLE,
-                gap,                     y, bw, bh, hwnd, (HMENU)IDC_ADD_FOLDER, nullptr, nullptr);
-            HWND bAddE = CreateWindowA("BUTTON", L->btnAddFile,   WS_CHILD | WS_VISIBLE,
-                gap + bw + gap,          y, bw, bh, hwnd, (HMENU)IDC_ADD,        nullptr, nullptr);
-            HWND bDel  = CreateWindowA("BUTTON", L->btnRemove,    WS_CHILD | WS_VISIBLE,
-                gap + (bw + gap) * 2,    y, bw, bh, hwnd, (HMENU)IDC_DEL,        nullptr, nullptr);
-            HWND bCls  = CreateWindowA("BUTTON", L->btnClose,     WS_CHILD | WS_VISIBLE,
-                rc.right - bw - gap,     y, bw, bh, hwnd, (HMENU)IDC_CLOSE2,     nullptr, nullptr);
-            SendMessageA(bAddF, WM_SETFONT, (WPARAM)d->hFont, FALSE);
-            SendMessageA(bAddE, WM_SETFONT, (WPARAM)d->hFont, FALSE);
-            SendMessageA(bDel,  WM_SETFONT, (WPARAM)d->hFont, FALSE);
-            SendMessageA(bCls,  WM_SETFONT, (WPARAM)d->hFont, FALSE);
-        } else {
-            HWND bAdd = CreateWindowA("BUTTON", L->btnAdd,    WS_CHILD | WS_VISIBLE,
-                gap,                 y, bw, bh, hwnd, (HMENU)IDC_ADD,    nullptr, nullptr);
-            HWND bDel = CreateWindowA("BUTTON", L->btnRemove, WS_CHILD | WS_VISIBLE,
-                gap + bw + gap,      y, bw, bh, hwnd, (HMENU)IDC_DEL,    nullptr, nullptr);
-            HWND bCls = CreateWindowA("BUTTON", L->btnClose,  WS_CHILD | WS_VISIBLE,
-                rc.right - bw - gap, y, bw, bh, hwnd, (HMENU)IDC_CLOSE2, nullptr, nullptr);
-            SendMessageA(bAdd, WM_SETFONT, (WPARAM)d->hFont, FALSE);
-            SendMessageA(bDel, WM_SETFONT, (WPARAM)d->hFont, FALSE);
-            SendMessageA(bCls, WM_SETFONT, (WPARAM)d->hFont, FALSE);
-        }
-
-        Populate(lb, d->items);
-        return 0;
-    }
-
-    case WM_COMMAND: {
-        HWND lb = GetDlgItem(hwnd, IDC_LBOX);
-
-        auto browseFolder = [&]() {
-            BROWSEINFOA bi = {};
-            bi.hwndOwner = hwnd;
-            bi.ulFlags   = BIF_RETURNONLYFSDIRS | BIF_USENEWUI;
-            LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
-            if (pidl) {
-                char path[MAX_PATH] = {};
-                if (SHGetPathFromIDListA(pidl, path)) {
-                    std::string s(path);
-                    if (s.back() != '\\') s += '\\';
-                    EnterCriticalSection(&g_cfgLock);
-                    d->items->push_back(s);
-                    LeaveCriticalSection(&g_cfgLock);
-                    SaveConfig();
-                    Populate(lb, d->items);
-                }
-                CoTaskMemFree(pidl);
-            }
-        };
-        auto browseFile = [&]() {
-            char path[MAX_PATH] = {};
-            OPENFILENAMEA ofn = {};
-            ofn.lStructSize = sizeof(ofn);
-            ofn.hwndOwner   = hwnd;
-            ofn.lpstrFilter = "Executables\0*.exe\0All Files\0*.*\0";
-            ofn.lpstrFile   = path;
-            ofn.nMaxFile    = MAX_PATH;
-            ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-            if (GetOpenFileNameA(&ofn)) {
-                EnterCriticalSection(&g_cfgLock);
-                d->items->push_back(path);
-                LeaveCriticalSection(&g_cfgLock);
-                SaveConfig();
-                Populate(lb, d->items);
-            }
-        };
-
-        if (LOWORD(wp) == IDC_ADD_FOLDER) { browseFolder(); }
-
-        if (LOWORD(wp) == IDC_ADD) {
-            if (d->mode == 1) browseFolder();
-            else              browseFile();   // mode 0 = files only, mode 2 = add file
-        }
-
-        if (LOWORD(wp) == IDC_DEL) {
-            int sel = (int)SendMessageA(lb, LB_GETCURSEL, 0, 0);
-            if (sel != LB_ERR) {
-                EnterCriticalSection(&g_cfgLock);
-                if (sel < (int)d->items->size())
-                    d->items->erase(d->items->begin() + sel);
-                LeaveCriticalSection(&g_cfgLock);
-                SaveConfig();
-                Populate(lb, d->items);
-            }
-        }
-
-        if (LOWORD(wp) == IDC_CLOSE2) DestroyWindow(hwnd);
-        return 0;
-    }
-
-    case WM_CLOSE:   DestroyWindow(hwnd); return 0;
-    case WM_DESTROY:
-        if (d && d->hFont) DeleteObject(d->hFont);
-        delete d;
-        return 0;
-    }
-    return DefWindowProcA(hwnd, msg, wp, lp);
-}
-
-static void ShowListDialog(const char* title,
-                           std::vector<std::string>* items,
-                           int mode)
-{
-    ListDlgData* data = new ListDlgData{items, mode};
-    HINSTANCE hInst   = (HINSTANCE)GetModuleHandleA(nullptr);
-
-    // Get system DPI to size the window properly
-    typedef UINT(WINAPI* PFN_GetDpiForSystem)();
-    static auto pfnDpiSys = (PFN_GetDpiForSystem)GetProcAddress(GetModuleHandleA("user32.dll"), "GetDpiForSystem");
-    UINT dpi = pfnDpiSys ? pfnDpiSys() : 96;
-    int W = MulDiv(640, (int)dpi, 96);
-    int H = MulDiv(460, (int)dpi, 96);
-
-    HWND hw = CreateWindowExA(
-        WS_EX_TOPMOST,
-        "HDRAutostartListDlg", title,
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, W, H,
-        nullptr, nullptr, hInst, data);
-    if (hw) SetForegroundWindow(hw);
-    else    delete data;
-}
-
-// =============================================================================
 // Auto-update  (background thread → WinHTTP + URLDownloadToFile)
 // =============================================================================
 #define WM_UPDATE_AVAILABLE (WM_APP + 3)
+#define WM_MIGRATION_NOTICE (WM_APP + 4)   // startup balloon: old config migrated, folders discarded
 
 struct UpdateInfo { char tag[64]; char dlUrl[512]; };
 
@@ -2145,30 +2202,16 @@ cleanup:
 // =============================================================================
 // Tray window
 // =============================================================================
-#define ID_TRAY_FOLDERS   200
-#define ID_TRAY_WHITELIST 201
-#define ID_TRAY_BLACKLIST 202
-#define ID_TRAY_EXCLUDE   206
 #define ID_TRAY_ABOUT     199
 #define ID_TRAY_STARTUP   203
 #define ID_TRAY_EXIT      204
 #define ID_TRAY_GITHUB    205
 #define ID_TRAY_PROFILES  207
-#define ID_KTC_SHARP_HDR   320
-#define ID_KTC_SHARP_SDR   321
-#define ID_KTC_SHARP_DESK  322
-#define ID_KTC_BRIGHT_DESK 323
-#define ID_KTC_BRIGHT_SDR  324
-#define ID_KTC_OFF          299
-#define ID_KTC_AUTO         300
-#define ID_KTC_LOW          301
-#define ID_KTC_STANDARD     302
-#define ID_KTC_HIGH         303
-#define ID_KTC_SDR_OFF      309
-#define ID_KTC_SDR_AUTO     310
-#define ID_KTC_SDR_LOW      311
-#define ID_KTC_SDR_STANDARD 312
-#define ID_KTC_SDR_HIGH     313
+#define ID_DESK_SHARP     322
+#define ID_DESK_BRIGHT    323
+#define ID_VIDEO_SHARP    325
+#define ID_DESK_DIM_0     330   // 330-334: desktop Local Dimming Don't change/Auto/Low/Std/High
+#define ID_VIDEO_DIM_0    340   // 340-344: same for HDR video in a browser
 
 #define ID_VIDEO_BROWSER  314
 
@@ -2183,7 +2226,6 @@ static int             g_trayRetry    = 0;  // retry counter for NIM_ADD
 
 // These are only accessed on the main (tray) thread — no lock needed
 static bool g_gameHdrOn      = false;  // updated by WM_HDRSTATUS from monitor thread
-static bool g_browserHdrOn   = false;  // managed by TIMER_BROWSER
 static int  g_browserSkipTicks = 20;   // skip first 10s of browser checks at startup
 
 static void UpdateTray(bool on)
@@ -2215,16 +2257,11 @@ static void CheckBrowserHDR()
             if (g_browserHdrOn) {
                 Log("Browser HDR disabled — disabling HDR");
                 if (!SetHDRRetry(false)) Log("HDR disable FAILED after retries");
-                int d, sh;
                 EnterCriticalSection(&g_cfgLock);
-                d  = g_cfg.ktcLocalDimming;
-                sh = g_cfg.ktcSharpnessDesktop;
                 g_hdrSource[0] = '\0';
                 LeaveCriticalSection(&g_cfgLock);
-                Sleep(500);
-                if (d > 0) SetKTCLocalDimming(1);
-                RestoreKTCSharpnessAfterHdrTransition(sh);
-                g_browserHdrOn = false;
+                ApplyDesktopValues(true);
+                g_browserHdrOn = 0;
                 UpdateTray(false);
             }
             return;
@@ -2233,7 +2270,7 @@ static void CheckBrowserHDR()
 
     // Game controls HDR while running — don't interfere
     if (g_gameHdrOn) {
-        g_browserHdrOn = false;
+        g_browserHdrOn = 0;
         return;
     }
 
@@ -2247,47 +2284,40 @@ static void CheckBrowserHDR()
         // Already failed during this fullscreen session: don't retry (or log) every 500 ms
         if (s_enableFailedThisFS) return;
         Log("Browser fullscreen — enabling HDR");
-        int dimming, sharpHdr;
+        int dimming, sharpVideo;
         EnterCriticalSection(&g_cfgLock);
-        dimming  = g_cfg.ktcLocalDimming;
-        sharpHdr = g_cfg.ktcSharpnessHdr;
+        dimming    = g_cfg.videoDimming;
+        sharpVideo = g_cfg.videoSharpness;
         LeaveCriticalSection(&g_cfgLock);
         bool noDisplay = false;
+        // Raised BEFORE the switch: MonitorThread must not send desktop values in the middle of
+        // this sequence (HDR on -> dimming -> sharpness). Lowered again if the enable fails.
+        g_browserHdrOn = 1;
         if (!SetHDR(true, &noDisplay)) {
             Log(noDisplay ? "Browser HDR: no KTC HDR display active — not enabled"
                           : "Browser HDR: enable FAILED — not retrying until fullscreen ends");
+            g_browserHdrOn = 0;
             s_enableFailedThisFS = true;
             return;
         }
         // Local dimming after HDR (KTC proprietary VCP — survives mode switch)
         SetKTCLocalDimming(dimming);
         // Sharpness: VCP 0x87 gets reset by HDR mode switch; wait then send
-        if (sharpHdr >= 0) { Sleep(500); SetKTCSharpness(sharpHdr); }
+        if (sharpVideo >= 0) { Sleep(500); SetKTCSharpness(sharpVideo); }
         EnterCriticalSection(&g_cfgLock);
         strncpy_s(g_hdrSource, "Browser", _TRUNCATE);
         LeaveCriticalSection(&g_cfgLock);
-        g_browserHdrOn = true;
         UpdateTray(true);
     } else if (!isFS && g_browserHdrOn) {
         Log("Browser left fullscreen — disabling HDR");
         if (!SetHDRRetry(false)) Log("HDR disable FAILED after retries");
-        {
-            int d, sh;
-            EnterCriticalSection(&g_cfgLock);
-            d  = g_cfg.ktcLocalDimming;
-            sh = g_cfg.ktcSharpnessDesktop;
-            LeaveCriticalSection(&g_cfgLock);
-
-            // Match the game path so the desktop sharpness command is sent
-            // after the monitor finishes the HDR -> SDR transition.
-            Sleep(500);
-            if (d > 0) SetKTCLocalDimming(1);
-            RestoreKTCSharpnessAfterHdrTransition(sh);
-        }
+        // Same path as the games: the desktop values go out after the monitor
+        // finishes the HDR -> SDR transition.
+        ApplyDesktopValues(true);
         EnterCriticalSection(&g_cfgLock);
         g_hdrSource[0] = '\0';
         LeaveCriticalSection(&g_cfgLock);
-        g_browserHdrOn = false;
+        g_browserHdrOn = 0;
         UpdateTray(false);
     }
 }
@@ -2300,21 +2330,11 @@ static void StopBrowserHDROnExit()
 
     Log("Exit with browser HDR active — disabling HDR");
     if (!SetHDRRetry(false)) Log("HDR disable FAILED after retries");
-    {
-        int d, sh;
-        EnterCriticalSection(&g_cfgLock);
-        d  = g_cfg.ktcLocalDimming;
-        sh = g_cfg.ktcSharpnessDesktop;
-        LeaveCriticalSection(&g_cfgLock);
-
-        Sleep(500);
-        if (d > 0) SetKTCLocalDimming(1);
-        RestoreKTCSharpnessAfterHdrTransition(sh);
-    }
+    ApplyDesktopValues(true);
     EnterCriticalSection(&g_cfgLock);
     g_hdrSource[0] = '\0';
     LeaveCriticalSection(&g_cfgLock);
-    g_browserHdrOn = false;
+    g_browserHdrOn = 0;
 }
 
 // =============================================================================
@@ -2326,6 +2346,7 @@ static void StopBrowserHDROnExit()
 
 struct SharpDlgData {
     int*  value;
+    bool  desktop;       // a desktop setting: MonitorThread is told to apply it
     HFONT hFont;
 };
 
@@ -2348,19 +2369,19 @@ static LRESULT CALLBACK SharpDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         int gap = S(8), bw = S(80), bh = S(26), lw = S(110), cw = S(110);
 
-        HWND hLbl = CreateWindowA("STATIC", "Sharpness:",
+        HWND hLbl = CreateWindowA("STATIC", L->profSharpShort,
             WS_CHILD | WS_VISIBLE, gap, gap + S(4), lw, S(20), hwnd, nullptr, nullptr, nullptr);
         SendMessageA(hLbl, WM_SETFONT, (WPARAM)d->hFont, FALSE);
 
         HWND hCbo = CreateWindowExA(0, "COMBOBOX", nullptr,
-            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
             gap + lw + gap, gap, cw, S(220), hwnd, (HMENU)IDC_SHARP_COMBO, nullptr, nullptr);
         SendMessageA(hCbo, WM_SETFONT, (WPARAM)d->hFont, FALSE);
 
-        // Off (-1), then 0, 1, 2 ... 10
-        { int idx = (int)SendMessageA(hCbo, CB_ADDSTRING, 0, (LPARAM)"Off");
+        // "Don't change" (-1), then 0, 1, 2 ... 10
+        { int idx = (int)SendMessageA(hCbo, CB_ADDSTRING, 0, (LPARAM)L->ktcKeep);
           SendMessageA(hCbo, CB_SETITEMDATA, idx, (LPARAM)(DWORD)-1); }
-        int selIdx = 0;  // default to "Off" (index 0); updated below if value matches
+        int selIdx = 0;  // default to "Don't change" (index 0); updated below if value matches
         for (int v = 0; v <= 10; v++) {
             char buf[8]; snprintf(buf, sizeof(buf), "%d", v);
             int idx = (int)SendMessageA(hCbo, CB_ADDSTRING, 0, (LPARAM)buf);
@@ -2370,9 +2391,9 @@ static LRESULT CALLBACK SharpDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SendMessageA(hCbo, CB_SETCURSEL, selIdx, 0);
 
         int y2 = gap + S(36);
-        HWND hOk  = CreateWindowA("BUTTON", "OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+        HWND hOk  = CreateWindowA("BUTTON", L->btnOk, WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
             gap,              y2, bw, bh, hwnd, (HMENU)IDC_SHARP_OK,     nullptr, nullptr);
-        HWND hCan = CreateWindowA("BUTTON", "Cancel", WS_CHILD | WS_VISIBLE,
+        HWND hCan = CreateWindowA("BUTTON", L->btnCancel, WS_CHILD | WS_VISIBLE,
             gap + bw + gap,   y2, bw, bh, hwnd, (HMENU)IDC_SHARP_CANCEL, nullptr, nullptr);
         SendMessageA(hOk,  WM_SETFONT, (WPARAM)d->hFont, FALSE);
         SendMessageA(hCan, WM_SETFONT, (WPARAM)d->hFont, FALSE);
@@ -2383,8 +2404,12 @@ static LRESULT CALLBACK SharpDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             HWND hCbo = GetDlgItem(hwnd, IDC_SHARP_COMBO);
             int sel = (int)SendMessageA(hCbo, CB_GETCURSEL, 0, 0);
             if (sel != CB_ERR) {
-                *d->value = (int)(DWORD)SendMessageA(hCbo, CB_GETITEMDATA, sel, 0);
+                int v = (int)(DWORD)SendMessageA(hCbo, CB_GETITEMDATA, sel, 0);
+                EnterCriticalSection(&g_cfgLock);
+                *d->value = v;
+                LeaveCriticalSection(&g_cfgLock);
                 SaveConfig();
+                if (d->desktop) DesktopSettingsChanged();
             }
             DestroyWindow(hwnd);
         } else if (LOWORD(wp) == IDC_SHARP_CANCEL) {
@@ -2400,9 +2425,9 @@ static LRESULT CALLBACK SharpDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcA(hwnd, msg, wp, lp);
 }
 
-static void ShowSharpnessDialog(const char* title, int* value)
+static void ShowSharpnessDialog(const char* title, int* value, bool desktop = false)
 {
-    SharpDlgData* data = new SharpDlgData{value, nullptr};
+    SharpDlgData* data = new SharpDlgData{value, desktop, nullptr};
     HINSTANCE hInst = (HINSTANCE)GetModuleHandleA(nullptr);
 
     typedef UINT(WINAPI* PFN_GetDpiForSystem)();
@@ -2429,7 +2454,7 @@ static void ShowSharpnessDialog(const char* title, int* value)
 #define IDC_NUM_OK     432
 #define IDC_NUM_CANCEL 433
 
-struct NumDlgData { int* value; int minV; int maxV; HFONT hFont; };
+struct NumDlgData { int* value; int minV; int maxV; bool desktop; HFONT hFont; };
 
 static LRESULT CALLBACK NumDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
@@ -2450,14 +2475,14 @@ static LRESULT CALLBACK NumDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         int gap = S(8), bw = S(80), bh = S(26), lw = S(120), ew = S(60), sw = S(18);
 
-        char rangeLabel[32];
-        snprintf(rangeLabel, sizeof(rangeLabel), "Value (%d-%d):", d->minV, d->maxV);
+        char rangeLabel[64];
+        snprintf(rangeLabel, sizeof(rangeLabel), L->numValueFmt, d->minV, d->maxV);
         HWND hLbl = CreateWindowA("STATIC", rangeLabel,
             WS_CHILD | WS_VISIBLE, gap, gap + S(4), lw, S(20), hwnd, nullptr, nullptr, nullptr);
         SendMessageA(hLbl, WM_SETFONT, (WPARAM)d->hFont, FALSE);
 
         HWND hEdit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", nullptr,
-            WS_CHILD | WS_VISIBLE | ES_NUMBER,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER,
             gap + lw + gap, gap, ew, S(22), hwnd, (HMENU)IDC_NUM_EDIT, nullptr, nullptr);
         SendMessageA(hEdit, WM_SETFONT, (WPARAM)d->hFont, FALSE);
         char buf[8]; snprintf(buf, sizeof(buf), "%d", *d->value);
@@ -2471,9 +2496,9 @@ static LRESULT CALLBACK NumDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SendMessageA(hSpin, UDM_SETPOS32,   0, *d->value);
 
         int y2 = gap + S(36);
-        HWND hOk  = CreateWindowA("BUTTON", "OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+        HWND hOk  = CreateWindowA("BUTTON", L->btnOk, WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
             gap,            y2, bw, bh, hwnd, (HMENU)IDC_NUM_OK,     nullptr, nullptr);
-        HWND hCan = CreateWindowA("BUTTON", "Cancel", WS_CHILD | WS_VISIBLE,
+        HWND hCan = CreateWindowA("BUTTON", L->btnCancel, WS_CHILD | WS_VISIBLE,
             gap + bw + gap, y2, bw, bh, hwnd, (HMENU)IDC_NUM_CANCEL, nullptr, nullptr);
         SendMessageA(hOk,  WM_SETFONT, (WPARAM)d->hFont, FALSE);
         SendMessageA(hCan, WM_SETFONT, (WPARAM)d->hFont, FALSE);
@@ -2491,6 +2516,7 @@ static LRESULT CALLBACK NumDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 *d->value = v;
                 LeaveCriticalSection(&g_cfgLock);
                 SaveConfig();
+                if (d->desktop) DesktopSettingsChanged();
             }
             DestroyWindow(hwnd);
         } else if (LOWORD(wp) == IDC_NUM_CANCEL) {
@@ -2506,9 +2532,9 @@ static LRESULT CALLBACK NumDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcA(hwnd, msg, wp, lp);
 }
 
-static void ShowNumDialog(const char* title, int* value, int minV, int maxV)
+static void ShowNumDialog(const char* title, int* value, int minV, int maxV, bool desktop = false)
 {
-    NumDlgData* data = new NumDlgData{value, minV, maxV, nullptr};
+    NumDlgData* data = new NumDlgData{value, minV, maxV, desktop, nullptr};
     HINSTANCE hInst = (HINSTANCE)GetModuleHandleA(nullptr);
 
     typedef UINT(WINAPI* PFN_GetDpiForSystem)();
@@ -2530,17 +2556,32 @@ static void ShowNumDialog(const char* title, int* value, int minV, int maxV)
 // =============================================================================
 // Per-profile edit dialog
 // =============================================================================
-#define IDC_PROF_DIM_COMBO   410
-#define IDC_PROF_SHARP_COMBO 411
-#define IDC_PROF_OK          412
-#define IDC_PROF_CANCEL      413
+#define IDC_PROF_DIM_COMBO     410
+#define IDC_PROF_SHARP_COMBO   411
+#define IDC_PROF_OK            412
+#define IDC_PROF_CANCEL        413
+#define IDC_PROF_HDR_CHECK     414
+#define IDC_PROF_BRIGHT_LABEL  415
+#define IDC_PROF_BRIGHT_EDIT   416
+#define IDC_PROF_BRIGHT_SPIN   417
 
 struct ProfEditData {
     int  dimming;
     int  sharpness;
+    int  brightness;
+    bool hdr;
     bool ok;
     HFONT hFont;
 };
+
+// Brightness only matters to SDR games: grey the field out while the HDR box is checked
+static void ProfEditUpdateBrightness(HWND hwnd)
+{
+    BOOL on = SendDlgItemMessageA(hwnd, IDC_PROF_HDR_CHECK, BM_GETCHECK, 0, 0) != BST_CHECKED;
+    EnableWindow(GetDlgItem(hwnd, IDC_PROF_BRIGHT_LABEL), on);
+    EnableWindow(GetDlgItem(hwnd, IDC_PROF_BRIGHT_EDIT),  on);
+    EnableWindow(GetDlgItem(hwnd, IDC_PROF_BRIGHT_SPIN),  on);
+}
 
 static LRESULT CALLBACK ProfEditDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
@@ -2559,43 +2600,50 @@ static LRESULT CALLBACK ProfEditDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         SystemParametersInfoA(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
         d->hFont = CreateFontIndirectA(&ncm.lfMessageFont);
 
-        int gap = S(8), bw = S(80), bh = S(26), lw = S(120), cw = S(160);
+        int gap = S(8), bw = S(80), bh = S(26), lw = S(130), cw = S(150), ew = S(60), sw = S(18);
+
+        // Row 0 — HDR on/off for this game
+        RECT rc; GetClientRect(hwnd, &rc);
+        HWND hHdr = CreateWindowA("BUTTON", L->profHdrCheck,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            gap, gap, rc.right - gap * 2, S(22), hwnd, (HMENU)IDC_PROF_HDR_CHECK, nullptr, nullptr);
+        SendMessageA(hHdr, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+        SendMessageA(hHdr, BM_SETCHECK, d->hdr ? BST_CHECKED : BST_UNCHECKED, 0);
 
         // Row 1 — Local Dimming
-        HWND hL1 = CreateWindowA("STATIC", "Local Dimming:",
-            WS_CHILD | WS_VISIBLE, gap, gap + S(4), lw, S(20), hwnd, nullptr, nullptr, nullptr);
+        int row1 = gap + S(30);
+        HWND hL1 = CreateWindowA("STATIC", L->profDimField,
+            WS_CHILD | WS_VISIBLE, gap, row1 + S(4), lw, S(20), hwnd, nullptr, nullptr, nullptr);
         SendMessageA(hL1, WM_SETFONT, (WPARAM)d->hFont, FALSE);
         HWND hC1 = CreateWindowExA(0, "COMBOBOX", nullptr,
-            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-            gap + lw + gap, gap, cw, S(160), hwnd, (HMENU)IDC_PROF_DIM_COMBO, nullptr, nullptr);
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+            gap + lw + gap, row1, cw, S(160), hwnd, (HMENU)IDC_PROF_DIM_COMBO, nullptr, nullptr);
         SendMessageA(hC1, WM_SETFONT, (WPARAM)d->hFont, FALSE);
         {
-            struct { const char* label; int val; } dimItems[] = {
-                {"Global default", -1}, {"Off", 0}, {"Auto", 1},
-                {"Low", 2}, {"Standard", 3}, {"High", 4}
-            };
-            int selDim = 0;
-            for (int i = 0; i < 6; i++) {
-                int idx = (int)SendMessageA(hC1, CB_ADDSTRING, 0, (LPARAM)dimItems[i].label);
-                SendMessageA(hC1, CB_SETITEMDATA, idx, (LPARAM)(DWORD)dimItems[i].val);
-                if (dimItems[i].val == d->dimming) selDim = idx;
+            const char* const dimLabels[] = { L->ktcKeep, L->ktcAuto, L->ktcLow, L->ktcStd, L->ktcHigh };
+            int selDim = 1;  // Auto
+            for (int i = 0; i < 5; i++) {
+                int idx = (int)SendMessageA(hC1, CB_ADDSTRING, 0, (LPARAM)dimLabels[i]);
+                SendMessageA(hC1, CB_SETITEMDATA, idx, (LPARAM)(DWORD)i);
+                if (i == d->dimming) selDim = idx;
             }
             SendMessageA(hC1, CB_SETCURSEL, selDim, 0);
         }
 
         // Row 2 — Sharpness
-        int row2 = gap + S(36);
-        HWND hL2 = CreateWindowA("STATIC", "Sharpness:",
+        int row2 = row1 + S(36);
+        HWND hL2 = CreateWindowA("STATIC", L->profSharpShort,
             WS_CHILD | WS_VISIBLE, gap, row2 + S(4), lw, S(20), hwnd, nullptr, nullptr, nullptr);
         SendMessageA(hL2, WM_SETFONT, (WPARAM)d->hFont, FALSE);
         HWND hC2 = CreateWindowExA(0, "COMBOBOX", nullptr,
-            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
             gap + lw + gap, row2, cw, S(220), hwnd, (HMENU)IDC_PROF_SHARP_COMBO, nullptr, nullptr);
         SendMessageA(hC2, WM_SETFONT, (WPARAM)d->hFont, FALSE);
         {
-            int idxG = (int)SendMessageA(hC2, CB_ADDSTRING, 0, (LPARAM)"Global default");
-            SendMessageA(hC2, CB_SETITEMDATA, idxG, (LPARAM)(DWORD)-1);
-            int selSharp = 0;  // default to "Global default" (index 0); updated below if value matches
+            // "Don't change" (-1: send nothing to the monitor), then 0 .. 10
+            int idxOff = (int)SendMessageA(hC2, CB_ADDSTRING, 0, (LPARAM)L->ktcKeep);
+            SendMessageA(hC2, CB_SETITEMDATA, idxOff, (LPARAM)(DWORD)-1);
+            int selSharp = idxOff;
             for (int v = 0; v <= 10; v++) {
                 char buf[8]; snprintf(buf, sizeof(buf), "%d", v);
                 int idx = (int)SendMessageA(hC2, CB_ADDSTRING, 0, (LPARAM)buf);
@@ -2605,28 +2653,65 @@ static LRESULT CALLBACK ProfEditDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             SendMessageA(hC2, CB_SETCURSEL, selSharp, 0);
         }
 
-        int y3 = row2 + S(36);
-        HWND hOk  = CreateWindowA("BUTTON", "OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-            gap,              y3, bw, bh, hwnd, (HMENU)IDC_PROF_OK,     nullptr, nullptr);
-        HWND hCan = CreateWindowA("BUTTON", "Cancel", WS_CHILD | WS_VISIBLE,
-            gap + bw + gap,   y3, bw, bh, hwnd, (HMENU)IDC_PROF_CANCEL, nullptr, nullptr);
+        // Row 3 — Brightness (SDR games only)
+        int row3 = row2 + S(36);
+        HWND hL3 = CreateWindowA("STATIC", L->profBrightField,
+            WS_CHILD | WS_VISIBLE, gap, row3 + S(4), lw, S(20), hwnd, (HMENU)IDC_PROF_BRIGHT_LABEL, nullptr, nullptr);
+        SendMessageA(hL3, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+        HWND hE3 = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", nullptr,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER,
+            gap + lw + gap, row3, ew, S(22), hwnd, (HMENU)IDC_PROF_BRIGHT_EDIT, nullptr, nullptr);
+        SendMessageA(hE3, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+        SendMessageA(hE3, EM_LIMITTEXT, 3, 0);
+        HWND hSp = CreateWindowExA(0, UPDOWN_CLASSA, nullptr,
+            WS_CHILD | WS_VISIBLE | UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS,
+            0, 0, sw, S(22), hwnd, (HMENU)IDC_PROF_BRIGHT_SPIN, nullptr, nullptr);
+        SendMessageA(hSp, UDM_SETBUDDY,   (WPARAM)hE3, 0);
+        SendMessageA(hSp, UDM_SETRANGE32, 0, 100);
+        SendMessageA(hSp, UDM_SETPOS32,   0, d->brightness);
+
+        int y4 = row3 + S(36);
+        HWND hOk  = CreateWindowA("BUTTON", L->btnOk, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            gap,              y4, bw, bh, hwnd, (HMENU)IDC_PROF_OK,     nullptr, nullptr);
+        HWND hCan = CreateWindowA("BUTTON", L->btnCancel, WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            gap + bw + gap,   y4, bw, bh, hwnd, (HMENU)IDC_PROF_CANCEL, nullptr, nullptr);
         SendMessageA(hOk,  WM_SETFONT, (WPARAM)d->hFont, FALSE);
         SendMessageA(hCan, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+
+        ProfEditUpdateBrightness(hwnd);
         return 0;
     }
     case WM_COMMAND:
-        if (LOWORD(wp) == IDC_PROF_OK) {
+        if (LOWORD(wp) == IDC_PROF_HDR_CHECK) {
+            ProfEditUpdateBrightness(hwnd);
+        } else if (LOWORD(wp) == IDC_PROF_OK || LOWORD(wp) == IDOK) {  // IDOK: Enter via IsDialogMessage
             HWND hC1 = GetDlgItem(hwnd, IDC_PROF_DIM_COMBO);
             HWND hC2 = GetDlgItem(hwnd, IDC_PROF_SHARP_COMBO);
             int s1 = (int)SendMessageA(hC1, CB_GETCURSEL, 0, 0);
             int s2 = (int)SendMessageA(hC2, CB_GETCURSEL, 0, 0);
+            bool hdr = SendDlgItemMessageA(hwnd, IDC_PROF_HDR_CHECK, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            int bright = d->brightness;  // HDR profile: brightness is not used, keep what it had
+            if (!hdr) {
+                char buf[16] = {};
+                GetWindowTextA(GetDlgItem(hwnd, IDC_PROF_BRIGHT_EDIT), buf, sizeof(buf));
+                if (!buf[0]) {  // empty is not 0: ask for a value instead of saving one
+                    MessageBeep(MB_ICONWARNING);
+                    SetFocus(GetDlgItem(hwnd, IDC_PROF_BRIGHT_EDIT));
+                    return 0;
+                }
+                bright = atoi(buf);
+                if (bright < 0)   bright = 0;
+                if (bright > 100) bright = 100;
+            }
             if (s1 != CB_ERR && s2 != CB_ERR) {
-                d->dimming   = (int)(DWORD)SendMessageA(hC1, CB_GETITEMDATA, s1, 0);
-                d->sharpness = (int)(DWORD)SendMessageA(hC2, CB_GETITEMDATA, s2, 0);
-                d->ok        = true;
+                d->dimming    = (int)(DWORD)SendMessageA(hC1, CB_GETITEMDATA, s1, 0);
+                d->sharpness  = (int)(DWORD)SendMessageA(hC2, CB_GETITEMDATA, s2, 0);
+                d->brightness = bright;
+                d->hdr        = hdr;
+                d->ok         = true;
             }
             DestroyWindow(hwnd);
-        } else if (LOWORD(wp) == IDC_PROF_CANCEL) {
+        } else if (LOWORD(wp) == IDC_PROF_CANCEL || LOWORD(wp) == IDCANCEL) {
             DestroyWindow(hwnd);
         }
         return 0;
@@ -2639,34 +2724,40 @@ static LRESULT CALLBACK ProfEditDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
 }
 
 // Run ProfEditDlg modally (spin message loop until destroyed)
-static bool RunProfEditDialog(HWND parent, int& dimming, int& sharpness)
+static bool RunProfEditDialog(HWND parent, int& dimming, int& sharpness, int& brightness, bool& hdr)
 {
     ProfEditData data;
-    data.dimming   = dimming;
-    data.sharpness = sharpness;
-    data.ok        = false;
-    data.hFont     = nullptr;
+    data.dimming    = dimming;
+    data.sharpness  = sharpness;
+    data.brightness = brightness;
+    data.hdr        = hdr;
+    data.ok         = false;
+    data.hFont      = nullptr;
 
     HINSTANCE hInst = (HINSTANCE)GetModuleHandleA(nullptr);
     typedef UINT(WINAPI* PFN_GetDpiForSystem)();
     static auto pfnDpiSys = (PFN_GetDpiForSystem)GetProcAddress(GetModuleHandleA("user32.dll"), "GetDpiForSystem");
     UINT dpi = pfnDpiSys ? pfnDpiSys() : 96;
-    int W = MulDiv(320, (int)dpi, 96);
-    int H = MulDiv(155, (int)dpi, 96);
+    int W = MulDiv(330, (int)dpi, 96);
+    int H = MulDiv(225, (int)dpi, 96);
 
     HWND hw = CreateWindowExA(
         WS_EX_TOPMOST,
-        "HDRAutostartProfEditDlg", "Profile settings",
+        "HDRAutostartProfEditDlg", L->dlgProfEdit,
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT, W, H,
         parent, nullptr, hInst, &data);
     if (!hw) return false;
     SetForegroundWindow(hw);
+    SetFocus(GetDlgItem(hw, IDC_PROF_HDR_CHECK));
     EnableWindow(parent, FALSE);
     MSG m = {};
     while (IsWindow(hw) && GetMessageA(&m, nullptr, 0, 0) > 0) {
-        TranslateMessage(&m);
-        DispatchMessageA(&m);
+        // Tab / Shift+Tab / Enter / Esc between the controls
+        if (!IsDialogMessageA(hw, &m)) {
+            TranslateMessage(&m);
+            DispatchMessageA(&m);
+        }
     }
     if (IsWindow(hw)) {
         // The app is quitting (tray Exit) while this dialog is open: this nested loop
@@ -2677,7 +2768,7 @@ static bool RunProfEditDialog(HWND parent, int& dimming, int& sharpness)
     }
     EnableWindow(parent, TRUE);
     SetForegroundWindow(parent);
-    if (data.ok) { dimming = data.dimming; sharpness = data.sharpness; }
+    if (data.ok) { dimming = data.dimming; sharpness = data.sharpness; brightness = data.brightness; hdr = data.hdr; }
     return data.ok;
 }
 
@@ -2692,21 +2783,47 @@ static bool RunProfEditDialog(HWND parent, int& dimming, int& sharpness)
 
 struct ProfilesDlgData { HFONT hFont; };
 
+// Shortens a folder path (with trailing backslash) for display: more than 4 components
+// become "drive\...\parent\folder\"; short paths are shown whole
+static std::string AbbrevFolder(const std::string& folder)
+{
+    std::vector<std::string> parts;
+    size_t start = 0;
+    for (size_t i = 0; i < folder.size(); i++)
+        if (folder[i] == '\\') { parts.push_back(folder.substr(start, i - start)); start = i + 1; }
+    if (parts.size() <= 4) return folder;
+    size_t n = parts.size();
+    return parts[0] + "\\...\\" + parts[n - 2] + "\\" + parts[n - 1] + "\\";
+}
+
 static void PopulateProfilesList(HWND lb)
 {
     SendMessageA(lb, LB_RESETCONTENT, 0, 0);
+    const char* const dimNames[] = { L->ktcKeep, L->ktcAuto, L->ktcLow, L->ktcStd, L->ktcHigh };
     EnterCriticalSection(&g_cfgLock);
     for (auto& p : g_cfg.profiles) {
-        // Show basename for readability
-        const char* base = strrchr(p.exe.c_str(), '\\');
-        const char* name = base ? base + 1 : p.exe.c_str();
-        char dim_str[16], sharp_str[16];
-        if (p.localDimming < 0) snprintf(dim_str,   sizeof(dim_str),   "Global");
-        else                     snprintf(dim_str,   sizeof(dim_str),   "%d", p.localDimming);
-        if (p.sharpness < 0)    snprintf(sharp_str, sizeof(sharp_str), "Global");
-        else                     snprintf(sharp_str, sizeof(sharp_str), "%d", p.sharpness);
-        char entry[MAX_PATH + 64];
-        snprintf(entry, sizeof(entry), "%s  [Dim: %s | Sharp: %s]", name, dim_str, sharp_str);
+        // Three entry kinds, each shown differently so two profiles never look alike:
+        //   full path -> "name.exe  (c:\...\folder\)"   name only -> "name.exe  (any folder)"
+        //   folder    -> "[folder] c:\games\"
+        std::string name;
+        if (!p.exe.empty() && p.exe.back() == '\\') {
+            name = std::string(L->profTagFolder) + " " + p.exe;
+        } else if (p.exe.find('\\') == std::string::npos) {
+            name = p.exe + "  " + L->profTagName;
+        } else {
+            name = PathBase(p.exe) + "  (" + AbbrevFolder(p.exe.substr(0, p.exe.size() - PathBase(p.exe).size())) + ")";
+        }
+        char sharp_str[16];
+        if (p.sharpness < 0) snprintf(sharp_str, sizeof(sharp_str), "%s", L->ktcKeep);
+        else                 snprintf(sharp_str, sizeof(sharp_str), "%d", p.sharpness);
+        char entry[MAX_PATH + 256];
+        int len = snprintf(entry, sizeof(entry), "%s  [%s]  %s %s  %s %s", name.c_str(),
+                           p.hdr ? "HDR" : "SDR", L->profDimLabel,
+                           dimNames[p.localDimming >= 0 && p.localDimming <= 4 ? p.localDimming : 0],
+                           L->profSharpShort, sharp_str);
+        // Brightness only applies to SDR games
+        if (!p.hdr && len > 0 && len < (int)sizeof(entry))
+            snprintf(entry + len, sizeof(entry) - len, "  %s %d", L->profBrightShort, p.brightness);
         SendMessageA(lb, LB_ADDSTRING, 0, (LPARAM)entry);
     }
     LeaveCriticalSection(&g_cfgLock);
@@ -2769,17 +2886,53 @@ static LRESULT CALLBACK ProfilesDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             ofn.nMaxFile    = MAX_PATH;
             ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
             if (GetOpenFileNameA(&ofn)) {
-                int dimming = -1, sharpness = -1;
-                if (RunProfEditDialog(hwnd, dimming, sharpness)) {
-                    GameProfile gp;
-                    gp.exe          = ToLower(std::string(path));
-                    gp.localDimming = dimming;
-                    gp.sharpness    = sharpness;
+                // A profile for this exe already exists: edit it instead of adding a duplicate
+                std::string exe = ToLower(std::string(path));
+                // New profiles start with HDR on and inherit the desktop (general) monitor
+                // values as a base: dimming, sharpness and brightness. The user edits from there.
+                int dimming = 1, sharpness = 6, brightness = 100;
+                bool hdr = true;
+                bool sameExe = false;
+                EnterCriticalSection(&g_cfgLock);
+                dimming    = g_cfg.ktcDimmingDesktop;
+                sharpness  = g_cfg.ktcSharpnessDesktop;
+                brightness = g_cfg.ktcBrightnessDesktop;
+                for (auto& q : g_cfg.profiles)
+                    if (q.exe == exe) {
+                        dimming = q.localDimming; sharpness = q.sharpness; brightness = q.brightness;
+                        hdr = q.hdr; sameExe = true; break;
+                    }
+                LeaveCriticalSection(&g_cfgLock);
+                if (!sameExe) {
+                    // No profile for this exact path, but a name or folder profile already covers it:
+                    // start from its values (OK creates a new, more specific full-path profile)
+                    GameProfile cover;
+                    if (FindProfile(exe, cover)) {
+                        dimming = cover.localDimming; sharpness = cover.sharpness;
+                        brightness = cover.brightness; hdr = cover.hdr;
+                    }
+                }
+                if (RunProfEditDialog(hwnd, dimming, sharpness, brightness, hdr)) {
+                    int idx = -1;
                     EnterCriticalSection(&g_cfgLock);
-                    g_cfg.profiles.push_back(gp);
+                    // Look again: the list may have changed while the dialog was open
+                    for (size_t i = 0; i < g_cfg.profiles.size(); i++)
+                        if (g_cfg.profiles[i].exe == exe) { idx = (int)i; break; }
+                    if (idx < 0) {
+                        GameProfile gp;
+                        gp.exe = exe;
+                        g_cfg.profiles.push_back(gp);
+                        idx = (int)g_cfg.profiles.size() - 1;
+                    }
+                    g_cfg.profiles[idx].localDimming = dimming;
+                    g_cfg.profiles[idx].sharpness    = sharpness;
+                    g_cfg.profiles[idx].brightness   = brightness;
+                    g_cfg.profiles[idx].hdr          = hdr;
                     LeaveCriticalSection(&g_cfgLock);
+                    InterlockedIncrement(&g_profilesGen);
                     SaveConfig();
                     PopulateProfilesList(lb);
+                    SendMessageA(lb, LB_SETCURSEL, idx, 0);
                 }
             }
         } else if (LOWORD(wp) == IDC_PROF_EDIT ||
@@ -2788,19 +2941,24 @@ static LRESULT CALLBACK ProfilesDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             if (sel != LB_ERR) {
                 EnterCriticalSection(&g_cfgLock);
                 bool valid = sel < (int)g_cfg.profiles.size();
-                int dimming  = valid ? g_cfg.profiles[sel].localDimming : -1;
-                int sharpness = valid ? g_cfg.profiles[sel].sharpness   : -1;
-                std::string exe = valid ? g_cfg.profiles[sel].exe       : std::string();
+                int dimming   = valid ? g_cfg.profiles[sel].localDimming : 1;
+                int sharpness = valid ? g_cfg.profiles[sel].sharpness    : -1;
+                int brightness = valid ? g_cfg.profiles[sel].brightness  : 100;
+                bool hdr      = valid ? g_cfg.profiles[sel].hdr          : true;
+                std::string exe = valid ? g_cfg.profiles[sel].exe        : std::string();
                 LeaveCriticalSection(&g_cfgLock);
-                if (valid && RunProfEditDialog(hwnd, dimming, sharpness)) {
+                if (valid && RunProfEditDialog(hwnd, dimming, sharpness, brightness, hdr)) {
                     EnterCriticalSection(&g_cfgLock);
                     // The list may have changed while the dialog was open (second
                     // Profiles window): only write if this is still the same entry.
                     if (sel < (int)g_cfg.profiles.size() && g_cfg.profiles[sel].exe == exe) {
                         g_cfg.profiles[sel].localDimming = dimming;
                         g_cfg.profiles[sel].sharpness    = sharpness;
+                        g_cfg.profiles[sel].brightness   = brightness;
+                        g_cfg.profiles[sel].hdr          = hdr;
                     }
                     LeaveCriticalSection(&g_cfgLock);
+                    InterlockedIncrement(&g_profilesGen);
                     SaveConfig();
                     PopulateProfilesList(lb);
                     SendMessageA(lb, LB_SETCURSEL, sel, 0);
@@ -2813,6 +2971,7 @@ static LRESULT CALLBACK ProfilesDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
                 if (sel < (int)g_cfg.profiles.size())
                     g_cfg.profiles.erase(g_cfg.profiles.begin() + sel);
                 LeaveCriticalSection(&g_cfgLock);
+                InterlockedIncrement(&g_profilesGen);
                 SaveConfig();
                 PopulateProfilesList(lb);
             }
@@ -2832,6 +2991,13 @@ static LRESULT CALLBACK ProfilesDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
 
 static void ShowProfilesDialog()
 {
+    // One profiles window at a time: bring the existing one forward
+    HWND existing = FindWindowA("HDRAutostartProfilesDlg", nullptr);
+    if (existing) {
+        ShowWindow(existing, SW_RESTORE);
+        SetForegroundWindow(existing);
+        return;
+    }
     ProfilesDlgData* data = new ProfilesDlgData{nullptr};
     HINSTANCE hInst = (HINSTANCE)GetModuleHandleA(nullptr);
 
@@ -2849,6 +3015,26 @@ static void ShowProfilesDialog()
         nullptr, nullptr, hInst, data);
     if (hw) SetForegroundWindow(hw);
     else    delete data;
+}
+
+// Local Dimming submenu: Don't change, Auto, Low, Standard, High (command ids baseId + 0..4, current one checked)
+static HMENU BuildDimMenu(int current, int baseId)
+{
+    HMENU sub = CreatePopupMenu();
+    AppendMenuA(sub, MF_STRING | (current == 0 ? MF_CHECKED : 0u), baseId + 0, L->ktcKeep);
+    AppendMenuA(sub, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(sub, MF_STRING | (current == 1 ? MF_CHECKED : 0u), baseId + 1, L->ktcAuto);
+    AppendMenuA(sub, MF_STRING | (current == 2 ? MF_CHECKED : 0u), baseId + 2, L->ktcLow);
+    AppendMenuA(sub, MF_STRING | (current == 3 ? MF_CHECKED : 0u), baseId + 3, L->ktcStd);
+    AppendMenuA(sub, MF_STRING | (current == 4 ? MF_CHECKED : 0u), baseId + 4, L->ktcHigh);
+    return sub;
+}
+
+// Sharpness value for a menu label: the number, or "Don't change" for -1 (nothing is sent)
+static void SharpnessText(char* out, size_t n, int v)
+{
+    if (v < 0) snprintf(out, n, "%s", L->ktcKeep);
+    else       snprintf(out, n, "%d", v);
 }
 
 static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -2887,6 +3073,17 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
+    if (msg == WM_MIGRATION_NOTICE) {
+        g_migratedDroppedFolders = false;  // once
+        g_nid.uFlags |= NIF_INFO;
+        snprintf(g_nid.szInfo,      sizeof(g_nid.szInfo),      "%s", L->msgFoldersDropped);
+        snprintf(g_nid.szInfoTitle, sizeof(g_nid.szInfoTitle), "HDRAutostart");
+        g_nid.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
+        Shell_NotifyIconA(NIM_MODIFY, &g_nid);
+        g_nid.uFlags &= ~NIF_INFO;
+        return 0;
+    }
+
     if (msg == WM_TASKBARCREATED) {
         KillTimer(hwnd, TIMER_TRAY_RETRY);
         g_trayRetry = 0;
@@ -2899,8 +3096,12 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (wp == TIMER_BROWSER) {
             CheckBrowserHDR();
         } else if (wp == TIMER_TRAY_RETRY) {
-            if (Shell_NotifyIconA(NIM_ADD, &g_nid) || ++g_trayRetry >= 30)
+            if (Shell_NotifyIconA(NIM_ADD, &g_nid)) {
                 KillTimer(hwnd, TIMER_TRAY_RETRY);
+                if (g_migratedDroppedFolders) PostMessageA(hwnd, WM_MIGRATION_NOTICE, 0, 0);
+            } else if (++g_trayRetry >= 30) {
+                KillTimer(hwnd, TIMER_TRAY_RETRY);
+            }
         }
         return 0;
 
@@ -2914,78 +3115,41 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             HMENU m = CreatePopupMenu();
             AppendMenuA(m, MF_STRING | MF_DISABLED | MF_GRAYED, ID_TRAY_ABOUT, "HDRAutostart v" APP_VERSION);
             AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
-            AppendMenuA(m, MF_STRING, ID_TRAY_FOLDERS,   L->menuFolders);
-            AppendMenuA(m, MF_STRING, ID_TRAY_WHITELIST, L->menuWhitelist);
-            AppendMenuA(m, MF_STRING, ID_TRAY_BLACKLIST, L->menuBlacklist);
-            AppendMenuA(m, MF_STRING, ID_TRAY_EXCLUDE,   L->menuExclude);
+            // Game profiles are the main entry point: a game is only watched once it has a profile
+            AppendMenuA(m, MF_STRING, ID_TRAY_PROFILES, L->menuProfiles);
             AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
 
-            // Local Dimming parent menu
-            int d, ds, shdrv, ssdv, sdeskv, brightDesk, brightSdr;
+            int deskDim, deskSharp, deskBright, vidDim, vidSharp;
             bool browserHdrOn;
             EnterCriticalSection(&g_cfgLock);
-            d            = g_cfg.ktcLocalDimming;
-            ds           = g_cfg.ktcSdrLocalDimming;
-            shdrv        = g_cfg.ktcSharpnessHdr;
-            ssdv         = g_cfg.ktcSharpnessSdr;
-            sdeskv       = g_cfg.ktcSharpnessDesktop;
-            brightDesk   = g_cfg.ktcBrightnessDesktop;
-            brightSdr    = g_cfg.ktcBrightnessSdr;
+            deskDim      = g_cfg.ktcDimmingDesktop;
+            deskSharp    = g_cfg.ktcSharpnessDesktop;
+            deskBright   = g_cfg.ktcBrightnessDesktop;
+            vidDim       = g_cfg.videoDimming;
+            vidSharp     = g_cfg.videoSharpness;
             browserHdrOn = g_cfg.browserHdrEnabled;
             LeaveCriticalSection(&g_cfgLock);
 
-            HMENU sub = CreatePopupMenu();
-            AppendMenuA(sub, MF_STRING | (d==0?MF_CHECKED:0u), ID_KTC_OFF,      L->ktcOff);
-            AppendMenuA(sub, MF_SEPARATOR, 0, nullptr);
-            AppendMenuA(sub, MF_STRING | (d==1?MF_CHECKED:0u), ID_KTC_AUTO,     L->ktcAuto);
-            AppendMenuA(sub, MF_STRING | (d==2?MF_CHECKED:0u), ID_KTC_LOW,      L->ktcLow);
-            AppendMenuA(sub, MF_STRING | (d==3?MF_CHECKED:0u), ID_KTC_STANDARD, L->ktcStd);
-            AppendMenuA(sub, MF_STRING | (d==4?MF_CHECKED:0u), ID_KTC_HIGH,     L->ktcHigh);
+            char sharpTxt[16], lbl[96];
 
-            HMENU subSDR = CreatePopupMenu();
-            AppendMenuA(subSDR, MF_STRING | (ds==0?MF_CHECKED:0u), ID_KTC_SDR_OFF,      L->ktcOff);
-            AppendMenuA(subSDR, MF_SEPARATOR, 0, nullptr);
-            AppendMenuA(subSDR, MF_STRING | (ds==1?MF_CHECKED:0u), ID_KTC_SDR_AUTO,     L->ktcAuto);
-            AppendMenuA(subSDR, MF_STRING | (ds==2?MF_CHECKED:0u), ID_KTC_SDR_LOW,      L->ktcLow);
-            AppendMenuA(subSDR, MF_STRING | (ds==3?MF_CHECKED:0u), ID_KTC_SDR_STANDARD, L->ktcStd);
-            AppendMenuA(subSDR, MF_STRING | (ds==4?MF_CHECKED:0u), ID_KTC_SDR_HIGH,     L->ktcHigh);
+            // Desktop submenu: what the monitor returns to when no game is running
+            HMENU deskMenu = CreatePopupMenu();
+            AppendMenuA(deskMenu, MF_POPUP, (UINT_PTR)BuildDimMenu(deskDim, ID_DESK_DIM_0), L->menuLocalDimming);
+            SharpnessText(sharpTxt, sizeof(sharpTxt), deskSharp);
+            snprintf(lbl, sizeof(lbl), "%s: %s...", L->menuSharpness, sharpTxt);
+            AppendMenuA(deskMenu, MF_STRING, ID_DESK_SHARP, lbl);
+            snprintf(lbl, sizeof(lbl), "%s: %d...", L->menuBrightness, deskBright);
+            AppendMenuA(deskMenu, MF_STRING, ID_DESK_BRIGHT, lbl);
+            AppendMenuA(m, MF_POPUP, (UINT_PTR)deskMenu, L->menuDesktop);
 
-            // Local Dimming submenu
-            HMENU dimMenu = CreatePopupMenu();
-            AppendMenuA(dimMenu, MF_POPUP, (UINT_PTR)sub,    L->menuKTC);
-            AppendMenuA(dimMenu, MF_POPUP, (UINT_PTR)subSDR, L->menuKTCSDR);
-
-            // Sharpness submenu
-            char shdrLabel[64], ssdLabel[64], sdeskLabel[64];
-            snprintf(shdrLabel,  sizeof(shdrLabel),  "HDR (KTC): %d",     shdrv);
-            snprintf(ssdLabel,   sizeof(ssdLabel),   "SDR (KTC): %d",     ssdv);
-            snprintf(sdeskLabel, sizeof(sdeskLabel),  "Desktop (KTC): %d", sdeskv);
-            HMENU sharpMenu = CreatePopupMenu();
-            AppendMenuA(sharpMenu, MF_STRING, ID_KTC_SHARP_HDR,  shdrLabel);
-            AppendMenuA(sharpMenu, MF_STRING, ID_KTC_SHARP_SDR,  ssdLabel);
-            AppendMenuA(sharpMenu, MF_STRING, ID_KTC_SHARP_DESK, sdeskLabel);
-
-            // Brightness submenu
-            char bDeskLabel[64], bSdrLabel[64];
-            snprintf(bDeskLabel, sizeof(bDeskLabel), "Desktop (KTC): %d", brightDesk);
-            snprintf(bSdrLabel,  sizeof(bSdrLabel),  "SDR Game (KTC): %d", brightSdr);
-            HMENU brightMenu = CreatePopupMenu();
-            AppendMenuA(brightMenu, MF_STRING, ID_KTC_BRIGHT_DESK, bDeskLabel);
-            AppendMenuA(brightMenu, MF_STRING, ID_KTC_BRIGHT_SDR,  bSdrLabel);
-
-            // KTC Settings root submenu
-            HMENU ktcMenu = CreatePopupMenu();
-            AppendMenuA(ktcMenu, MF_POPUP,     (UINT_PTR)dimMenu,       L->menuLocalDimming);
-            AppendMenuA(ktcMenu, MF_POPUP,     (UINT_PTR)sharpMenu,     L->menuSharpness);
-            AppendMenuA(ktcMenu, MF_POPUP,     (UINT_PTR)brightMenu,    L->menuBrightness);
-            AppendMenuA(ktcMenu, MF_SEPARATOR, 0, nullptr);
-            AppendMenuA(ktcMenu, MF_STRING,    ID_TRAY_PROFILES,        L->menuProfiles);
-            AppendMenuA(m, MF_POPUP, (UINT_PTR)ktcMenu, L->menuKTCSettings);
-
-            // Video submenu
+            // Video submenu: HDR for fullscreen browser video and the values it uses
             HMENU videoMenu = CreatePopupMenu();
             AppendMenuA(videoMenu, MF_STRING | (browserHdrOn ? MF_CHECKED : 0u),
                         ID_VIDEO_BROWSER, L->menuVideoBrowser);
+            AppendMenuA(videoMenu, MF_POPUP, (UINT_PTR)BuildDimMenu(vidDim, ID_VIDEO_DIM_0), L->menuLocalDimming);
+            SharpnessText(sharpTxt, sizeof(sharpTxt), vidSharp);
+            snprintf(lbl, sizeof(lbl), "%s: %s...", L->menuSharpness, sharpTxt);
+            AppendMenuA(videoMenu, MF_STRING, ID_VIDEO_SHARP, lbl);
             AppendMenuA(m, MF_POPUP, (UINT_PTR)videoMenu, L->menuVideo);
             AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
 
@@ -3006,36 +3170,26 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_COMMAND:
         switch (LOWORD(wp)) {
-        case ID_TRAY_FOLDERS:
-            ShowListDialog(L->dlgFolders,   &g_cfg.folders,   1); break;
-        case ID_TRAY_WHITELIST:
-            ShowListDialog(L->dlgWhitelist, &g_cfg.whitelist, 0); break;
-        case ID_TRAY_BLACKLIST:
-            ShowListDialog(L->dlgBlacklist, &g_cfg.blacklist, 0); break;
-        case ID_TRAY_EXCLUDE:
-            ShowListDialog(L->dlgExclude,   &g_cfg.exclude,   2); break;
         case ID_TRAY_STARTUP:
             SetStartup(!IsInStartup());  break;
-        case ID_KTC_OFF:          { EnterCriticalSection(&g_cfgLock); g_cfg.ktcLocalDimming=0;    LeaveCriticalSection(&g_cfgLock); SaveConfig(); } break;
-        case ID_KTC_AUTO:         { EnterCriticalSection(&g_cfgLock); g_cfg.ktcLocalDimming=1;    LeaveCriticalSection(&g_cfgLock); SaveConfig(); } break;
-        case ID_KTC_LOW:          { EnterCriticalSection(&g_cfgLock); g_cfg.ktcLocalDimming=2;    LeaveCriticalSection(&g_cfgLock); SaveConfig(); } break;
-        case ID_KTC_STANDARD:     { EnterCriticalSection(&g_cfgLock); g_cfg.ktcLocalDimming=3;    LeaveCriticalSection(&g_cfgLock); SaveConfig(); } break;
-        case ID_KTC_HIGH:         { EnterCriticalSection(&g_cfgLock); g_cfg.ktcLocalDimming=4;    LeaveCriticalSection(&g_cfgLock); SaveConfig(); } break;
-        case ID_KTC_SDR_OFF:      { EnterCriticalSection(&g_cfgLock); g_cfg.ktcSdrLocalDimming=0; LeaveCriticalSection(&g_cfgLock); SaveConfig(); } break;
-        case ID_KTC_SDR_AUTO:     { EnterCriticalSection(&g_cfgLock); g_cfg.ktcSdrLocalDimming=1; LeaveCriticalSection(&g_cfgLock); SaveConfig(); } break;
-        case ID_KTC_SDR_LOW:      { EnterCriticalSection(&g_cfgLock); g_cfg.ktcSdrLocalDimming=2; LeaveCriticalSection(&g_cfgLock); SaveConfig(); } break;
-        case ID_KTC_SDR_STANDARD: { EnterCriticalSection(&g_cfgLock); g_cfg.ktcSdrLocalDimming=3; LeaveCriticalSection(&g_cfgLock); SaveConfig(); } break;
-        case ID_KTC_SDR_HIGH:     { EnterCriticalSection(&g_cfgLock); g_cfg.ktcSdrLocalDimming=4; LeaveCriticalSection(&g_cfgLock); SaveConfig(); } break;
-        case ID_KTC_SHARP_HDR:
-            ShowSharpnessDialog("Sharpness HDR (KTC)", &g_cfg.ktcSharpnessHdr); break;
-        case ID_KTC_SHARP_SDR:
-            ShowSharpnessDialog("Sharpness SDR (KTC)", &g_cfg.ktcSharpnessSdr); break;
-        case ID_KTC_SHARP_DESK:
-            ShowSharpnessDialog("Sharpness Desktop (KTC)", &g_cfg.ktcSharpnessDesktop); break;
-        case ID_KTC_BRIGHT_DESK:
-            ShowNumDialog("Brightness Desktop (KTC)", &g_cfg.ktcBrightnessDesktop, 0, 100); break;
-        case ID_KTC_BRIGHT_SDR:
-            ShowNumDialog("Brightness SDR Game (KTC)", &g_cfg.ktcBrightnessSdr, 0, 100); break;
+        case ID_DESK_SHARP: {
+            char title[96];
+            snprintf(title, sizeof(title), "%s - %s", L->menuSharpness, L->menuDesktop);
+            ShowSharpnessDialog(title, &g_cfg.ktcSharpnessDesktop, true);
+            break;
+        }
+        case ID_DESK_BRIGHT: {
+            char title[96];
+            snprintf(title, sizeof(title), "%s - %s", L->menuBrightness, L->menuDesktop);
+            ShowNumDialog(title, &g_cfg.ktcBrightnessDesktop, 0, 100, true);
+            break;
+        }
+        case ID_VIDEO_SHARP: {
+            char title[96];
+            snprintf(title, sizeof(title), "%s - %s", L->menuSharpness, L->menuVideo);
+            ShowSharpnessDialog(title, &g_cfg.videoSharpness);
+            break;
+        }
         case ID_TRAY_PROFILES:
             ShowProfilesDialog(); break;
         case ID_VIDEO_BROWSER:
@@ -3061,8 +3215,22 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             SetEvent(g_stopEvent);
             DestroyWindow(hwnd);
             break;
-        default:
+        default: {
+            int id = LOWORD(wp);
+            if (id >= ID_DESK_DIM_0 && id <= ID_DESK_DIM_0 + 4) {
+                EnterCriticalSection(&g_cfgLock);
+                g_cfg.ktcDimmingDesktop = id - ID_DESK_DIM_0;
+                LeaveCriticalSection(&g_cfgLock);
+                SaveConfig();
+                DesktopSettingsChanged();
+            } else if (id >= ID_VIDEO_DIM_0 && id <= ID_VIDEO_DIM_0 + 4) {
+                EnterCriticalSection(&g_cfgLock);
+                g_cfg.videoDimming = id - ID_VIDEO_DIM_0;
+                LeaveCriticalSection(&g_cfgLock);
+                SaveConfig();
+            }
             break;
+        }
         }
         return 0;
 
@@ -3110,14 +3278,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     DetectLang();
     InitializeCriticalSection(&g_cfgLock);
     InitializeCriticalSection(&g_ktcCacheLock);
+    OpenLog();  // before LoadConfig so the config migration can be logged
+    Log("=== HDRAutostart started ===");
     LoadConfig();
     // Reset update timestamp only if it's older than 24h (prevents install-loop:
     // installer relaunches the app which would re-trigger the update immediately)
     if (g_cfg.lastUpdateAttempt != 0 &&
         (time(nullptr) - g_cfg.lastUpdateAttempt) > 86400)
         g_cfg.lastUpdateAttempt = 0;
-    OpenLog();
-    Log("=== HDRAutostart started ===");
     // NVAPI is not loaded at startup: SetNVAPIVCP is unused, and loading nvapi64.dll
     // by name from an elevated process searches the exe folder first.
 
@@ -3127,12 +3295,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     wc.cbSize = sizeof(wc);  wc.hInstance = hInst;
     wc.lpszClassName = "HDRAutostartTray";  wc.lpfnWndProc = TrayWndProc;
     RegisterClassExA(&wc);
-
-    WNDCLASSEXA wc2 = {};
-    wc2.cbSize = sizeof(wc2);  wc2.hInstance = hInst;
-    wc2.lpszClassName = "HDRAutostartListDlg";  wc2.lpfnWndProc = ListDlgProc;
-    wc2.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    RegisterClassExA(&wc2);
 
     WNDCLASSEXA wc3 = {};
     wc3.cbSize = sizeof(wc3);  wc3.hInstance = hInst;
@@ -3177,6 +3339,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     snprintf(g_nid.szTip, sizeof(g_nid.szTip), "%s  v" APP_VERSION, L->tipOff);
     if (!Shell_NotifyIconA(NIM_ADD, &g_nid))
         SetTimer(g_trayWnd, TIMER_TRAY_RETRY, 1000, nullptr);  // shell not ready yet
+    else if (g_migratedDroppedFolders)
+        PostMessageA(g_trayWnd, WM_MIGRATION_NOTICE, 0, 0);    // icon is in: show the one-time notice
 
     SetTimer(g_trayWnd, TIMER_BROWSER, 500, nullptr);
 
