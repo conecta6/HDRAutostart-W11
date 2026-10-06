@@ -10,12 +10,14 @@
 
 Windows 11 supports HDR, but it does not switch automatically. If you leave HDR always-on, your desktop, browser, and SDR apps look washed out. If you leave it off, you have to open Display Settings every time you want to play a game or watch HDR video. HDRAutostart solves this by monitoring your system in the background and toggling HDR for you.
 
+> **KTC monitors only:** HDRAutostart switches HDR on and off, and sends brightness, sharpness and local dimming commands, **only to a KTC monitor**. Any other monitor connected to the PC is never touched. KTC monitors are recognised by their manufacturer ID ("KTC" or "SKG") or because they answer the KTC local dimming command.
+
 ### Features
 
 | Feature | Description |
 |---|---|
-| **Game auto-detection** | Monitors Steam / GOG / Epic (and any custom folder) for new game processes and enables HDR the moment a game launches. HDR is disabled automatically when the game closes. |
-| **Browser fullscreen** | When Chrome, Edge, Firefox, Brave, Vivaldi, Opera, or other supported browsers enter fullscreen, HDR is enabled. It is disabled again as soon as the browser leaves fullscreen. To watch HDR videos, simply put the browser in fullscreen mode — usually by pressing **F11** or clicking the fullscreen button on the video player. |
+| **Game auto-detection** | Monitors Steam / GOG / Epic (and any custom folder) for new game processes and enables HDR the moment a game launches. Games already open when the app starts are detected too, and an HDR left on by a previous run is turned off. HDR is disabled automatically 2 seconds after the last game closes. |
+| **Browser fullscreen** | When Chrome, Edge, Firefox, Brave, Vivaldi, Opera, or other supported browsers enter fullscreen, HDR is enabled. It is disabled again as soon as the browser leaves fullscreen. Off by default: enable it from the tray menu (**Video** → **HDR on browser fullscreen**). To watch HDR videos, simply put the browser in fullscreen mode — usually by pressing **F11** or clicking the fullscreen button on the video player. |
 | **Whitelist** | Add individual `.exe` files that should always trigger HDR, regardless of their folder location. |
 | **Blacklist** | Add individual `.exe` files that should never trigger HDR (e.g. launchers inside game folders you don't want triggering HDR). |
 | **Exclude** | Completely ignore specific executables or entire folders. Excluded items are never scanned — no HDR, no KTC dimming. Useful for tools, utilities, or whole directories you never want to trigger anything. |
@@ -23,7 +25,7 @@ Windows 11 supports HDR, but it does not switch automatically. If you leave HDR 
 | **KTC Sharpness** | Automatically set monitor sharpness (VCP 0x87) when HDR activates or deactivates. Configurable from 0 to 10. Default: 6. |
 | **KTC Brightness** | Automatically set monitor brightness (VCP 0x10) when an SDR game launches or exits. Desktop value default: 22. SDR game value default: 100. |
 | **Game profiles** | Assign per-game Local Dimming and Sharpness overrides to specific executables. When the game closes, standard global values are restored automatically. |
-| **Run at startup** | One-click option to launch HDRAutostart with Windows. |
+| **Run at startup** | Launches HDRAutostart with Windows through a scheduled task (no UAC prompt). The installer creates it; you can turn it on or off from the tray menu. |
 | **System tray** | Runs silently in the background. Orange icon = HDR active, grey icon = HDR inactive. Right-click for the menu. |
 
 ### Installation
@@ -31,11 +33,17 @@ Windows 11 supports HDR, but it does not switch automatically. If you leave HDR 
 1. Download `HDRAutostartSetup.exe` from [Releases](../../releases).
 2. Run the installer. Windows will ask for administrator privileges — these are required to control HDR via the Windows Display API.
 3. The app appears in the system tray. Right-click to configure.
-4. (Optional) Enable **Run at startup** so it starts automatically with Windows.
+4. The installer already sets HDRAutostart to start with Windows. You can turn this on or off from the tray menu (**Run at startup**). In portable mode (running the `.exe` without installing) it is optional: enable it from that same menu entry.
+
+**Automatic updates:** the installed copy checks GitHub for a new version when it starts and updates itself silently. Portable copies do not update themselves.
 
 ### Configuration
 
-All settings are stored in `hdrautostart.ini` next to the executable.
+All settings are stored in `hdrautostart.ini`. Its location depends on how you installed the app:
+
+- Install for all users: `%ProgramData%\HDRAutostart`
+- Install for the current user: `%APPDATA%\HDRAutostart`
+- Portable mode (no installer): next to the executable
 
 #### Tray menu reference
 
@@ -60,6 +68,8 @@ The tray menu currently contains these entries:
         Desktop (KTC): <current value>
         SDR Game (KTC): <current value>
       Game profiles...
+    Video
+      HDR on browser fullscreen      (checked when enabled)
     Run at startup                   (checked when enabled)
     GitHub
     Exit
@@ -69,6 +79,7 @@ The tray menu currently contains these entries:
 - `KTC Settings -> Sharpness (KTC)` shows the current HDR, SDR, and Desktop sharpness values and opens the value picker for each one.
 - `KTC Settings -> Brightness` shows the current Desktop and SDR Game brightness values and opens the numeric input for each one.
 - `KTC Settings -> Game profiles...` opens the per-game override manager.
+- `Video -> HDR on browser fullscreen` turns browser fullscreen HDR on or off (off by default).
 - `Run at startup` toggles Windows startup registration.
 - `GitHub` opens the project repository in your browser.
 - `Exit` closes HDRAutostart.
@@ -108,7 +119,7 @@ Useful for tools, benchmarks, or secondary launchers you never want HDRAutostart
 
 ### KTC Settings (KTC monitors only)
 
-> **Note for non-KTC users:** These features exist solely because KTC is the monitor the developer uses. They are completely optional. If you ignore the KTC Settings submenu entirely, HDR auto-switching works normally on any HDR-capable monitor or TV.
+> **Note:** HDRAutostart only works with KTC monitors: HDR switching and everything in this submenu are sent only to a KTC display, and other connected monitors are left alone.
 
 All KTC-specific options are grouped under:
 
@@ -194,15 +205,15 @@ If you want to verify it yourself, you can [build it from source](#building-from
 
 - Windows 10 version 1903 or later (HDR API requirement)
 - Administrator privileges (required by the Windows HDR API)
-- A monitor that supports HDR
+- A KTC monitor that supports HDR (other brands are ignored)
 
 ### Building from source
 
 Requires:
-- [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the **Desktop development with C++** workload (MSVC x64)
+- [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) (any version) with the **Desktop development with C++** workload (MSVC x64)
 - [NSIS 3.x](https://nsis.sourceforge.io/Download)
 
-All source paths in `build.bat` are relative to `%~dp0` (the folder where the script lives). If `vcvarsall.bat` is not found, edit line 7 of `build.bat` to match your Visual Studio installation path. Then run:
+All source paths in `build.bat` are relative to `%~dp0` (the folder where the script lives). `build.bat` finds the compiler automatically with `vswhere` and looks for `makensis` in your `PATH` (then in the default NSIS folders). Then run:
 
 ```bat
 build.bat
@@ -218,12 +229,14 @@ Output: `dist\HDRAutostart.exe` and `dist\HDRAutostartSetup.exe`
 
 Windows 11 soporta HDR, pero no lo activa automáticamente. Si dejas el HDR siempre encendido, el escritorio, el navegador y las aplicaciones SDR se ven deslavados. Si lo dejas apagado, tienes que abrir la Configuración de pantalla cada vez que quieres jugar o ver un video HDR. HDRAutostart resuelve esto monitoreando el sistema en segundo plano y cambiando el HDR por ti.
 
+> **Solo monitores KTC:** HDRAutostart enciende y apaga el HDR, y envía brillo, nitidez y local dimming, **únicamente a un monitor KTC**. Cualquier otro monitor conectado al PC no se toca. Los monitores KTC se reconocen por su ID de fabricante ("KTC" o "SKG") o porque responden al comando de local dimming de KTC.
+
 ### Funcionalidades
 
 | Función | Descripción |
 |---|---|
-| **Detección automática de juegos** | Monitorea Steam / GOG / Epic (y cualquier carpeta personalizada) en busca de nuevos procesos de juego y activa el HDR en cuanto el juego abre. El HDR se desactiva automáticamente cuando el juego cierra. |
-| **Pantalla completa en navegador** | Cuando Chrome, Edge, Firefox, Brave, Vivaldi, Opera u otros navegadores compatibles entran en pantalla completa, se activa el HDR. Se desactiva en cuanto el navegador sale de pantalla completa. Para ver videos en HDR, simplemente pon el navegador en pantalla completa — normalmente pulsando **F11** o el botón de pantalla completa del reproductor de video. |
+| **Detección automática de juegos** | Monitorea Steam / GOG / Epic (y cualquier carpeta personalizada) en busca de nuevos procesos de juego y activa el HDR en cuanto el juego abre. También detecta los juegos que ya estaban abiertos al iniciar la app, y apaga un HDR que hubiera quedado encendido de una ejecución anterior. El HDR se desactiva automáticamente 2 segundos después de cerrarse el último juego. |
+| **Pantalla completa en navegador** | Cuando Chrome, Edge, Firefox, Brave, Vivaldi, Opera u otros navegadores compatibles entran en pantalla completa, se activa el HDR. Se desactiva en cuanto el navegador sale de pantalla completa. Está desactivado por defecto: actívalo desde el menú de la bandeja (**Vídeo** → **HDR en navegador a pantalla completa**). Para ver videos en HDR, simplemente pon el navegador en pantalla completa — normalmente pulsando **F11** o el botón de pantalla completa del reproductor de video. |
 | **Lista blanca** | Agrega archivos `.exe` individuales que siempre deben activar el HDR, independientemente de su carpeta. |
 | **Lista negra** | Agrega archivos `.exe` individuales que nunca deben activar el HDR (p. ej. launchers dentro de carpetas de juegos que no quieres que disparen el HDR). |
 | **Excluir** | Ignora completamente ejecutables concretos o carpetas enteras. Los elementos excluidos no se procesan en absoluto — sin HDR, sin KTC dimming. Útil para herramientas, utilidades o directorios enteros que nunca quieres que disparen nada. |
@@ -231,7 +244,7 @@ Windows 11 soporta HDR, pero no lo activa automáticamente. Si dejas el HDR siem
 | **Nitidez KTC** | Ajusta automáticamente la nitidez del monitor (VCP 0x87) al activar o desactivar el HDR. Configurable de 0 a 10. Valor por defecto: 6. |
 | **Brillo KTC** | Ajusta automáticamente el brillo del monitor (VCP 0x10) cuando se lanza o cierra un juego SDR (lista negra). Valor escritorio por defecto: 22. Valor juego SDR por defecto: 100. |
 | **Perfiles de juego** | Asigna valores personalizados de Local Dimming y Nitidez a ejecutables específicos. Al cerrar el juego, se restauran automáticamente los valores globales estándar. |
-| **Ejecutar al inicio** | Opción con un clic para lanzar HDRAutostart con Windows. |
+| **Ejecutar al inicio** | Lanza HDRAutostart con Windows mediante una tarea programada (sin aviso de UAC). La crea el instalador; puedes activarla o desactivarla desde el menú de la bandeja. |
 | **Bandeja del sistema** | Se ejecuta silenciosamente en segundo plano. Icono naranja = HDR activo, icono gris = HDR inactivo. Clic derecho para el menú. |
 
 ### Instalación
@@ -239,11 +252,17 @@ Windows 11 soporta HDR, pero no lo activa automáticamente. Si dejas el HDR siem
 1. Descarga `HDRAutostartSetup.exe` desde [Releases](../../releases).
 2. Ejecuta el instalador. Windows pedirá privilegios de administrador — son necesarios para controlar el HDR a través de la API de Windows.
 3. La app aparece en la bandeja del sistema. Clic derecho para configurar.
-4. (Opcional) Activa **Ejecutar al inicio** para que arranque automáticamente con Windows.
+4. El instalador ya configura HDRAutostart para que arranque con Windows. Puedes activarlo o desactivarlo desde el menú de la bandeja (**Ejecutar al inicio**). En modo portable (ejecutar el `.exe` sin instalar) es opcional: actívalo desde esa misma entrada del menú.
+
+**Actualizaciones automáticas:** la copia instalada comprueba GitHub al arrancar y se actualiza sola en silencio. Las copias portables no se actualizan solas.
 
 ### Configuración
 
-Todos los ajustes se guardan en `hdrautostart.ini` junto al ejecutable.
+Todos los ajustes se guardan en `hdrautostart.ini`. Su ubicación depende de cómo hayas instalado la app:
+
+- Instalación para todos los usuarios: `%ProgramData%\HDRAutostart`
+- Instalación para el usuario actual: `%APPDATA%\HDRAutostart`
+- Modo portable (sin instalador): junto al ejecutable
 
 #### Arbol del menu de bandeja
 
@@ -268,6 +287,8 @@ El menu de la bandeja contiene actualmente estas opciones:
         Desktop (KTC): <valor actual>
         SDR Game (KTC): <valor actual>
       Perfiles de juego...
+    Vídeo
+      HDR en navegador a pantalla completa   (con marca cuando esta activado)
     Ejecutar al inicio               (con marca cuando esta activado)
     GitHub
     Salir
@@ -277,6 +298,7 @@ El menu de la bandeja contiene actualmente estas opciones:
 - `Configuracion KTC -> Nitidez (KTC)` muestra los valores actuales de nitidez para HDR, SDR y Desktop, y abre el selector de valor para cada uno.
 - `Configuracion KTC -> Brillo` muestra los valores actuales de brillo para escritorio y juego SDR, y abre el selector numérico para cada uno.
 - `Configuracion KTC -> Perfiles de juego...` abre el gestor de perfiles por juego.
+- `Vídeo -> HDR en navegador a pantalla completa` activa o desactiva el HDR en navegador a pantalla completa (desactivado por defecto).
 - `Ejecutar al inicio` activa o desactiva el arranque con Windows.
 - `GitHub` abre el repositorio del proyecto en el navegador.
 - `Salir` cierra HDRAutostart.
@@ -316,7 +338,7 @@ Ignora completamente ejecutables concretos o carpetas enteras — los elementos 
 
 ### Configuración KTC (solo monitores KTC)
 
-> **Nota para usuarios sin monitor KTC:** Estas funciones existen únicamente porque KTC es el monitor que usa el desarrollador. Son completamente opcionales. Si ignoras el submenú Configuración KTC, el cambio automático de HDR funciona con normalidad en cualquier monitor o televisor compatible con HDR.
+> **Nota:** HDRAutostart solo funciona con monitores KTC: el cambio de HDR y todo lo de este submenú se envía únicamente a una pantalla KTC, y los demás monitores conectados no se tocan.
 
 Todas las opciones específicas de KTC están agrupadas en:
 
@@ -402,15 +424,15 @@ Si quieres verificarlo tú mismo, puedes [compilarlo desde el código fuente](#c
 
 - Windows 10 versión 1903 o posterior (requisito de la API HDR)
 - Privilegios de administrador (requeridos por la API HDR de Windows)
-- Un monitor compatible con HDR
+- Un monitor KTC compatible con HDR (las demás marcas se ignoran)
 
 ### Compilar desde el código fuente
 
 Requiere:
-- [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) con la carga de trabajo **Desarrollo para escritorio con C++** (MSVC x64)
+- [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) (cualquier versión) con la carga de trabajo **Desarrollo para escritorio con C++** (MSVC x64)
 - [NSIS 3.x](https://nsis.sourceforge.io/Download)
 
-Todas las rutas en `build.bat` son relativas a `%~dp0` (la carpeta donde vive el script). Si `vcvarsall.bat` no se encuentra, edita la línea 7 de `build.bat` para que coincida con tu ruta de instalación de Visual Studio. Luego ejecuta:
+Todas las rutas en `build.bat` son relativas a `%~dp0` (la carpeta donde vive el script). `build.bat` localiza el compilador automáticamente con `vswhere` y busca `makensis` en tu `PATH` (y después en las carpetas por defecto de NSIS). Luego ejecuta:
 
 ```bat
 build.bat

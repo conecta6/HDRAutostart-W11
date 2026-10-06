@@ -193,11 +193,16 @@ static std::string ConfigDir()
     return ExeDir();
 }
 
+static void Log(const char* fmt, ...);  // defined below (used by SaveConfig)
+
 static void SaveConfig()
 {
     std::string path = ConfigDir() + "hdrautostart.ini";
+    // Write to a temp file and swap it in at the end, so a crash or power loss
+    // mid-save can never leave an empty/truncated .ini behind.
+    std::string tmp  = path + ".tmp";
     EnterCriticalSection(&g_cfgLock);
-    FILE* f = fopen(path.c_str(), "w");
+    FILE* f = fopen(tmp.c_str(), "w");
     if (!f) { LeaveCriticalSection(&g_cfgLock); return; }
     fprintf(f, "[settings]\n");
     fprintf(f, "ktc_local_dimming=%d\n",     g_cfg.ktcLocalDimming);
@@ -221,8 +226,25 @@ static void SaveConfig()
     fprintf(f, "[profiles]\n");
     for (auto& p : g_cfg.profiles)
         fprintf(f, "%s|%d|%d\n", p.exe.c_str(), p.localDimming, p.sharpness);
+    bool ok = !ferror(f);
+    if (fclose(f) != 0) ok = false;
+    // Swap inside the lock: two threads saving at once must not share the temp file
+    // The swap can fail transiently (antivirus / indexer holding the target): retry a few times
+    bool  moved   = false;
+    DWORD moveErr = 0;
+    if (ok) {
+        for (int attempt = 0; attempt < 4 && !moved; attempt++) {
+            if (attempt) Sleep(50);
+            moved = MoveFileExA(tmp.c_str(), path.c_str(),
+                                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+            if (!moved) moveErr = GetLastError();
+        }
+    }
+    if (!moved) {
+        DeleteFileA(tmp.c_str());
+        if (ok) Log("SaveConfig: could not replace %s (error %lu)", path.c_str(), moveErr);
+    }
     LeaveCriticalSection(&g_cfgLock);
-    fclose(f);
 }
 
 static bool ParseSharpnessValue(const char* text, int& value)
@@ -233,6 +255,8 @@ static bool ParseSharpnessValue(const char* text, int& value)
     value = v;
     return true;
 }
+
+static std::string ToLower(std::string s);  // defined below (used by LoadConfig)
 
 static void LoadConfig()
 {
@@ -259,6 +283,21 @@ static void LoadConfig()
         std::string o = ExeDir() + "hdrautostart.ini";
         if (o != path)
             if (CopyFileA(o.c_str(), path.c_str(), FALSE)) f = fopen(path.c_str(), "r");
+    }
+    // Installs whose ConfigPath only became visible after the installer switched to the
+    // 64-bit registry view used one of these per-user folders before: copy it over (origin kept).
+    {
+        static const char* const kOldIni[] = {
+            "%APPDATA%\\HDRAutostart\\hdrautostart.ini",
+            "%LOCALAPPDATA%\\HDRAutostart\\hdrautostart.ini"
+        };
+        for (size_t i = 0; !f && i < sizeof(kOldIni) / sizeof(kOldIni[0]); i++) {
+            char o[MAX_PATH] = {};
+            DWORD n = ExpandEnvironmentStringsA(kOldIni[i], o, MAX_PATH);
+            if (n == 0 || n > MAX_PATH) continue;
+            if (_stricmp(o, path.c_str()) == 0) continue;
+            if (CopyFileA(o, path.c_str(), FALSE)) f = fopen(path.c_str(), "r");
+        }
     }
     // --- Migration from old steamhdr.ini ---
     if (!f) {
@@ -351,12 +390,16 @@ static void LoadConfig()
                 char* p2 = strchr(p1 + 1, '|');
                 if (p2) {
                     GameProfile gp;
-                    gp.exe = std::string(line, p1 - line);
+                    // Lowercase: MonitorThread compares against the lowercased process path
+                    gp.exe = ToLower(std::string(line, p1 - line));
                     gp.localDimming = atoi(p1 + 1);
-                    gp.sharpness    = atoi(p2 + 1);
-                    if (gp.sharpness > 10 && gp.sharpness <= 100 && (gp.sharpness % 10) == 0)
-                        gp.sharpness /= 10;  // migrate old 0-100 profile values
-                    g_cfg.profiles.push_back(gp);
+                    int sharp = 0;
+                    // Drop malformed lines: dimming must be -1..4, sharpness -1..10 (old 0-100 migrated)
+                    if (gp.localDimming >= -1 && gp.localDimming <= 4 &&
+                        ParseSharpnessValue(p2 + 1, sharp)) {
+                        gp.sharpness = sharp;
+                        g_cfg.profiles.push_back(gp);
+                    }
                 }
             }
             break;
@@ -419,19 +462,108 @@ struct ACS {
 static bool QPaths(std::vector<DISPLAYCONFIG_PATH_INFO>& p,
                    std::vector<DISPLAYCONFIG_MODE_INFO>& m)
 {
-    UINT32 np = 0, nm = 0;
-    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS) return false;
-    p.resize(np); m.resize(nm);
-    return QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, p.data(),
-                              &nm, m.data(), nullptr) == ERROR_SUCCESS;
+    // The display configuration can change between the size query and the
+    // actual query (ERROR_INSUFFICIENT_BUFFER): retry a few times.
+    for (int attempt = 0; attempt < 3; attempt++) {
+        UINT32 np = 0, nm = 0;
+        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS) return false;
+        p.resize(np); m.resize(nm);
+        LONG r = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, p.data(),
+                                    &nm, m.data(), nullptr);
+        if (r == ERROR_SUCCESS) return true;
+        if (r != ERROR_INSUFFICIENT_BUFFER) return false;
+    }
+    return false;
 }
 
-static bool SetHDR(bool on)
+// True if the monitor answers the KTC-proprietary local dimming code (0xF4)
+// with a non-zero max. Used to recognise KTC panels whose PnP vendor ID is unknown.
+static bool RespondsToKTCDimming(HANDLE hPhysicalMonitor)
 {
+    DWORD dimCur = 0, dimMax = 0;
+    return GetVCPFeatureAndVCPFeatureReply(hPhysicalMonitor, 0xF4,
+                                           nullptr, &dimCur, &dimMax) && dimMax != 0;
+}
+
+// True if any physical monitor behind this HMONITOR answers the KTC dimming code.
+// Slow (DDC/CI round trip per physical monitor, ~60 ms).
+static bool AnyPhysicalMonitorRespondsToKTCDimming(HMONITOR hmon)
+{
+    DWORD count = 0;
+    if (!GetNumberOfPhysicalMonitorsFromHMONITOR(hmon, &count) || count == 0) return false;
+    std::vector<PHYSICAL_MONITOR> mons(count);
+    if (!GetPhysicalMonitorsFromHMONITOR(hmon, count, mons.data())) return false;
+    bool isKTC = false;
+    for (DWORD i = 0; i < count && !isKTC; i++)
+        isKTC = RespondsToKTCDimming(mons[i].hPhysicalMonitor);
+    DestroyPhysicalMonitors(count, mons.data());
+    return isKTC;
+}
+
+struct FindMonitorCtx {
+    const WCHAR* gdiName;   // e.g. L"\\\\.\\DISPLAY1"
+    HMONITOR     hmon;
+};
+
+static BOOL CALLBACK FindMonitorByGdiNameProc(HMONITOR hmon, HDC, LPRECT, LPARAM lParam)
+{
+    FindMonitorCtx* ctx = (FindMonitorCtx*)lParam;
+    MONITORINFOEXW mi = {};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(hmon, (MONITORINFO*)&mi) && _wcsicmp(mi.szDevice, ctx->gdiName) == 0) {
+        ctx->hmon = hmon;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static bool IsKTCMonitor(HMONITOR hmon);  // defined below (shared cached verdict)
+
+// True if the target of this display path is a KTC monitor: PnP vendor ID "KTC"
+// or "SKG" (the M27P6 reports "SKG") in the target device path, or, failing that,
+// the cached verdict of IsKTCMonitor (vendor ID / DDC/CI dimming probe).
+static bool IsKTCDisplayPath(const DISPLAYCONFIG_PATH_INFO& pi)
+{
+    DISPLAYCONFIG_TARGET_DEVICE_NAME tn = {};
+    tn.header.type      = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+    tn.header.size      = sizeof(tn);
+    tn.header.adapterId = pi.targetInfo.adapterId;
+    tn.header.id        = pi.targetInfo.id;
+    if (DisplayConfigGetDeviceInfo(&tn.header) == ERROR_SUCCESS) {
+        // monitorDevicePath looks like "\\?\DISPLAY#SKG2774#5&...#{guid}"
+        std::wstring path = tn.monitorDevicePath;
+        CharUpperW(&path[0]);
+        if (path.find(L"DISPLAY#KTC") != std::wstring::npos ||
+            path.find(L"DISPLAY#SKG") != std::wstring::npos) return true;
+    }
+
+    // Fallback: DDC/CI probe on the monitor attached to this path's source.
+    DISPLAYCONFIG_SOURCE_DEVICE_NAME sn = {};
+    sn.header.type      = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+    sn.header.size      = sizeof(sn);
+    sn.header.adapterId = pi.sourceInfo.adapterId;
+    sn.header.id        = pi.sourceInfo.id;
+    if (DisplayConfigGetDeviceInfo(&sn.header) != ERROR_SUCCESS) return false;
+
+    FindMonitorCtx ctx = { sn.viewGdiDeviceName, nullptr };
+    EnumDisplayMonitors(nullptr, nullptr, FindMonitorByGdiNameProc, (LPARAM)&ctx);
+    if (!ctx.hmon) return false;
+
+    return IsKTCMonitor(ctx.hmon);
+}
+
+// Turns HDR on/off on KTC displays only; other monitors are never touched.
+// Returns true if at least one KTC HDR-capable display was switched.
+// *noDisplay (optional) is set to true when no active KTC display with HDR support
+// was found at all (as opposed to a switch that failed); callers do the logging.
+static bool SetHDR(bool on, bool* noDisplay = nullptr)
+{
+    if (noDisplay) *noDisplay = false;
     std::vector<DISPLAYCONFIG_PATH_INFO> p;
     std::vector<DISPLAYCONFIG_MODE_INFO> m;
     if (!QPaths(p, m)) return false;
     bool any = false;
+    bool ktcHdrSeen = false;
     for (auto& pi : p) {
         ACI info = {};
         info.h.type      = kGetACI;
@@ -439,6 +571,8 @@ static bool SetHDR(bool on)
         info.h.adapterId = pi.targetInfo.adapterId;
         info.h.id        = pi.targetInfo.id;
         if (DisplayConfigGetDeviceInfo(&info.h) != ERROR_SUCCESS || !info.sup) continue;
+        if (!IsKTCDisplayPath(pi)) continue;
+        ktcHdrSeen = true;
         ACS st = {};
         st.h.type      = kSetACS;
         st.h.size      = sizeof(st);
@@ -447,7 +581,51 @@ static bool SetHDR(bool on)
         st.on          = on ? 1u : 0u;
         if (DisplayConfigSetDeviceInfo(&st.h) == ERROR_SUCCESS) any = true;
     }
+    if (noDisplay) *noDisplay = !ktcHdrSeen;
     return any;
+}
+
+// Returns true if any HDR-capable active KTC display currently has HDR enabled
+// (non-KTC displays are ignored).
+// Returns false on query failure (never act blindly); 'queried' tells both apart.
+static bool IsHDROn(bool* queried = nullptr)
+{
+    std::vector<DISPLAYCONFIG_PATH_INFO> p;
+    std::vector<DISPLAYCONFIG_MODE_INFO> m;
+    if (queried) *queried = false;
+    if (!QPaths(p, m)) return false;
+    if (queried) *queried = true;
+    for (auto& pi : p) {
+        ACI info = {};
+        info.h.type      = kGetACI;
+        info.h.size      = sizeof(info);
+        info.h.adapterId = pi.targetInfo.adapterId;
+        info.h.id        = pi.targetInfo.id;
+        if (DisplayConfigGetDeviceInfo(&info.h) != ERROR_SUCCESS || !info.sup) continue;
+        if (!IsKTCDisplayPath(pi)) continue;
+        if (info.en) return true;
+    }
+    return false;
+}
+
+// Up to 3 attempts of SetHDR(on), 300 ms apart. When turning HDR off, a failed
+// attempt with HDR confirmed off (or no HDR display) counts as success.
+// When turning HDR on and there is no KTC HDR display at all, it gives up at once
+// (*noDisplay = true): retrying cannot help.
+static bool SetHDRRetry(bool on, bool* noDisplay = nullptr)
+{
+    if (noDisplay) *noDisplay = false;
+    for (int r = 0; r < 3; r++) {
+        bool nd = false;
+        if (SetHDR(on, &nd)) return true;
+        if (noDisplay) *noDisplay = nd;
+        if (on && nd) return false;
+        if (r == 2) break;
+        bool queried = false;
+        if (!on && !IsHDROn(&queried) && queried) return true;
+        Sleep(300);
+    }
+    return false;
 }
 
 // =============================================================================
@@ -692,11 +870,85 @@ static bool SetNVAPIVCP(BYTE vcp, DWORD value)
 // =============================================================================
 // KTC DDC/CI VCP helpers
 // =============================================================================
+// True if the display behind this HMONITOR reports a known KTC PnP vendor ID.
+// KTC panels do not always use "KTC" (e.g. M27P6 reports "SKG").
+static bool IsKTCDeviceId(HMONITOR hmon)
+{
+    MONITORINFOEXA mi = {};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoA(hmon, (MONITORINFO*)&mi)) return false;
+    DISPLAY_DEVICEA dd = {};
+    dd.cb = sizeof(dd);
+    for (DWORD i = 0; EnumDisplayDevicesA(mi.szDevice, i, &dd, 0); i++) {
+        // DeviceID looks like "MONITOR\SKG2774\{guid}\0001"
+        if (_strnicmp(dd.DeviceID, "MONITOR\\KTC", 11) == 0 ||
+            _strnicmp(dd.DeviceID, "MONITOR\\SKG", 11) == 0) return true;
+    }
+    return false;
+}
+
+// Shared "is this monitor a KTC panel" verdict: known PnP vendor ID, or failing that the
+// DDC/CI dimming probe (slow, ~60 ms per physical monitor). Cached by GDI name + DeviceID
+// (not HMONITOR, which changes across display reconfigurations). Positives live until the
+// cache is invalidated (WM_DISPLAYCHANGE); negatives expire after 30 s because a DDC probe
+// can fail occasionally. Called from MonitorThread and from the UI thread.
+struct KTCCacheEntry { bool isKTC; ULONGLONG tick; };
+static CRITICAL_SECTION                     g_ktcCacheLock;
+static std::map<std::string, KTCCacheEntry> g_ktcCache;
+static unsigned                             g_ktcCacheGen = 0;  // bumped on invalidation
+static const ULONGLONG                      kKtcNegativeTtlMs = 30000;
+
+static void InvalidateKTCMonitorCache()
+{
+    EnterCriticalSection(&g_ktcCacheLock);
+    g_ktcCache.clear();
+    g_ktcCacheGen++;
+    LeaveCriticalSection(&g_ktcCacheLock);
+}
+
+static bool IsKTCMonitor(HMONITOR hmon)
+{
+    MONITORINFOEXA mi = {};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoA(hmon, (MONITORINFO*)&mi)) return false;  // stale handle: not cached
+    DISPLAY_DEVICEA dd = {};
+    dd.cb = sizeof(dd);
+    EnumDisplayDevicesA(mi.szDevice, 0, &dd, 0);
+    std::string key = std::string(mi.szDevice) + "|" + dd.DeviceID;
+
+    unsigned gen = 0;
+    EnterCriticalSection(&g_ktcCacheLock);
+    gen = g_ktcCacheGen;
+    auto it = g_ktcCache.find(key);
+    if (it != g_ktcCache.end() &&
+        (it->second.isKTC || GetTickCount64() - it->second.tick < kKtcNegativeTtlMs)) {
+        bool cached = it->second.isKTC;
+        LeaveCriticalSection(&g_ktcCacheLock);
+        return cached;
+    }
+    LeaveCriticalSection(&g_ktcCacheLock);
+
+    // Probe outside the lock: DDC/CI is slow
+    bool isKTC = IsKTCDeviceId(hmon) || AnyPhysicalMonitorRespondsToKTCDimming(hmon);
+
+    EnterCriticalSection(&g_ktcCacheLock);
+    if (gen == g_ktcCacheGen) {  // skip the store if the cache was invalidated meanwhile
+        KTCCacheEntry e = { isKTC, GetTickCount64() };
+        g_ktcCache[key] = e;
+    }
+    LeaveCriticalSection(&g_ktcCacheLock);
+    Log("KTC monitor check [%s]: %s", key.c_str(), isKTC ? "KTC" : "not KTC");
+    return isKTC;
+}
+
 // Generic DDC/CI VCP setter — lParam = (vcp << 16) | value
+// Only KTC monitors are written to: brightness/sharpness are standard VCP codes
+// that any other brand would obey too.
 static BOOL CALLBACK KTCSetVCPProc(HMONITOR hmon, HDC, LPRECT, LPARAM lParam)
 {
     BYTE  vcp  = (BYTE)((DWORD_PTR)lParam >> 16);
     DWORD val  = (DWORD)((DWORD_PTR)lParam & 0xFFFF);
+    if (!IsKTCMonitor(hmon)) return TRUE;
     DWORD count = 0;
     if (!GetNumberOfPhysicalMonitorsFromHMONITOR(hmon, &count) || count == 0) {
         Log("  KTC DDC: no physical monitors for HMONITOR");
@@ -829,6 +1081,10 @@ static std::wstring ToWideACP(const char* s)
     return std::wstring(buf.data());
 }
 
+// Starts 'cmd' with the Explorer (non-elevated) token. Returns true as soon as the
+// process was created; the result does not depend on how long it runs. It still waits
+// up to timeoutMs (0 = don't wait) so that *exitCode, if requested, is meaningful when
+// the process ends in time (STILL_ACTIVE otherwise).
 static bool RunAsShellUser(const char* cmd, DWORD timeoutMs, DWORD* exitCode = nullptr)
 {
     HWND shell = GetShellWindow();
@@ -855,7 +1111,8 @@ static bool RunAsShellUser(const char* cmd, DWORD timeoutMs, DWORD* exitCode = n
 
             if (CreateProcessWithTokenW(hDup, LOGON_WITH_PROFILE, nullptr, cmdBuf.data(),
                                         CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-                ok = (WaitForSingleObject(pi.hProcess, timeoutMs) == WAIT_OBJECT_0);
+                ok = true;
+                WaitForSingleObject(pi.hProcess, timeoutMs);
                 DWORD code = STILL_ACTIVE;
                 GetExitCodeProcess(pi.hProcess, &code);
                 if (exitCode) *exitCode = code;
@@ -901,12 +1158,13 @@ static void SetStartup(bool on)
             // All-users install: use PowerShell Register-ScheduledTask with -GroupId so the
             // task fires for EVERY user who logs on. schtasks without /ru, even when called
             // from an elevated token, stores the current user as principal — not "all users".
+            // Users group by SID (S-1-5-32-545): its name is localized (BUILTIN\\Usuarios...).
             snprintf(cmd, sizeof(cmd),
                 "powershell -NonInteractive -NoProfile -ExecutionPolicy Bypass -Command "
                 "\"Register-ScheduledTask -TaskName 'HDRAutostart' "
                 "-Action (New-ScheduledTaskAction -Execute '%s') "
                 "-Trigger (New-ScheduledTaskTrigger -AtLogOn) "
-                "-Principal (New-ScheduledTaskPrincipal -GroupId 'BUILTIN\\Users' -RunLevel Highest) "
+                "-Principal (New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-545' -RunLevel Highest) "
                 "-Force\"",
                 self);
         } else {
@@ -1041,6 +1299,7 @@ static bool IsBrowserExe(const std::string& path)
 }
 
 // Returns true if a browser window is currently covering a full monitor
+// of a KTC display (fullscreen video on any other monitor is ignored)
 static bool CheckBrowserFullscreen()
 {
     HWND fg = GetForegroundWindow();
@@ -1061,10 +1320,13 @@ static bool CheckBrowserFullscreen()
     MONITORINFO mi = {};  mi.cbSize = sizeof(mi);
     GetMonitorInfo(hmon, &mi);
 
-    return wrc.left  <= mi.rcMonitor.left  &&
-           wrc.top   <= mi.rcMonitor.top   &&
-           wrc.right >= mi.rcMonitor.right &&
-           wrc.bottom>= mi.rcMonitor.bottom;
+    if (!(wrc.left  <= mi.rcMonitor.left  &&
+          wrc.top   <= mi.rcMonitor.top   &&
+          wrc.right >= mi.rcMonitor.right &&
+          wrc.bottom>= mi.rcMonitor.bottom)) return false;
+
+    // Only a KTC monitor counts (checked last: it may need a slow DDC/CI probe)
+    return IsKTCMonitor(hmon);
 }
 
 // =============================================================================
@@ -1139,6 +1401,10 @@ static HANDLE g_stopEvent = nullptr;
 static HWND   g_trayWnd   = nullptr;
 static char   g_hdrSource[MAX_PATH] = {};  // who activated HDR (game exe name or "Browser")
 
+// Grace period before turning HDR off once the last HDR game exits. A launcher
+// closing and handing off to the real game would otherwise toggle HDR off/on.
+static const DWORD kHdrOffGraceMs = 2000;
+
 static DWORD WINAPI MonitorThread(LPVOID)
 {
     Log("Monitor started");
@@ -1149,17 +1415,19 @@ static DWORD WINAPI MonitorThread(LPVOID)
     bool sdrDimmingActive = false;
     bool dimSentForHdr    = false;  // any dimming command sent this HDR session
     bool sharpSentForHdr  = false;  // any sharpness command sent this HDR session
+    ULONGLONG hdrIdleSince = 0;     // tick when 'games' became empty (0 = not idle)
+    bool hdrEnablePending = false;  // game HDR enable failed; main loop keeps retrying
+    ULONGLONG hdrEnableLastTry = 0; // tick of the last enable attempt
+    int hdrEnableTries = 0;         // late-retry attempts used so far
+    const int kMaxEnableTries = 15; // ~30 s at one attempt per 2 s
+    int hdrSessionSharpness = -1;   // effective HDR sharpness of this session (-1 = none)
 
+    // Starts empty on purpose: the first scan also classifies processes that were
+    // already running at startup (e.g. a game opened before the app launched).
     std::set<DWORD> seen;
-    {
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (snap != INVALID_HANDLE_VALUE) {
-            PROCESSENTRY32 pe = {};  pe.dwSize = sizeof(pe);
-            if (Process32First(snap, &pe))
-                do { seen.insert(pe.th32ProcessID); } while (Process32Next(snap, &pe));
-            CloseHandle(snap);
-        }
-    }
+    std::map<DWORD, int> openFails;  // pid -> consecutive OpenProcess failures
+    const int kMaxOpenFails = 20;    // give up on a PID after this many failed opens
+    bool startupChecked = false;  // one-time "HDR left on" check after the first full scan
 
     while (WaitForSingleObject(g_stopEvent, 100) == WAIT_TIMEOUT)
     {
@@ -1189,9 +1457,19 @@ static DWORD WINAPI MonitorThread(LPVOID)
         }
 
         // --- All HDR games closed ---
+        bool hdrOffDue = false;
         if (games.empty() && hdrActive) {
+            if (hdrIdleSince == 0) {
+                hdrIdleSince = GetTickCount64();
+                Log("No HDR games running — waiting %lu ms before disabling HDR", kHdrOffGraceMs);
+            }
+            hdrOffDue = (GetTickCount64() - hdrIdleSince) >= kHdrOffGraceMs;
+        } else {
+            hdrIdleSince = 0;
+        }
+        if (hdrOffDue) {
             Log("All HDR games closed — disabling HDR");
-            SetHDR(false);
+            if (!SetHDRRetry(false)) Log("HDR disable FAILED after retries");
             int sDim, sSharp, sDeskSharp;
             EnterCriticalSection(&g_cfgLock);
             sDim       = g_cfg.ktcSdrLocalDimming;
@@ -1236,6 +1514,9 @@ static DWORD WINAPI MonitorThread(LPVOID)
                 }
             }
             hdrActive = false;
+            hdrEnablePending = false;
+            hdrEnableTries = 0;
+            hdrIdleSince = 0;
             if (g_trayWnd) PostMessage(g_trayWnd, WM_HDRSTATUS, 0, 0);
         }
 
@@ -1251,6 +1532,29 @@ static DWORD WINAPI MonitorThread(LPVOID)
             SetKTCLocalDimming(1);
             if (sSharp >= 0) SetKTCSharpness(sSharp);
             sdrDimmingActive = false;
+        }
+
+        // --- Late retry of a failed HDR enable (single non-blocking attempt) ---
+        if (hdrEnablePending && hdrActive && !games.empty() &&
+            (GetTickCount64() - hdrEnableLastTry) >= 2000) {
+            hdrEnableLastTry = GetTickCount64();
+            bool noDisplay = false;
+            if (SetHDR(true, &noDisplay)) {
+                Log("HDR ENABLED (late retry)");
+                hdrEnablePending = false;
+                hdrEnableTries = 0;
+                if (g_trayWnd) PostMessage(g_trayWnd, WM_HDRSTATUS, 1, 0);
+                // The mode switch resets sharpness (VCP 0x87): re-apply it
+                if (hdrSessionSharpness >= 0) {
+                    Sleep(500);
+                    SetKTCSharpness(hdrSessionSharpness);
+                }
+            } else if (++hdrEnableTries >= kMaxEnableTries) {
+                // Keep hdrActive so closing the game still restores the KTC values that were sent
+                Log("HDR enable still failing — giving up for this session");
+                hdrEnablePending = false;
+                hdrEnableTries = 0;
+            }
         }
 
         // --- Snapshot new processes ---
@@ -1277,7 +1581,22 @@ static DWORD WINAPI MonitorThread(LPVOID)
                     // HDR game
                     HANDLE hProc = OpenProcess(
                         SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-                    if (!hProc) continue;  // transient open failure — retry next tick (don't burn into 'seen')
+                    DWORD openErr = GetLastError();
+                    if (!hProc) {
+                        // Retry next tick (don't burn into 'seen'), but give up if it never opens
+                        int fails = ++openFails[pid];
+                        if (fails == 1)
+                            Log("Cannot open process %s (PID %lu, err=%lu) — will retry",
+                                base ? base + 1 : path.c_str(), pid, openErr);
+                        if (fails >= kMaxOpenFails) {
+                            Log("Giving up on %s (PID %lu) after %d failed open attempts",
+                                base ? base + 1 : path.c_str(), pid, fails);
+                            seen.insert(pid);
+                            openFails.erase(pid);
+                        }
+                        continue;
+                    }
+                    openFails.erase(pid);
                     Log("Game detected: %s (PID %lu)", base ? base + 1 : path.c_str(), pid);
 
                     if (games.empty()) {
@@ -1302,24 +1621,37 @@ static DWORD WINAPI MonitorThread(LPVOID)
 
                         // Enable HDR
                         Log("Enabling HDR...");
-                        bool ok = false;
-                        for (int r = 0; r < 3 && !ok; r++) {
-                            if (r) Sleep(300);
-                            ok = SetHDR(true);
-                        }
-                        Log("HDR %s", ok ? "ENABLED" : "enable FAILED after retries");
+                        bool noDisplay = false;
+                        bool ok = SetHDRRetry(true, &noDisplay);
+                        if (noDisplay) {
+                            // KTC off or in a non-HDR mode: nothing to enable, nothing to restore later.
+                            // The game still goes into 'games' below so it is not classified again.
+                            Log("No KTC HDR display active — HDR not enabled for this game");
+                        } else {
+                            Log("HDR %s", ok ? "ENABLED" : "enable FAILED after retries");
+                            // On failure keep retrying from the main loop (see "late retry")
+                            hdrEnablePending     = !ok;
+                            hdrEnableLastTry     = GetTickCount64();
+                            hdrEnableTries       = 0;
+                            hdrSessionSharpness  = effectiveSharpness;
 
-                        // Local dimming after HDR (KTC proprietary VCP — survives mode switch)
-                        if (effectiveDimming > 0) {
-                            SetKTCLocalDimming(effectiveDimming);
-                            dimSentForHdr = true;
-                        }
-                        // Sharpness: VCP 0x87 gets reset by HDR mode switch.
-                        // Wait for monitor to stabilize, then send.
-                        if (effectiveSharpness >= 0) {
-                            Sleep(500);
-                            SetKTCSharpness(effectiveSharpness);
-                            sharpSentForHdr = true;
+                            // Local dimming after HDR (KTC proprietary VCP — survives mode switch)
+                            if (effectiveDimming > 0) {
+                                SetKTCLocalDimming(effectiveDimming);
+                                dimSentForHdr = true;
+                            }
+                            // Sharpness: VCP 0x87 gets reset by HDR mode switch.
+                            // Wait for monitor to stabilize, then send.
+                            if (effectiveSharpness >= 0) {
+                                Sleep(500);
+                                SetKTCSharpness(effectiveSharpness);
+                                sharpSentForHdr = true;
+                            }
+
+                            sdrDimmingActive = false;  // HDR takes precedence
+                            hdrActive = true;
+                            // Orange icon only once HDR is really on; a pending enable sends it on late success
+                            if (ok && g_trayWnd) PostMessage(g_trayWnd, WM_HDRSTATUS, 1, 0);
                         }
 
                         GameProfile usedProfile;
@@ -1327,10 +1659,6 @@ static DWORD WINAPI MonitorThread(LPVOID)
                         usedProfile.localDimming = profileDimming;
                         usedProfile.sharpness    = profileSharpness;
                         activeProfiles[pid]      = usedProfile;
-
-                        sdrDimmingActive = false;  // HDR takes precedence
-                        hdrActive = true;
-                        if (g_trayWnd) PostMessage(g_trayWnd, WM_HDRSTATUS, 1, 0);
                     }
                     games[pid] = hProc;
 
@@ -1353,7 +1681,22 @@ static DWORD WINAPI MonitorThread(LPVOID)
 
                     HANDLE hProc = OpenProcess(
                         SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-                    if (!hProc) continue;  // transient open failure — retry next tick (don't burn into 'seen')
+                    DWORD openErr = GetLastError();
+                    if (!hProc) {
+                        // Retry next tick (don't burn into 'seen'), but give up if it never opens
+                        int fails = ++openFails[pid];
+                        if (fails == 1)
+                            Log("Cannot open process %s (PID %lu, err=%lu) — will retry",
+                                base ? base + 1 : path.c_str(), pid, openErr);
+                        if (fails >= kMaxOpenFails) {
+                            Log("Giving up on %s (PID %lu) after %d failed open attempts",
+                                base ? base + 1 : path.c_str(), pid, fails);
+                            seen.insert(pid);
+                            openFails.erase(pid);
+                        }
+                        continue;
+                    }
+                    openFails.erase(pid);
                     Log("SDR game detected: %s (PID %lu)", base ? base + 1 : path.c_str(), pid);
 
                     if (sdrGames.empty() && !hdrActive) {
@@ -1369,15 +1712,37 @@ static DWORD WINAPI MonitorThread(LPVOID)
         }
         CloseHandle(snap);
 
+        // First completed scan: if HDR was left on by a previous run (app killed,
+        // shutdown) and no game is running, turn it off once. KTC values untouched.
+        if (!startupChecked) {
+            startupChecked = true;
+            if (games.empty() && !hdrActive && IsHDROn()) {
+                Log("Startup: HDR was left on with no game running — disabling");
+                if (!SetHDRRetry(false)) {
+                    Log("HDR disable FAILED after retries");
+                } else {
+                    // The HDR -> SDR switch resets the monitor sharpness (VCP 0x87): restore it
+                    int sh;
+                    EnterCriticalSection(&g_cfgLock);
+                    sh = !sdrGames.empty() ? g_cfg.ktcSharpnessSdr : g_cfg.ktcSharpnessDesktop;
+                    LeaveCriticalSection(&g_cfgLock);
+                    Sleep(500);
+                    RestoreKTCSharpnessAfterHdrTransition(sh);
+                }
+            }
+        }
+
         // Purge dead PIDs from 'seen' so a recycled PID (e.g. a relaunched game)
         // is classified again instead of being skipped forever.
         for (auto it = seen.begin(); it != seen.end(); )
             if (!alive.count(*it)) it = seen.erase(it); else ++it;
+        for (auto it = openFails.begin(); it != openFails.end(); )
+            if (!alive.count(it->first)) it = openFails.erase(it); else ++it;
     }
 
     // Shutdown cleanup
     if (hdrActive) {
-        SetHDR(false);
+        if (!SetHDRRetry(false)) Log("HDR disable FAILED after retries");
         int sh; EnterCriticalSection(&g_cfgLock); sh=g_cfg.ktcSharpnessDesktop; LeaveCriticalSection(&g_cfgLock);
         Sleep(500);
         if (dimSentForHdr)   SetKTCLocalDimming(1);
@@ -1392,7 +1757,8 @@ static DWORD WINAPI MonitorThread(LPVOID)
         bd = g_cfg.ktcBrightnessDesktop;
         LeaveCriticalSection(&g_cfgLock);
         SetKTCBrightness(bd);
-        if (d > 0) { SetKTCLocalDimming(1); SetKTCSharpness(sh); }
+        if (d > 0) SetKTCLocalDimming(1);
+        SetKTCSharpness(sh);  // no-op when sharpness is disabled (-1)
     }
     for (auto& kv : games)    CloseHandle(kv.second);
     for (auto& kv : sdrGames) CloseHandle(kv.second);
@@ -1646,8 +2012,42 @@ static DWORD WINAPI DoSilentUpdate(LPVOID p)
     return 0;
 }
 
+// True if this exe is the copy registered by the installer (InstallLocation in
+// Add/Remove Programs). Portable copies must not auto-update: the silent installer
+// would create a separate per-user install and leave the portable config behind.
+static bool IsInstalledCopy()
+{
+    static const char* kUninst =
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\HDRAutostart";
+    std::string self = ToLower(ExeDir());
+    if (!self.empty() && self.back() == '\\') self.pop_back();
+    // The NSIS installer is 32-bit, so its HKLM writes land in the 32-bit registry view.
+    const struct { HKEY root; REGSAM view; } keys[] = {
+        { HKEY_LOCAL_MACHINE, KEY_WOW64_32KEY },
+        { HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY },
+        { HKEY_CURRENT_USER,  0 },
+    };
+    for (auto& k : keys) {
+        HKEY h;
+        if (RegOpenKeyExA(k.root, kUninst, 0, KEY_QUERY_VALUE | k.view, &h) != ERROR_SUCCESS) continue;
+        char buf[MAX_PATH] = {};  DWORD sz = sizeof(buf) - 1, type = 0;
+        LONG r = RegQueryValueExA(h, "InstallLocation", nullptr, &type, (BYTE*)buf, &sz);
+        RegCloseKey(h);
+        if (r != ERROR_SUCCESS || type != REG_SZ) continue;
+        std::string loc = ToLower(buf);
+        if (!loc.empty() && loc.back() == '\\') loc.pop_back();
+        if (loc == self) return true;
+    }
+    return false;
+}
+
 static DWORD WINAPI UpdateCheckThread(LPVOID)
 {
+    if (!IsInstalledCopy()) {
+        Log("Update check: skipped (portable copy, not registered by the installer)");
+        return 0;
+    }
+
     Sleep(8000);  // let the app settle before checking
 
     // Anti-loop: skip if an update was triggered less than 1 hour ago
@@ -1814,7 +2214,7 @@ static void CheckBrowserHDR()
         if (!enabled) {
             if (g_browserHdrOn) {
                 Log("Browser HDR disabled — disabling HDR");
-                SetHDR(false);
+                if (!SetHDRRetry(false)) Log("HDR disable FAILED after retries");
                 int d, sh;
                 EnterCriticalSection(&g_cfgLock);
                 d  = g_cfg.ktcLocalDimming;
@@ -1839,14 +2239,26 @@ static void CheckBrowserHDR()
 
     bool isFS = CheckBrowserFullscreen();
 
+    // UI thread only: remembers a failed enable until this fullscreen session ends
+    static bool s_enableFailedThisFS = false;
+    if (!isFS) s_enableFailedThisFS = false;
+
     if (isFS && !g_browserHdrOn) {
+        // Already failed during this fullscreen session: don't retry (or log) every 500 ms
+        if (s_enableFailedThisFS) return;
         Log("Browser fullscreen — enabling HDR");
         int dimming, sharpHdr;
         EnterCriticalSection(&g_cfgLock);
         dimming  = g_cfg.ktcLocalDimming;
         sharpHdr = g_cfg.ktcSharpnessHdr;
         LeaveCriticalSection(&g_cfgLock);
-        SetHDR(true);
+        bool noDisplay = false;
+        if (!SetHDR(true, &noDisplay)) {
+            Log(noDisplay ? "Browser HDR: no KTC HDR display active — not enabled"
+                          : "Browser HDR: enable FAILED — not retrying until fullscreen ends");
+            s_enableFailedThisFS = true;
+            return;
+        }
         // Local dimming after HDR (KTC proprietary VCP — survives mode switch)
         SetKTCLocalDimming(dimming);
         // Sharpness: VCP 0x87 gets reset by HDR mode switch; wait then send
@@ -1858,7 +2270,7 @@ static void CheckBrowserHDR()
         UpdateTray(true);
     } else if (!isFS && g_browserHdrOn) {
         Log("Browser left fullscreen — disabling HDR");
-        SetHDR(false);
+        if (!SetHDRRetry(false)) Log("HDR disable FAILED after retries");
         {
             int d, sh;
             EnterCriticalSection(&g_cfgLock);
@@ -1878,6 +2290,31 @@ static void CheckBrowserHDR()
         g_browserHdrOn = false;
         UpdateTray(false);
     }
+}
+
+// Turn off browser-activated HDR when the app exits (the window is destroyed
+// right after, so no tray update here).
+static void StopBrowserHDROnExit()
+{
+    if (!g_browserHdrOn) return;
+
+    Log("Exit with browser HDR active — disabling HDR");
+    if (!SetHDRRetry(false)) Log("HDR disable FAILED after retries");
+    {
+        int d, sh;
+        EnterCriticalSection(&g_cfgLock);
+        d  = g_cfg.ktcLocalDimming;
+        sh = g_cfg.ktcSharpnessDesktop;
+        LeaveCriticalSection(&g_cfgLock);
+
+        Sleep(500);
+        if (d > 0) SetKTCLocalDimming(1);
+        RestoreKTCSharpnessAfterHdrTransition(sh);
+    }
+    EnterCriticalSection(&g_cfgLock);
+    g_hdrSource[0] = '\0';
+    LeaveCriticalSection(&g_cfgLock);
+    g_browserHdrOn = false;
 }
 
 // =============================================================================
@@ -2046,11 +2483,15 @@ static LRESULT CALLBACK NumDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (LOWORD(wp) == IDC_NUM_OK) {
             char buf[16] = {};
             GetWindowTextA(GetDlgItem(hwnd, IDC_NUM_EDIT), buf, sizeof(buf));
-            int v = atoi(buf);
-            if (v < d->minV) v = d->minV;
-            if (v > d->maxV) v = d->maxV;
-            *d->value = v;
-            SaveConfig();
+            if (buf[0]) {  // empty field: keep the current value (atoi("") would store 0)
+                int v = atoi(buf);
+                if (v < d->minV) v = d->minV;
+                if (v > d->maxV) v = d->maxV;
+                EnterCriticalSection(&g_cfgLock);
+                *d->value = v;
+                LeaveCriticalSection(&g_cfgLock);
+                SaveConfig();
+            }
             DestroyWindow(hwnd);
         } else if (LOWORD(wp) == IDC_NUM_CANCEL) {
             DestroyWindow(hwnd);
@@ -2222,10 +2663,17 @@ static bool RunProfEditDialog(HWND parent, int& dimming, int& sharpness)
     if (!hw) return false;
     SetForegroundWindow(hw);
     EnableWindow(parent, FALSE);
-    MSG m;
+    MSG m = {};
     while (IsWindow(hw) && GetMessageA(&m, nullptr, 0, 0) > 0) {
         TranslateMessage(&m);
         DispatchMessageA(&m);
+    }
+    if (IsWindow(hw)) {
+        // The app is quitting (tray Exit) while this dialog is open: this nested loop
+        // just consumed WM_QUIT. Close the dialog while 'data' is still alive and
+        // re-post the quit so the main loop in WinMain also ends.
+        DestroyWindow(hw);
+        PostQuitMessage((int)m.wParam);
     }
     EnableWindow(parent, TRUE);
     SetForegroundWindow(parent);
@@ -2342,11 +2790,16 @@ static LRESULT CALLBACK ProfilesDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
                 bool valid = sel < (int)g_cfg.profiles.size();
                 int dimming  = valid ? g_cfg.profiles[sel].localDimming : -1;
                 int sharpness = valid ? g_cfg.profiles[sel].sharpness   : -1;
+                std::string exe = valid ? g_cfg.profiles[sel].exe       : std::string();
                 LeaveCriticalSection(&g_cfgLock);
                 if (valid && RunProfEditDialog(hwnd, dimming, sharpness)) {
                     EnterCriticalSection(&g_cfgLock);
-                    g_cfg.profiles[sel].localDimming = dimming;
-                    g_cfg.profiles[sel].sharpness    = sharpness;
+                    // The list may have changed while the dialog was open (second
+                    // Profiles window): only write if this is still the same entry.
+                    if (sel < (int)g_cfg.profiles.size() && g_cfg.profiles[sel].exe == exe) {
+                        g_cfg.profiles[sel].localDimming = dimming;
+                        g_cfg.profiles[sel].sharpness    = sharpness;
+                    }
                     LeaveCriticalSection(&g_cfgLock);
                     SaveConfig();
                     PopulateProfilesList(lb);
@@ -2587,11 +3040,24 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             ShowProfilesDialog(); break;
         case ID_VIDEO_BROWSER:
             { EnterCriticalSection(&g_cfgLock); g_cfg.browserHdrEnabled = !g_cfg.browserHdrEnabled; LeaveCriticalSection(&g_cfgLock); SaveConfig(); } break;
-        case ID_TRAY_GITHUB:
-            ShellExecuteA(nullptr, "open", "https://github.com/conecta6/HDRAutostart-W11", nullptr, nullptr, SW_SHOWNORMAL);
+        case ID_TRAY_GITHUB: {
+            // Open the URL with the Explorer (non-elevated) token so a browser started by
+            // this click doesn't run as administrator. Fall back to ShellExecute on failure.
+            const char* url = "https://github.com/conecta6/HDRAutostart-W11";
+            char sysDir[MAX_PATH] = {};
+            char cmd[MAX_PATH + 128] = {};
+            bool launched = false;
+            if (GetSystemDirectoryA(sysDir, MAX_PATH) > 0) {
+                snprintf(cmd, sizeof(cmd), "\"%s\\rundll32.exe\" url.dll,FileProtocolHandler %s", sysDir, url);
+                launched = RunAsShellUser(cmd, 0);  // don't block the UI thread
+            }
+            if (!launched)
+                ShellExecuteA(nullptr, "open", url, nullptr, nullptr, SW_SHOWNORMAL);
             break;
+        }
         case ID_TRAY_EXIT:
             KillTimer(hwnd, TIMER_BROWSER);
+            StopBrowserHDROnExit();
             SetEvent(g_stopEvent);
             DestroyWindow(hwnd);
             break;
@@ -2600,7 +3066,15 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
 
+    case WM_DISPLAYCHANGE:
+        // Monitors added/removed/reconfigured: re-evaluate which ones are KTC
+        InvalidateKTCMonitorCache();
+        break;  // fall through to DefWindowProcA below
+
     case WM_DESTROY:
+        // Also covers exits that bypass ID_TRAY_EXIT: don't leave browser HDR on
+        KillTimer(hwnd, TIMER_BROWSER);
+        StopBrowserHDROnExit();
         Shell_NotifyIconA(NIM_DELETE, &g_nid);
         PostQuitMessage(0);
         return 0;
@@ -2635,6 +3109,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     CoInitialize(nullptr);
     DetectLang();
     InitializeCriticalSection(&g_cfgLock);
+    InitializeCriticalSection(&g_ktcCacheLock);
     LoadConfig();
     // Reset update timestamp only if it's older than 24h (prevents install-loop:
     // installer relaunches the app which would re-trigger the update immediately)
@@ -2643,7 +3118,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         g_cfg.lastUpdateAttempt = 0;
     OpenLog();
     Log("=== HDRAutostart started ===");
-    InitNVAPI();
+    // NVAPI is not loaded at startup: SetNVAPIVCP is unused, and loading nvapi64.dll
+    // by name from an elevated process searches the exe folder first.
 
     WM_TASKBARCREATED = RegisterWindowMessageA("TaskbarCreated");
 
@@ -2682,8 +3158,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     wc6.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     RegisterClassExA(&wc6);
 
+    // Hidden top-level window (not HWND_MESSAGE): message-only windows never receive
+    // the "TaskbarCreated" broadcast, so the icon was lost when Explorer restarted.
     g_trayWnd = CreateWindowExA(0, "HDRAutostartTray", "HDRAutostart", 0,
-        0, 0, 0, 0, HWND_MESSAGE, nullptr, hInst, nullptr);
+        0, 0, 0, 0, nullptr, nullptr, hInst, nullptr);
+    // We run elevated: let the (non-elevated) shell deliver that broadcast to us.
+    ChangeWindowMessageFilterEx(g_trayWnd, WM_TASKBARCREATED, MSGFLT_ALLOW, nullptr);
 
     g_icoOff = CreateHDRIcon(false);
     g_icoOn  = CreateHDRIcon(true);
@@ -2718,6 +3198,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     if (g_icoOff) DestroyIcon(g_icoOff);
     if (g_icoOn)  DestroyIcon(g_icoOn);
     ShutdownNVAPI();
+    DeleteCriticalSection(&g_ktcCacheLock);
     DeleteCriticalSection(&g_cfgLock);
     if (g_log) fclose(g_log);
     CoUninitialize();

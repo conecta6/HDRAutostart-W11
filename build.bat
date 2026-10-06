@@ -4,7 +4,26 @@ setlocal enabledelayedexpansion
 :: Project root: %~dp0  (directory where this build.bat lives — no need to change)
 :: All source files and output are relative to %~dp0
 
-call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64
+:: Locate the MSVC environment with vswhere (any VS / Build Tools version).
+:: Paths with "(x86)" are kept in variables and expanded with !var! (no parentheses
+:: issues); gotos are used instead of ( ... ) blocks for the same reason.
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+set "VSINSTALL="
+if not exist "!VSWHERE!" goto :no_vs
+for /f "usebackq delims=" %%i in (`"!VSWHERE!" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+if not defined VSINSTALL goto :no_vs
+if not exist "!VSINSTALL!\VC\Auxiliary\Build\vcvarsall.bat" goto :no_vs
+call "!VSINSTALL!\VC\Auxiliary\Build\vcvarsall.bat" x64
+where cl >nul 2>&1
+if errorlevel 1 goto :no_vs
+goto :vs_ok
+
+:no_vs
+echo [ERROR] Visual Studio Build Tools with the C++ workload not found (vswhere / vcvarsall.bat / cl)
+pause
+exit /b 1
+
+:vs_ok
 if not exist "%~dp0dist" mkdir "%~dp0dist"
 
 :: Check if HDRAutostart is running and kill it before building
@@ -34,11 +53,13 @@ if errorlevel 1 ( echo [ERROR] HDRAutostart build failed & pause & exit /b 1 )
 echo [BUILD] HDRAutostart.exe OK
 
 :: ── Build installer ──────────────────────────────────────────────────────────
-if exist "C:\Program Files (x86)\NSIS\makensis.exe" (
-    "C:\Program Files (x86)\NSIS\makensis.exe" "%~dp0installer.nsi"
-) else (
-    "C:\Program Files\NSIS\makensis.exe" "%~dp0installer.nsi"
-)
+:: Look for makensis in PATH first, then in the default install folders
+set "MAKENSIS="
+for /f "usebackq delims=" %%i in (`where makensis 2^>nul`) do if not defined MAKENSIS set "MAKENSIS=%%i"
+if not defined MAKENSIS if exist "C:\Program Files (x86)\NSIS\makensis.exe" set "MAKENSIS=C:\Program Files (x86)\NSIS\makensis.exe"
+if not defined MAKENSIS if exist "C:\Program Files\NSIS\makensis.exe" set "MAKENSIS=C:\Program Files\NSIS\makensis.exe"
+if not defined MAKENSIS ( echo [ERROR] NSIS ^(makensis.exe^) not found - HDRAutostart.exe was built but the installer was not & pause & exit /b 1 )
+"!MAKENSIS!" "%~dp0installer.nsi"
 if errorlevel 1 ( echo [ERROR] NSIS installer failed & pause & exit /b 1 )
 
 echo [BUILD] All done.

@@ -1,6 +1,7 @@
 # Generates icon.ico (multi-size: 16, 32, 48, 256 px) — orange HDR design
 # matching CreateHDRIcon() in hdrautostart.cpp exactly.
 # Called automatically by build.bat
+$ErrorActionPreference = 'Stop'  # any error aborts the script with exit code 1
 Add-Type -AssemblyName System.Drawing
 
 function New-HdrBitmap($sz) {

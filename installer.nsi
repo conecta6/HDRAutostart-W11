@@ -49,6 +49,9 @@ Haga clic en Siguiente para continuar."
 
 ; -- .onInit -- ask all users vs current user ---------------------------------
 Function .onInit
+    ; The app is 64-bit: use the 64-bit registry view so it can read what we write.
+    ; (This installer is 32-bit and would otherwise be redirected to WOW6432Node.)
+    SetRegView 64
     ReadEnvStr $ProgramData PROGRAMDATA
 
     ; Silent mode (auto-update): detect existing install location from registry
@@ -73,6 +76,11 @@ No  -> Solo esta cuenta (AppData del usuario actual)" \
     silentDetect:
     ; Try HKLM (all-users install)
     ReadRegStr $INSTDIR HKLM "${REG_UNINST}" "InstallLocation"
+    StrCmp $INSTDIR "" 0 silentHKLM
+    ; Installers before SetRegView 64 registered all-users installs in the 32-bit view
+    SetRegView 32
+    ReadRegStr $INSTDIR HKLM "${REG_UNINST}" "InstallLocation"
+    SetRegView 64
     StrCmp $INSTDIR "" 0 silentHKLM
     ; Try HKCU (current-user install)
     ReadRegStr $INSTDIR HKCU "${REG_UNINST}" "InstallLocation"
@@ -103,6 +111,11 @@ Section "Instalar"
 
     ; -- Config directory & registry key --------------------------------------
     ${If} $AllUsers == "1"
+        ; Remove the entries older installers left in the 32-bit registry view
+        SetRegView 32
+        DeleteRegKey HKLM "${REG_UNINST}"
+        DeleteRegKey HKLM "${REG_APP}"
+        SetRegView 64
         ; Shared config in ProgramData
         CreateDirectory "$ProgramData\${APP_NAME}"
         WriteRegStr HKLM "${REG_APP}" "ConfigPath" "$ProgramData\${APP_NAME}"
@@ -122,15 +135,20 @@ Section "Instalar"
                     "$INSTDIR\Uninstall.exe"
 
     ; -- Scheduled task (elevated, no UAC on startup) -------------------------
+    StrCpy $2 "-1"  ; exit code of the task creation command (0 = created)
     ${If} $AllUsers == "1"
         ; All-users install: use PowerShell Register-ScheduledTask with -GroupId so the task
         ; fires for EVERY user who logs on. schtasks without /ru, even from an elevated token,
         ; stores the current user as principal — not "all users".
-        ExecWait "powershell -NonInteractive -NoProfile -ExecutionPolicy Bypass -Command $\"Register-ScheduledTask -TaskName '${TASK_NAME}' -Action (New-ScheduledTaskAction -Execute '$INSTDIR\${EXE_NAME}') -Trigger (New-ScheduledTaskTrigger -AtLogOn) -Principal (New-ScheduledTaskPrincipal -GroupId 'BUILTIN\Users' -RunLevel Highest) -Force$\""
+        ; The group is given by SID (S-1-5-32-545 = Users): its name is localized
+        ; (e.g. BUILTIN\Usuarios on Spanish Windows) and 'BUILTIN\Users' fails there.
+        ExecWait "powershell -NonInteractive -NoProfile -ExecutionPolicy Bypass -Command $\"Register-ScheduledTask -TaskName '${TASK_NAME}' -Action (New-ScheduledTaskAction -Execute '$INSTDIR\${EXE_NAME}') -Trigger (New-ScheduledTaskTrigger -AtLogOn) -Principal (New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-545' -RunLevel Highest) -Force$\"" $2
     ${Else}
         ; Per-user install: exe in user's AppData — restrict task to this user only
         ; to avoid running the task for other users who cannot access these folders
-        ExecWait 'schtasks /create /tn "${TASK_NAME}" /tr "\"$INSTDIR\${EXE_NAME}\"" /sc onlogon /ru "$%USERNAME%" /rl highest /f'
+        ; Read the user name at install time ($%USERNAME% is expanded when the installer is compiled)
+        ReadEnvStr $1 USERNAME
+        ExecWait 'schtasks /create /tn "${TASK_NAME}" /tr "\"$INSTDIR\${EXE_NAME}\"" /sc onlogon /ru "$1" /rl highest /f' $2
     ${EndIf}
 
     ; -- Uninstaller ----------------------------------------------------------
@@ -161,10 +179,16 @@ Section "Instalar"
     Goto endSection
 
     showMsg:
-    MessageBox MB_ICONINFORMATION \
-        "${APP_NAME} instalado correctamente.$\n$\n\
+    ${If} $2 == 0
+        MessageBox MB_ICONINFORMATION \
+            "${APP_NAME} instalado correctamente.$\n$\n\
 - Tarea programada creada: se inicia automaticamente con Windows sin UAC.$\n\
 - Puede activarlo/desactivarlo desde el icono de la bandeja -> Ejecutar al inicio."
+    ${Else}
+        MessageBox MB_ICONEXCLAMATION \
+            "${APP_NAME} instalado, pero no se pudo crear la tarea programada de inicio (codigo $2).$\n$\n\
+Puede activarla desde el icono de la bandeja -> Ejecutar al inicio."
+    ${EndIf}
 
     endSection:
 SectionEnd
@@ -193,7 +217,11 @@ Section "Uninstall"
     Delete "$SMPROGRAMS\${APP_NAME}\Desinstalar ${APP_NAME}.lnk"
     RMDir  "$SMPROGRAMS\${APP_NAME}"
 
-    ; Remove registry keys
+    ; Remove registry keys (HKLM in both views: older installers used the 32-bit one)
+    SetRegView 32
+    DeleteRegKey HKLM "${REG_UNINST}"
+    DeleteRegKey HKLM "${REG_APP}"
+    SetRegView 64
     DeleteRegKey HKLM "${REG_UNINST}"
     DeleteRegKey HKCU "${REG_UNINST}"
     DeleteRegKey HKLM "${REG_APP}"
