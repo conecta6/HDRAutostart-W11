@@ -86,6 +86,7 @@ struct Lang {
     const char *menuPicMode, *menuContrast, *menuSaturation, *menuGamma, *menuColorTemp;
     const char *profByName;                  // profile dialog: match by executable name only
     const char *profPrimary;                 // profile dialog: primary display switch
+    const char *profOthersOff;               // profile dialog: turn the other displays off
 };
 
 static const Lang kES = {
@@ -108,7 +109,8 @@ static const Lang kES = {
     "Valor (%d-%d):",
     "Modo de imagen", "Contraste", "Saturaci\xf3n", "Gamma", "Temperatura de color",
     "Solo por nombre del ejecutable (cualquier carpeta)",
-    "Usar el monitor HDR como principal mientras est\xe9 abierto"
+    "Usar el monitor HDR como principal mientras est\xe9 abierto",
+    "Apagar las dem\xe1s pantallas mientras est\xe9 abierto"
 };
 static const Lang kEN = {
     "Run at startup", "Exit",
@@ -130,7 +132,8 @@ static const Lang kEN = {
     "Value (%d-%d):",
     "Picture mode", "Contrast", "Saturation", "Gamma", "Color temperature",
     "By executable name only (any folder)",
-    "Make the HDR monitor the primary display while it runs"
+    "Make the HDR monitor the primary display while it runs",
+    "Turn off the other displays while it runs"
 };
 static const Lang* L = &kEN;
 
@@ -204,6 +207,9 @@ struct GameProfile {
     // While the game runs the supported monitor is the Windows primary display (for games with
     // no monitor selector); the previous display configuration is restored when it closes
     bool primary      = false;
+    // While the game runs every other display (e.g. the laptop panel) is turned off, as with
+    // Win+P "second screen only"; implies the supported monitor is the primary one
+    bool othersOff    = false;
 };
 
 // General settings = the desktop: what the monitor goes back to when no game (and no
@@ -313,12 +319,12 @@ static void SaveConfig()
     fprintf(f, "browser_hdr=%d\n",          g_cfg.browserHdrEnabled ? 1 : 0);
     if (g_cfg.lastUpdateAttempt)
         fprintf(f, "last_update_attempt=%lld\n", (long long)g_cfg.lastUpdateAttempt);
-    // exe|dimming|sharpness|hdr|brightness|picture mode|contrast|saturation|gamma|color temp|primary
+    // exe|dimming|sharpness|hdr|brightness|picture mode|contrast|saturation|gamma|color temp|primary|others off
     fprintf(f, "[profiles]\n");
     for (auto& p : g_cfg.profiles)
-        fprintf(f, "%s|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d\n", p.exe.c_str(), p.localDimming, p.sharpness,
+        fprintf(f, "%s|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d\n", p.exe.c_str(), p.localDimming, p.sharpness,
                 p.hdr ? 1 : 0, p.brightness, p.pictureMode, p.contrast, p.saturation, p.gamma, p.colorTemp,
-                p.primary ? 1 : 0);
+                p.primary ? 1 : 0, p.othersOff ? 1 : 0);
     bool ok = !ferror(f);
     if (fclose(f) != 0) ok = false;
     // An old .ini that could not be backed up when it was loaded: try the copy again before
@@ -626,6 +632,10 @@ static void LoadConfig()
                     char* q11 = strchr(q + 1, '|');
                     int pv = 0;
                     if (q11 && ParseIntRange(q11 + 1, 0, 1, pv)) gp.primary = pv != 0;
+                    // Field 12: turn the other displays off (0/1); missing or invalid = off
+                    char* q12 = q11 ? strchr(q11 + 1, '|') : nullptr;
+                    pv = 0;
+                    if (q12 && ParseIntRange(q12 + 1, 0, 1, pv)) gp.othersOff = pv != 0;
                 }
             }
             // Ignore a second profile for the same entry (first one wins)
@@ -1064,42 +1074,105 @@ static void RestoreMMTaskbar()
     g_mmTaskbarChanged = false;
 }
 
-static bool MakeSupportedMonitorPrimary()
+static bool g_othersOff = false;  // the switch also turned off every other display
+
+// Configuration derived from the current one: the supported monitor at (0,0) (the primary
+// display is the one at the origin; relative positions stay the same) and, with othersOff,
+// only the supported monitor's paths (paths left out are turned off by Windows). 'origin' gets
+// the supported monitor's current position. False when no supported monitor is active.
+static bool BuildDisplayOverride(const std::vector<DISPLAYCONFIG_PATH_INFO>& p,
+                                 const std::vector<DISPLAYCONFIG_MODE_INFO>& m, bool othersOff,
+                                 std::vector<DISPLAYCONFIG_PATH_INFO>& np,
+                                 std::vector<DISPLAYCONFIG_MODE_INFO>& nm, POINTL& origin)
 {
-    std::vector<DISPLAYCONFIG_PATH_INFO> p;
-    std::vector<DISPLAYCONFIG_MODE_INFO> m;
-    if (!QPaths(p, m)) { Log("Primary display: cannot query the display configuration"); return false; }
+    bool found = false;
     for (auto& pi : p) {
         if (!(pi.flags & DISPLAYCONFIG_PATH_ACTIVE) || !IsSupportedDisplayPath(pi)) continue;
         UINT32 idx = pi.sourceInfo.modeInfoIdx;
         if (idx >= m.size() || m[idx].infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) continue;
-        POINTL o = m[idx].sourceMode.position;
-        if (o.x == 0 && o.y == 0) {
-            Log("Primary display: the supported monitor is already the primary one");
-            return false;
-        }
-        // The primary display is the one at (0,0): move the whole desktop so the supported
-        // monitor lands there. Relative positions (the layout) stay the same.
-        std::vector<DISPLAYCONFIG_MODE_INFO> nm = m;
+        origin = m[idx].sourceMode.position;
+        found = true;
+        break;
+    }
+    if (!found) return false;
+    if (!othersOff) {
+        np = p;
+        nm = m;
         for (auto& mi : nm)
             if (mi.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
-                mi.sourceMode.position.x -= o.x;
-                mi.sourceMode.position.y -= o.y;
+                mi.sourceMode.position.x -= origin.x;
+                mi.sourceMode.position.y -= origin.y;
             }
+        return true;
+    }
+    // Only the supported monitor(s): copy their paths with their modes re-indexed
+    np.clear();
+    nm.clear();
+    for (auto& pi : p) {
+        if (!(pi.flags & DISPLAYCONFIG_PATH_ACTIVE) || !IsSupportedDisplayPath(pi)) continue;
+        DISPLAYCONFIG_PATH_INFO q = pi;
+        if (pi.sourceInfo.modeInfoIdx < m.size()) {
+            DISPLAYCONFIG_MODE_INFO sm = m[pi.sourceInfo.modeInfoIdx];
+            if (sm.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
+                sm.sourceMode.position.x -= origin.x;
+                sm.sourceMode.position.y -= origin.y;
+            }
+            q.sourceInfo.modeInfoIdx = (UINT32)nm.size();
+            nm.push_back(sm);
+        }
+        if (pi.targetInfo.modeInfoIdx < m.size()) {
+            q.targetInfo.modeInfoIdx = (UINT32)nm.size();
+            nm.push_back(m[pi.targetInfo.modeInfoIdx]);
+        }
+        np.push_back(q);
+    }
+    return true;
+}
+
+// Makes the supported monitor primary and, with othersOff, turns every other display off.
+// The first call saves the whole configuration (what RestorePrimaryDisplay gives back); a later
+// call with othersOff (a second game asking for more) only adds the turn-off.
+static bool ApplyDisplayOverride(bool othersOff)
+{
+    std::vector<DISPLAYCONFIG_PATH_INFO> p, np;
+    std::vector<DISPLAYCONFIG_MODE_INFO> m, nm;
+    if (!QPaths(p, m)) { Log("Primary display: cannot query the display configuration"); return false; }
+    POINTL o = {};
+    if (!BuildDisplayOverride(p, m, othersOff, np, nm, o)) {
+        Log("Primary display: no active supported monitor — not switched");
+        return false;
+    }
+    bool othersActive = false;
+    for (auto& pi : p)
+        if ((pi.flags & DISPLAYCONFIG_PATH_ACTIVE) && !IsSupportedDisplayPath(pi)) othersActive = true;
+    if (o.x == 0 && o.y == 0 && !(othersOff && othersActive)) {
+        if (!g_primarySwitched) Log("Primary display: the supported monitor is already the primary one");
+        return false;
+    }
+    const bool first = !g_primarySwitched;
+    if (first) {
         g_savedPaths = p;
         g_savedModes = m;
         // Flag first: if the app dies after the switch, the next start restores the layout
         WritePrimaryFlag();
-        LONG r = SetDisplayConfig((UINT32)p.size(), p.data(), (UINT32)nm.size(), nm.data(),
-                                  SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES);
-        if (r != ERROR_SUCCESS) {
-            Log("Primary display: switch FAILED (error %ld)", r);
-            DeleteFileA(PrimaryFlagPath().c_str());
-            return false;
-        }
-        g_primarySwitched = true;
+    }
+    LONG r = SetDisplayConfig((UINT32)np.size(), np.data(), (UINT32)nm.size(), nm.data(),
+                              SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES);
+    if (r != ERROR_SUCCESS) {
+        Log("Primary display: switch FAILED (error %ld)", r);
+        if (first) DeleteFileA(PrimaryFlagPath().c_str());
+        return false;
+    }
+    g_primarySwitched = true;
+    if (othersOff) {
+        g_othersOff = true;
+        Log("Primary display: only the supported monitor left on (other displays turned off)");
+    } else {
         Log("Primary display: supported monitor made primary (it was at %ld,%ld)", o.x, o.y);
-        // Keep a taskbar on the old primary too, if the user has it on one display only
+    }
+    // Keep a taskbar on the old primary too (only when it stays on), if the user has it on one
+    // display only
+    if (first && !othersOff) {
         DWORD mm = 0;
         bool had = ReadMMTaskbar(mm);
         if (!had || mm == 0) {
@@ -1110,10 +1183,36 @@ static bool MakeSupportedMonitorPrimary()
             SetMMTaskbar(true, 1);
             Log("Primary display: taskbar on all displays turned on for the session");
         }
-        return true;
     }
-    Log("Primary display: no active supported monitor — not switched");
-    return false;
+    return true;
+}
+
+// While a game holds the switch: if Windows undid it, apply it again. Turning HDR on or off
+// makes Windows re-apply its stored configuration (tested 2026-11-14): the supported monitor
+// stops being primary and turned-off displays come back. The configuration saved at the start
+// (what the restore gives back) is not touched.
+static void EnsureDisplayOverride()
+{
+    std::vector<DISPLAYCONFIG_PATH_INFO> p, np;
+    std::vector<DISPLAYCONFIG_MODE_INFO> m, nm;
+    if (!QPaths(p, m)) return;
+    bool anySupported = false, atOrigin = false, othersActive = false;
+    for (auto& pi : p) {
+        if (!(pi.flags & DISPLAYCONFIG_PATH_ACTIVE)) continue;
+        if (!IsSupportedDisplayPath(pi)) { othersActive = true; continue; }
+        UINT32 idx = pi.sourceInfo.modeInfoIdx;
+        if (idx >= m.size() || m[idx].infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) continue;
+        anySupported = true;
+        if (m[idx].sourceMode.position.x == 0 && m[idx].sourceMode.position.y == 0) atOrigin = true;
+    }
+    if (!anySupported) return;
+    if (atOrigin && !(g_othersOff && othersActive)) return;  // still as wanted
+    POINTL o = {};
+    if (!BuildDisplayOverride(p, m, g_othersOff, np, nm, o)) return;
+    LONG r = SetDisplayConfig((UINT32)np.size(), np.data(), (UINT32)nm.size(), nm.data(),
+                              SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES);
+    Log("Primary display: undone by Windows (e.g. an HDR switch) — re-applied %s",
+        r == ERROR_SUCCESS ? "OK" : "FAILED");
 }
 
 // Compares the current configuration with the saved one: same paths, positions, resolutions
@@ -1151,7 +1250,7 @@ static bool DisplayLayoutMatchesSaved()
     return same;
 }
 
-// Gives back the configuration saved by MakeSupportedMonitorPrimary
+// Gives back the configuration saved by ApplyDisplayOverride (displays turned off come back on)
 static void RestorePrimaryDisplay()
 {
     if (!g_primarySwitched) return;
@@ -1171,6 +1270,7 @@ static void RestorePrimaryDisplay()
     RestoreMMTaskbar();  // after the layout: the taskbar is back on the old primary first
     DeleteFileA(PrimaryFlagPath().c_str());
     g_primarySwitched = false;
+    g_othersOff       = false;
 }
 
 // At start: the app died while a game had switched the primary display. The switch was never
@@ -2265,19 +2365,25 @@ static DWORD WINAPI MonitorThread(LPVOID)
     // back (after the same grace period as HDR) once none is left.
     std::set<DWORD> primaryHolders;
     ULONGLONG primaryIdleSince = 0;
+    int primaryCheckTick = 0;  // the switch is re-checked every 10 iterations (~1 s)
 
     // Starts tracking a program with a profile (cls 1 = HDR game, -1 = SDR game): a process,
     // or a web app under its pseudo PID. 'path' is the exe path or the web app id.
     auto track = [&](DWORD pid, HANDLE h, const std::string& path, int cls) {
         const char* base = strrchr(path.c_str(), '\\');
         const char* name = base ? base + 1 : path.c_str();
-        // Primary display first: the game picks its monitor when it creates its window
+        // Primary display. An HDR game switches it only after HDR is on (below): turning HDR on
+        // re-applies the stored configuration and would undo a switch made before it.
+        bool wantPrimary = false, wantOthersOff = false;
         {
             GameProfile pp;
-            if (FindProfile(path, pp) && pp.primary) {
+            if (FindProfile(path, pp) && (pp.primary || pp.othersOff)) {
+                wantPrimary   = true;
+                wantOthersOff = pp.othersOff;
                 primaryHolders.insert(pid);
                 primaryIdleSince = 0;
-                if (!g_primarySwitched) MakeSupportedMonitorPrimary();
+                if (cls != 1 && (!g_primarySwitched || (wantOthersOff && !g_othersOff)))
+                    ApplyDisplayOverride(wantOthersOff);
             }
         }
         if (cls == 1) {
@@ -2321,6 +2427,8 @@ static DWORD WINAPI MonitorThread(LPVOID)
                     if (ok && g_trayWnd) PostMessage(g_trayWnd, WM_HDRSTATUS, 1, 0);
                 }
             }
+            if (wantPrimary && (!g_primarySwitched || (wantOthersOff && !g_othersOff)))
+                ApplyDisplayOverride(wantOthersOff);
             games[pid] = h;
         } else {
             Log("SDR game detected: %s (PID %lu)", name, pid);
@@ -2374,7 +2482,8 @@ static DWORD WINAPI MonitorThread(LPVOID)
                     if (g != games.end()) h = g->second;
                     else { auto sg = sdrGames.find(*it); if (sg != sdrGames.end()) h = sg->second; }
                     GameProfile pp;
-                    if (!h || !FindProfile(HandlePath(h), pp) || !pp.primary) it = primaryHolders.erase(it);
+                    if (!h || !FindProfile(HandlePath(h), pp) || !(pp.primary || pp.othersOff))
+                        it = primaryHolders.erase(it);
                     else ++it;
                 }
                 // Tracked games whose class changed (to 0, or between HDR and SDR) are dropped
@@ -2537,6 +2646,10 @@ static DWORD WINAPI MonitorThread(LPVOID)
         // --- Primary display: back to the user's configuration once no game that moved it is left ---
         for (auto it = primaryHolders.begin(); it != primaryHolders.end(); )
             if (!games.count(*it) && !sdrGames.count(*it)) it = primaryHolders.erase(it); else ++it;
+        if (g_primarySwitched && !primaryHolders.empty() && ++primaryCheckTick >= 10) {
+            primaryCheckTick = 0;
+            EnsureDisplayOverride();
+        }
         if (g_primarySwitched && primaryHolders.empty()) {
             if (!primaryIdleSince) primaryIdleSince = GetTickCount64();
             if (GetTickCount64() - primaryIdleSince >= kHdrOffGraceMs) {
@@ -3284,6 +3397,7 @@ static void ShowNumDialog(const char* title, int* value, int minV, int maxV, boo
 #define IDC_PROF_CT_COMBO      449
 #define IDC_PROF_BYNAME_CHECK  452
 #define IDC_PROF_PRIMARY_CHECK 453
+#define IDC_PROF_OTHERSOFF_CHECK 454
 
 struct ProfEditData {
     GameProfile p;      // values being edited
@@ -3369,6 +3483,13 @@ static LRESULT CALLBACK ProfEditDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
                 gap, y, rc.right - gap * 2, S(22), hwnd, (HMENU)IDC_PROF_PRIMARY_CHECK, nullptr, nullptr);
             SendMessageA(hPr, WM_SETFONT, (WPARAM)d->hFont, FALSE);
             SendMessageA(hPr, BM_SETCHECK, d->p.primary ? BST_CHECKED : BST_UNCHECKED, 0);
+            y += S(30);
+            // Row 0d — every other display off while the game runs (implies the one above)
+            HWND hOo = CreateWindowA("BUTTON", L->profOthersOff,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                gap, y, rc.right - gap * 2, S(22), hwnd, (HMENU)IDC_PROF_OTHERSOFF_CHECK, nullptr, nullptr);
+            SendMessageA(hOo, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+            SendMessageA(hOo, BM_SETCHECK, d->p.othersOff ? BST_CHECKED : BST_UNCHECKED, 0);
             y += S(30);
         }
         auto label = [&](const char* text, int id) {
@@ -3521,6 +3642,7 @@ static LRESULT CALLBACK ProfEditDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             HWND hBn = GetDlgItem(hwnd, IDC_PROF_BYNAME_CHECK);
             if (hBn) d->byName = SendMessageA(hBn, BM_GETCHECK, 0, 0) == BST_CHECKED;
             np.primary = SendDlgItemMessageA(hwnd, IDC_PROF_PRIMARY_CHECK, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            np.othersOff = SendDlgItemMessageA(hwnd, IDC_PROF_OTHERSOFF_CHECK, BM_GETCHECK, 0, 0) == BST_CHECKED;
             np.hdr = hdr;
             d->p   = np;
             d->ok  = true;
@@ -3559,7 +3681,7 @@ static bool RunProfEditDialog(HWND parent, GameProfile& prof, int kinds, bool by
     static auto pfnDpiSys = (PFN_GetDpiForSystem)GetProcAddress(GetModuleHandleA("user32.dll"), "GetDpiForSystem");
     UINT dpi = pfnDpiSys ? pfnDpiSys() : 96;
     int W = MulDiv(380, (int)dpi, 96);
-    int H = MulDiv(225 + (ProfEditRows(kinds) - 3) * 36 + (data.entryKind != 2 ? 30 : 0) + 30, (int)dpi, 96);
+    int H = MulDiv(225 + (ProfEditRows(kinds) - 3) * 36 + (data.entryKind != 2 ? 30 : 0) + 60, (int)dpi, 96);
 
     HWND hw = CreateWindowExA(
         WS_EX_TOPMOST,
@@ -3643,7 +3765,8 @@ static void PopulateProfilesList(HWND lb)
         // Only the settings of the connected monitors are listed
         char buf[96];
         std::string entry = name + "  [" + (p.hdr ? "HDR" : "SDR") + "]";
-        if (p.primary) entry += L == &kES ? "  [principal]" : "  [primary]";
+        if (p.othersOff)    entry += L == &kES ? "  [solo monitor HDR]" : "  [HDR monitor only]";
+        else if (p.primary) entry += L == &kES ? "  [principal]" : "  [primary]";
         if (ShowsKtcSettings(kinds))
             entry += std::string("  ") + L->profDimLabel + " " +
                      dimNames[p.localDimming >= 0 && p.localDimming <= 4 ? p.localDimming : 0];
