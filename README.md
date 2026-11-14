@@ -10,7 +10,7 @@
 
 Windows 11 supports HDR, but it does not switch automatically. If you leave HDR always-on, your desktop, browser, and SDR apps look washed out. If you leave it off, you have to open Display Settings every time you want to play a game or watch HDR video. HDRAutostart solves this by monitoring your system in the background and toggling HDR for you.
 
-> **KTC monitors only:** HDRAutostart switches HDR on and off, and sends brightness, sharpness and local dimming commands, **only to a KTC monitor**. Any other monitor connected to the PC is never touched. KTC monitors are recognised by their manufacturer ID ("KTC" or "SKG") or because they answer the KTC local dimming command.
+> **Supported monitors only:** HDRAutostart switches HDR on and off, and sends monitor settings, **only to a KTC monitor or to the ASUS ROG Strix XG27AQWMG**. Any other monitor connected to the PC (for example a laptop panel) is never touched. KTC monitors are recognised by their manufacturer ID ("KTC" or "SKG") or because they answer the KTC local dimming command; the ASUS by its ID ("AUSAA02"). The tray menu and the profile dialog show the settings of the monitor that is connected.
 
 ### Features
 
@@ -22,6 +22,7 @@ Windows 11 supports HDR, but it does not switch automatically. If you leave HDR 
 | **KTC Local Dimming** | For KTC monitors with DDC/CI support: set the Local Dimming level (VCP 0xF4) for the desktop, for each game profile and for HDR video in a browser. **Don't change** sends no command (the monitor keeps whatever value it has at that moment, it is not switched off), so it is safe on any monitor. |
 | **KTC Sharpness** | Set the monitor sharpness (VCP 0x87) from 0 to 10 (or Don't change = send nothing) for the desktop, for each game profile and for HDR video in a browser. Default: 6. |
 | **KTC Brightness** | Set the monitor brightness (VCP 0x10): the Desktop value (default 22) and, in profiles with HDR off, the profile's own value. HDR games leave the brightness to the monitor. |
+| **ASUS ROG Strix XG27AQWMG** | Picture mode (GameVisual), brightness, contrast, saturation, sharpness, gamma and color temperature, for the desktop and for each game profile. With HDR on only sharpness is sent; everything else applies to SDR games and the desktop. There is no local dimming on this OLED. |
 | **Game profiles** | A profile is an executable plus **HDR on/off**, Local Dimming, Sharpness and Brightness. Every profile carries its own values; there is no general fallback. A new profile starts with HDR on and the Desktop values as a base, and you change them. HDR on: HDR is enabled while the game runs. HDR off (an SDR game): HDR is not enabled, but the profile's dimming, sharpness and brightness are applied. When the last game closes, the monitor returns to the Desktop values. Creating, editing or removing a profile while its game is open takes effect without restarting the game. |
 | **Run at startup** | Launches HDRAutostart with Windows through a scheduled task (no UAC prompt). The installer creates it; you can turn it on or off from the tray menu. |
 | **System tray** | Runs silently in the background. Orange icon = HDR active, grey icon = HDR inactive. Right-click for the menu. |
@@ -95,7 +96,7 @@ Profile changes take effect without restarting the game: a new profile is picked
 
 #### The `.ini` file
 
-Settings go under `[settings]` and one profile per line under `[profiles]`, as `exe|dimming|sharpness|hdr|brightness`. Dimming is `0` (don't change) or `1`–`4` (Auto, Low, Standard, High); sharpness is `-1` (don't change) or `0`–`10`; hdr is `1` (HDR on) or `0` (SDR game); brightness is `0`–`100` and is only used when hdr is `0` (HDR profiles keep the field but ignore it). In `[settings]`, `ktc_dimming_desktop`, `ktc_sharpness_desktop` and `ktc_brightness_desktop` are the Desktop values, `video_dimming` and `video_sharpness` are the Video values (same scales as above) and `browser_hdr` is the browser fullscreen switch (`1` = on). Example:
+Settings go under `[settings]` and one profile per line under `[profiles]`, as `exe|dimming|sharpness|hdr|brightness|picture mode|contrast|saturation|gamma|color temp` (the last five are the ASUS settings, `-1` = don't change; lines without them are still valid). Dimming is `0` (don't change) or `1`–`4` (Auto, Low, Standard, High); sharpness is `-1` (don't change) or `0`–`10`; hdr is `1` (HDR on) or `0` (SDR game); brightness is `0`–`100` and is only used when hdr is `0` (HDR profiles keep the field but ignore it). In `[settings]`, `ktc_dimming_desktop`, `ktc_sharpness_desktop` and `ktc_brightness_desktop` are the Desktop values, `video_dimming` and `video_sharpness` are the Video values (same scales as above) and `browser_hdr` is the browser fullscreen switch (`1` = on). The ASUS Desktop values are `picture_mode_desktop`, `contrast_desktop`, `saturation_desktop`, `gamma_desktop` and `color_temp_desktop` (see "ASUS values" below). Example:
 
 ```ini
 [settings]
@@ -122,6 +123,22 @@ The first field can be a full path (the only form the interface creates), an exe
 **Games that were detected only because they were inside a monitored folder stop being detected until you create a profile for them.**
 
 ---
+
+### ASUS values (ROG Strix XG27AQWMG only)
+
+With the ASUS connected, **Desktop (ASUS)** and the profile dialog show these settings instead of Local Dimming. Each can be set to **Don't change** (nothing is sent):
+
+| Setting | VCP | Values |
+|---------|-----|--------|
+| Picture mode | 0xDC | Scenery, Racing, Cinema, RTS/RPG, FPS, sRGB, MOBA, Night Vision, User |
+| Brightness | 0x10 | 0–100 |
+| Contrast | 0x12 | 0–100 |
+| Saturation | 0x8A | 0–100 |
+| Sharpness | 0x87 | 0–10 in the app (sent ×10: the monitor uses 0–100) |
+| Gamma | 0x72 | 1.8, 2.0, 2.2, 2.4, 2.6 |
+| Color temperature | 0x14 | 4000K, 5000K, 6500K, 7500K, 8200K, 9300K, 10000K, User |
+
+Each picture mode keeps its own brightness, gamma, etc., so the picture mode is sent first and the other values after it. With HDR on only sharpness is sent. In the `.ini`, gamma is stored ×10 (`22` = 2.2) and picture mode / color temperature as the VCP value shown by the monitor (e.g. `4` = User picture mode, `5` = 6500K).
 
 ### KTC values (KTC monitors only)
 
@@ -189,7 +206,7 @@ If you want to verify it yourself, you can [build it from source](#building-from
 
 - Windows 10 version 1903 or later (HDR API requirement)
 - Administrator privileges (required by the Windows HDR API)
-- A KTC monitor that supports HDR (other brands are ignored)
+- A KTC monitor or an ASUS ROG Strix XG27AQWMG that supports HDR (other monitors are ignored)
 
 ### Building from source
 
@@ -213,7 +230,7 @@ Output: `dist\HDRAutostart.exe` and `dist\HDRAutostartSetup.exe`
 
 Windows 11 soporta HDR, pero no lo activa automáticamente. Si dejas el HDR siempre encendido, el escritorio, el navegador y las aplicaciones SDR se ven deslavados. Si lo dejas apagado, tienes que abrir la Configuración de pantalla cada vez que quieres jugar o ver un video HDR. HDRAutostart resuelve esto monitoreando el sistema en segundo plano y cambiando el HDR por ti.
 
-> **Solo monitores KTC:** HDRAutostart enciende y apaga el HDR, y envía brillo, nitidez y local dimming, **únicamente a un monitor KTC**. Cualquier otro monitor conectado al PC no se toca. Los monitores KTC se reconocen por su ID de fabricante ("KTC" o "SKG") o porque responden al comando de local dimming de KTC.
+> **Solo monitores compatibles:** HDRAutostart enciende y apaga el HDR, y envía ajustes de monitor, **únicamente a un monitor KTC o al ASUS ROG Strix XG27AQWMG**. Cualquier otro monitor conectado al PC (por ejemplo la pantalla de un portátil) no se toca. Los monitores KTC se reconocen por su ID de fabricante ("KTC" o "SKG") o porque responden al comando de local dimming de KTC; el ASUS por su ID ("AUSAA02"). El menú de la bandeja y el diálogo de perfil muestran los ajustes del monitor conectado.
 
 ### Funcionalidades
 
@@ -225,6 +242,7 @@ Windows 11 soporta HDR, pero no lo activa automáticamente. Si dejas el HDR siem
 | **Local Dimming KTC** | Para monitores KTC con soporte DDC/CI: fija el nivel de Local Dimming (VCP 0xF4) del escritorio, de cada perfil de juego y del vídeo HDR en navegador. **No tocar** no envía ningún comando (el monitor conserva el valor que tenga en ese momento, no se apaga), así que es seguro en cualquier monitor. |
 | **Nitidez KTC** | Fija la nitidez del monitor (VCP 0x87) de 0 a 10 (o No tocar = no enviar nada) para el escritorio, cada perfil de juego y el vídeo HDR en navegador. Valor por defecto: 6. |
 | **Brillo KTC** | Fija el brillo del monitor (VCP 0x10): el valor de escritorio (por defecto 22) y, en los perfiles con el HDR desactivado, el valor propio del perfil. Los juegos con HDR dejan el brillo al propio monitor. |
+| **ASUS ROG Strix XG27AQWMG** | Modo de imagen (GameVisual), brillo, contraste, saturación, nitidez, gamma y temperatura de color, para el escritorio y para cada perfil de juego. Con HDR activo solo se envía la nitidez; el resto se aplica a los juegos SDR y al escritorio. Este OLED no tiene local dimming. |
 | **Perfiles de juego** | Un perfil es un ejecutable más **HDR sí/no**, Local Dimming, Nitidez y Brillo. Cada perfil lleva sus propios valores; no hay valor general de reserva. Un perfil nuevo arranca con el HDR marcado y los valores de escritorio como base, y tú los cambias. HDR sí: el HDR se activa mientras el juego está abierto. HDR no (juego SDR): no se activa el HDR, pero se aplican la atenuación, la nitidez y el brillo del perfil. Al cerrarse el último juego, el monitor vuelve a los valores de escritorio. Crear, editar o borrar un perfil con su juego abierto se aplica sin reiniciar el juego. |
 | **Ejecutar al inicio** | Lanza HDRAutostart con Windows mediante una tarea programada (sin aviso de UAC). La crea el instalador; puedes activarla o desactivarla desde el menú de la bandeja. |
 | **Bandeja del sistema** | Se ejecuta silenciosamente en segundo plano. Icono naranja = HDR activo, icono gris = HDR inactivo. Clic derecho para el menú. |
@@ -298,7 +316,7 @@ Los cambios de perfil se aplican sin reiniciar el juego: un perfil nuevo lo reco
 
 #### El archivo `.ini`
 
-Los ajustes van en `[settings]` y cada perfil en una línea de `[profiles]`, con el formato `exe|dimming|nitidez|hdr|brillo`. Dimming es `0` (no tocar) o `1`–`4` (Auto, Bajo, Estándar, Alto); nitidez es `-1` (no tocar) o `0`–`10`; hdr es `1` (HDR sí) o `0` (juego SDR); brillo es `0`–`100` y solo se usa cuando hdr es `0` (los perfiles con HDR conservan el campo pero lo ignoran). En `[settings]`, `ktc_dimming_desktop`, `ktc_sharpness_desktop` y `ktc_brightness_desktop` son los valores de escritorio, `video_dimming` y `video_sharpness` son los de vídeo (mismas escalas) y `browser_hdr` es el interruptor de pantalla completa en navegador (`1` = activado). Ejemplo:
+Los ajustes van en `[settings]` y cada perfil en una línea de `[profiles]`, con el formato `exe|dimming|nitidez|hdr|brillo|modo de imagen|contraste|saturación|gamma|temperatura de color` (los cinco últimos son los ajustes del ASUS, `-1` = no tocar; las líneas sin ellos siguen siendo válidas). Dimming es `0` (no tocar) o `1`–`4` (Auto, Bajo, Estándar, Alto); nitidez es `-1` (no tocar) o `0`–`10`; hdr es `1` (HDR sí) o `0` (juego SDR); brillo es `0`–`100` y solo se usa cuando hdr es `0` (los perfiles con HDR conservan el campo pero lo ignoran). En `[settings]`, `ktc_dimming_desktop`, `ktc_sharpness_desktop` y `ktc_brightness_desktop` son los valores de escritorio, `video_dimming` y `video_sharpness` son los de vídeo (mismas escalas) y `browser_hdr` es el interruptor de pantalla completa en navegador (`1` = activado). Los valores de escritorio del ASUS son `picture_mode_desktop`, `contrast_desktop`, `saturation_desktop`, `gamma_desktop` y `color_temp_desktop` (ver "Valores ASUS" más abajo). Ejemplo:
 
 ```ini
 [settings]
@@ -325,6 +343,22 @@ El primer campo puede ser una ruta completa (la única forma que crea la interfa
 **Los juegos que solo se detectaban por estar dentro de una carpeta monitoreada dejan de detectarse hasta que les crees un perfil.**
 
 ---
+
+### Valores ASUS (solo ROG Strix XG27AQWMG)
+
+Con el ASUS conectado, **Escritorio (ASUS)** y el diálogo de perfil muestran estos ajustes en lugar del Local Dimming. Cada uno admite **No tocar** (no se envía nada):
+
+| Ajuste | VCP | Valores |
+|--------|-----|---------|
+| Modo de imagen | 0xDC | Escenario, Carrera, Cine, RTS/RPG, FPS, sRGB, MOBA, Visión nocturna, Usuario |
+| Brillo | 0x10 | 0–100 |
+| Contraste | 0x12 | 0–100 |
+| Saturación | 0x8A | 0–100 |
+| Nitidez | 0x87 | 0–10 en la app (se envía ×10: el monitor usa 0–100) |
+| Gamma | 0x72 | 1.8, 2.0, 2.2, 2.4, 2.6 |
+| Temperatura de color | 0x14 | 4000K, 5000K, 6500K, 7500K, 8200K, 9300K, 10000K, Usuario |
+
+Cada modo de imagen guarda su propio brillo, gamma, etc., así que primero se envía el modo de imagen y después los demás valores. Con HDR activo solo se envía la nitidez. En el `.ini`, la gamma se guarda ×10 (`22` = 2.2) y el modo de imagen / la temperatura de color como el valor VCP del monitor (p. ej. `4` = modo Usuario, `5` = 6500K).
 
 ### Valores KTC (solo monitores KTC)
 
@@ -392,7 +426,7 @@ Si quieres verificarlo tú mismo, puedes [compilarlo desde el código fuente](#c
 
 - Windows 10 versión 1903 o posterior (requisito de la API HDR)
 - Privilegios de administrador (requeridos por la API HDR de Windows)
-- Un monitor KTC compatible con HDR (las demás marcas se ignoran)
+- Un monitor KTC o un ASUS ROG Strix XG27AQWMG compatible con HDR (los demás monitores se ignoran)
 
 ### Compilar desde el código fuente
 

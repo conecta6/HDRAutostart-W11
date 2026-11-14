@@ -2,7 +2,9 @@
 // hdrautostart.cpp  v3 — system-tray HDR auto-activator (HDRAutostart)
 //   · Per-game profiles decide HDR / SDR handling (matched by exe path, name or folder)
 //   · Browser fullscreen triggers HDR (auto-off when leaving fullscreen)
-//   · KTC Local Dimming via DDC/CI (VCP 0xF4)
+//   · Monitor settings via DDC/CI on supported monitors only: KTC (local dimming VCP 0xF4,
+//     sharpness, brightness) and ASUS ROG Strix XG27AQWMG (picture mode, brightness, contrast,
+//     saturation, sharpness, gamma, color temperature)
 // =============================================================================
 #define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
@@ -38,6 +40,9 @@ extern "C" {
 #include <winhttp.h>
 #include <urlmon.h>
 #include <commctrl.h>
+#include <dwmapi.h>
+#include <objbase.h>
+#include <propsys.h>
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -49,6 +54,7 @@ extern "C" {
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "urlmon.lib")
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "dwmapi.lib")
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")
 
 #define APP_VERSION "0.35"
@@ -76,13 +82,16 @@ struct Lang {
     const char *dlgProfEdit;                 // profile edit dialog: title and field labels
     const char *profDimField, *profBrightField, *profBrightShort;
     const char *numValueFmt;                 // numeric dialog label, printf(min, max)
+    // ASUS settings (menu items; the profile dialog adds a colon)
+    const char *menuPicMode, *menuContrast, *menuSaturation, *menuGamma, *menuColorTemp;
+    const char *profByName;                  // profile dialog: match by executable name only
 };
 
 static const Lang kES = {
     "Ejecutar al inicio", "Salir",
     "Agregar", "Eliminar", "Cerrar", "Aceptar", "Cancelar",
     "HDRAutostart \x97 HDR activo", "HDRAutostart \x97 HDR inactivo",
-    "Local Dimming", "Escritorio (KTC)",
+    "Local Dimming", "Escritorio",
     "No tocar", "Auto", "Bajo", "Est\xe1ndar", "Alto",
     "GitHub",
     "Perfiles de juego...", "Perfiles de juego", "Nitidez",
@@ -95,13 +104,15 @@ static const Lang kES = {
     "(cualquier carpeta)", "[carpeta]",
     "Ajustes del perfil",
     "Atenuaci\xf3n local:", "Brillo (0-100):", "Brillo:",
-    "Valor (%d-%d):"
+    "Valor (%d-%d):",
+    "Modo de imagen", "Contraste", "Saturaci\xf3n", "Gamma", "Temperatura de color",
+    "Solo por nombre del ejecutable (cualquier carpeta)"
 };
 static const Lang kEN = {
     "Run at startup", "Exit",
     "Add", "Remove", "Close", "OK", "Cancel",
     "HDRAutostart \x97 HDR active", "HDRAutostart \x97 HDR inactive",
-    "Local Dimming", "Desktop (KTC)",
+    "Local Dimming", "Desktop",
     "Don't change", "Auto", "Low", "Standard", "High",
     "GitHub",
     "Game profiles...", "Game profiles", "Sharpness",
@@ -114,13 +125,58 @@ static const Lang kEN = {
     "(any folder)", "[folder]",
     "Profile settings",
     "Local Dimming:", "Brightness (0-100):", "Brightness:",
-    "Value (%d-%d):"
+    "Value (%d-%d):",
+    "Picture mode", "Contrast", "Saturation", "Gamma", "Color temperature",
+    "By executable name only (any folder)"
 };
 static const Lang* L = &kEN;
 
 static void DetectLang()
 {
     if (PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_SPANISH) L = &kES;
+}
+
+// =============================================================================
+// ASUS ROG Strix XG27AQWMG value tables (mapped from the OSD with DDC/CI reads)
+// =============================================================================
+struct NamedValue { int value; const char* es; const char* en; };
+#define COUNT_OF(a) (sizeof(a) / sizeof((a)[0]))
+
+// Picture mode (GameVisual), VCP 0xDC — in OSD order. Each mode keeps its own brightness,
+// color temperature, gamma, sharpness and saturation: switching reloads them.
+static const NamedValue kAsusPicModes[] = {
+    { 2, "Escenario", "Scenery" }, { 5, "Carrera", "Racing" }, { 1, "Cine", "Cinema" },
+    { 6, "RTS/RPG", "RTS/RPG" },   { 7, "FPS", "FPS" },        { 10, "sRGB", "sRGB" },
+    { 8, "MOBA", "MOBA" },         { 9, "Visi\xf3n nocturna", "Night Vision" },
+    { 4, "Usuario", "User" }
+};
+// Color temperature, VCP 0x14 (MCCS presets) — in OSD order
+static const NamedValue kAsusColorTemps[] = {
+    { 3, "4000K", "4000K" }, { 4, "5000K", "5000K" }, { 5, "6500K", "6500K" },
+    { 6, "7500K", "7500K" }, { 7, "8200K", "8200K" }, { 8, "9300K", "9300K" },
+    { 9, "10000K", "10000K" }, { 11, "Usuario", "User" }
+};
+// Gamma, stored as gamma x 10 (VCP 0x72 takes (gamma x 100 - 100) in its high byte)
+static const NamedValue kAsusGammas[] = {
+    { 18, "1.8", "1.8" }, { 20, "2.0", "2.0" }, { 22, "2.2", "2.2" },
+    { 24, "2.4", "2.4" }, { 26, "2.6", "2.6" }
+};
+
+// Position of 'value' in a table, -1 if it is not there
+static int NamedIndex(const NamedValue* t, size_t n, int value)
+{
+    for (size_t i = 0; i < n; i++) if (t[i].value == value) return (int)i;
+    return -1;
+}
+
+// Text of a table value in the UI language: "Don't change" for -1, the number if unknown
+static const char* NamedLabel(const NamedValue* t, size_t n, int value, char* buf, size_t bufSize)
+{
+    if (value < 0) return L->ktcKeep;
+    int i = NamedIndex(t, n, value);
+    if (i >= 0) return L == &kES ? t[i].es : t[i].en;
+    snprintf(buf, bufSize, "%d", value);
+    return buf;
 }
 
 // =============================================================================
@@ -136,14 +192,26 @@ struct GameProfile {
     int  localDimming = 1;     // 0 = leave alone, 1=Auto 2=Low 3=Std 4=High
     int  sharpness    = 6;     // -1 = leave alone, 0-10 (VCP 0x87)
     int  brightness   = 100;   // 0-100 (VCP 0x10); only sent to SDR games (-1 only while loading)
+    // ASUS only, SDR only (never sent while HDR is on). -1 = leave alone
+    int  pictureMode  = -1;    // VCP 0xDC value (kAsusPicModes)
+    int  contrast     = -1;    // 0-100 (VCP 0x12)
+    int  saturation   = -1;    // 0-100 (VCP 0x8A)
+    int  gamma        = -1;    // gamma x 10: 18, 20, 22, 24, 26 (VCP 0x72)
+    int  colorTemp    = -1;    // VCP 0x14 value (kAsusColorTemps)
 };
 
 // General settings = the desktop: what the monitor goes back to when no game (and no
 // browser video) is running. Each profile carries its own values.
 struct Config {
     int    ktcDimmingDesktop    = 1;   // 0 = leave alone, 1=Auto 2=Low 3=Std 4=High (VCP 0xF4)
-    int    ktcSharpnessDesktop  = 6;   // -1=off, 0-10 (VCP 0x87 on KTC)
-    int    ktcBrightnessDesktop = 22;  // 0-100 (VCP 0x10)
+    int    ktcSharpnessDesktop  = 6;   // -1=off, 0-10 (VCP 0x87; the ASUS gets it x 10)
+    int    ktcBrightnessDesktop = 22;  // 0-100 (VCP 0x10) — also used by the ASUS
+    // Desktop values of the ASUS-only settings (same meaning as in GameProfile, -1 = leave alone)
+    int    pictureModeDesktop   = -1;
+    int    contrastDesktop      = -1;
+    int    saturationDesktop    = -1;
+    int    gammaDesktop         = -1;
+    int    colorTempDesktop     = -1;
     int    videoDimming         = 1;   // same scale as ktcDimmingDesktop — HDR video in a browser
     int    videoSharpness       = 6;   // -1=off, 0-10 — HDR video in a browser
     time_t lastUpdateAttempt  = 0;  // unix timestamp of last auto-update trigger (anti-loop)
@@ -229,14 +297,21 @@ static void SaveConfig()
     fprintf(f, "ktc_dimming_desktop=%d\n",    g_cfg.ktcDimmingDesktop);
     fprintf(f, "ktc_sharpness_desktop=%d\n",   g_cfg.ktcSharpnessDesktop);
     fprintf(f, "ktc_brightness_desktop=%d\n",  g_cfg.ktcBrightnessDesktop);
+    fprintf(f, "picture_mode_desktop=%d\n",    g_cfg.pictureModeDesktop);
+    fprintf(f, "contrast_desktop=%d\n",        g_cfg.contrastDesktop);
+    fprintf(f, "saturation_desktop=%d\n",      g_cfg.saturationDesktop);
+    fprintf(f, "gamma_desktop=%d\n",           g_cfg.gammaDesktop);
+    fprintf(f, "color_temp_desktop=%d\n",      g_cfg.colorTempDesktop);
     fprintf(f, "video_dimming=%d\n",           g_cfg.videoDimming);
     fprintf(f, "video_sharpness=%d\n",         g_cfg.videoSharpness);
     fprintf(f, "browser_hdr=%d\n",          g_cfg.browserHdrEnabled ? 1 : 0);
     if (g_cfg.lastUpdateAttempt)
         fprintf(f, "last_update_attempt=%lld\n", (long long)g_cfg.lastUpdateAttempt);
-    fprintf(f, "[profiles]\n");  // exe|dimming|sharpness|hdr|brightness
+    // exe|dimming|sharpness|hdr|brightness|picture mode|contrast|saturation|gamma|color temp
+    fprintf(f, "[profiles]\n");
     for (auto& p : g_cfg.profiles)
-        fprintf(f, "%s|%d|%d|%d|%d\n", p.exe.c_str(), p.localDimming, p.sharpness, p.hdr ? 1 : 0, p.brightness);
+        fprintf(f, "%s|%d|%d|%d|%d|%d|%d|%d|%d|%d\n", p.exe.c_str(), p.localDimming, p.sharpness,
+                p.hdr ? 1 : 0, p.brightness, p.pictureMode, p.contrast, p.saturation, p.gamma, p.colorTemp);
     bool ok = !ferror(f);
     if (fclose(f) != 0) ok = false;
     // An old .ini that could not be backed up when it was loaded: try the copy again before
@@ -312,6 +387,16 @@ static bool ParseSharpnessValue(const char* text, int& value)
     if (!ParseIntField(text, v)) return false;
     if (v > 10 && v <= 100 && (v % 10) == 0) v /= 10;  // migrate old 0-100 configs
     if (v < -1 || v > 10) return false;
+    value = v;
+    return true;
+}
+
+// ASUS setting given by a table: -1 (leave alone) or one of the table's values
+static bool ParseTableValue(const char* text, const NamedValue* t, size_t n, int& value)
+{
+    int v = 0;
+    if (!ParseIntField(text, v)) return false;
+    if (v != -1 && NamedIndex(t, n, v) < 0) return false;
     value = v;
     return true;
 }
@@ -439,6 +524,16 @@ static void LoadConfig()
                 if (ParseSharpnessValue(v, i)) { g_cfg.ktcSharpnessDesktop = i; sawDesktopSharpness = true; }
             } else if ((v = IniValue(line, "ktc_brightness_desktop"))) {
                 if (ParseIntRange(v, 0, 100, i)) { g_cfg.ktcBrightnessDesktop = i; sawBrightnessDesktop = true; }
+            } else if ((v = IniValue(line, "picture_mode_desktop"))) {
+                if (ParseTableValue(v, kAsusPicModes, COUNT_OF(kAsusPicModes), i)) g_cfg.pictureModeDesktop = i;
+            } else if ((v = IniValue(line, "contrast_desktop"))) {
+                if (ParseIntRange(v, -1, 100, i)) g_cfg.contrastDesktop = i;
+            } else if ((v = IniValue(line, "saturation_desktop"))) {
+                if (ParseIntRange(v, -1, 100, i)) g_cfg.saturationDesktop = i;
+            } else if ((v = IniValue(line, "gamma_desktop"))) {
+                if (ParseTableValue(v, kAsusGammas, COUNT_OF(kAsusGammas), i)) g_cfg.gammaDesktop = i;
+            } else if ((v = IniValue(line, "color_temp_desktop"))) {
+                if (ParseTableValue(v, kAsusColorTemps, COUNT_OF(kAsusColorTemps), i)) g_cfg.colorTempDesktop = i;
             } else if ((v = IniValue(line, "video_dimming"))) {
                 if (ParseIntRange(v, 0, 4, i)) { g_cfg.videoDimming = i; sawVideoDim = true; }
             } else if ((v = IniValue(line, "video_sharpness"))) {
@@ -471,8 +566,9 @@ static void LoadConfig()
         case SEC_BLACKLIST: oldBlacklist.push_back(ToLower(line)); break;
         case SEC_EXCLUDE:   oldExclude.push_back(ToLower(line));   break;
         case SEC_PROFILES: {
-            // format: exe|dimming|sharpness|hdr|brightness
-            // (older forms: 3 fields have no hdr; without brightness it is filled in below.
+            // format: exe|dimming|sharpness|hdr|brightness|picture mode|contrast|saturation|gamma|color temp
+            // (the five ASUS fields may be missing: they stay -1, "leave alone".
+            //  Older forms: 3 fields have no hdr; without brightness it is filled in below.
             //  In the pre-"desktop" format -1 in dimming / sharpness meant "use the general value")
             // Every line that is dropped is logged with its text
             char* p1 = strchr(line, '|');
@@ -498,6 +594,26 @@ static void LoadConfig()
             if (p4) {
                 int b = 0;
                 if (ParseIntRange(p4 + 1, 0, 100, b)) gp.brightness = b;
+            }
+            // ASUS fields: an invalid value is logged and left at -1 (the line is kept)
+            {
+                int* const asusField[] = { &gp.pictureMode, &gp.contrast, &gp.saturation,
+                                           &gp.gamma, &gp.colorTemp };
+                char* q = p4;
+                for (int k = 0; k < 5 && q; k++) {
+                    q = strchr(q + 1, '|');
+                    if (!q) break;
+                    int v = -1;
+                    bool ok;
+                    switch (k) {
+                    case 0:  ok = ParseTableValue(q + 1, kAsusPicModes, COUNT_OF(kAsusPicModes), v); break;
+                    case 3:  ok = ParseTableValue(q + 1, kAsusGammas, COUNT_OF(kAsusGammas), v); break;
+                    case 4:  ok = ParseTableValue(q + 1, kAsusColorTemps, COUNT_OF(kAsusColorTemps), v); break;
+                    default: ok = ParseIntRange(q + 1, -1, 100, v); break;
+                    }
+                    if (ok) *asusField[k] = v;
+                    else Log("Config: profile %s: field %d invalid, left as \"don't change\"", gp.exe.c_str(), 6 + k);
+                }
             }
             // Ignore a second profile for the same entry (first one wins)
             bool dup = false;
@@ -757,12 +873,12 @@ static BOOL CALLBACK FindMonitorByGdiNameProc(HMONITOR hmon, HDC, LPRECT, LPARAM
     return TRUE;
 }
 
-static bool IsKTCMonitor(HMONITOR hmon);  // defined below (shared cached verdict)
+static bool IsSupportedMonitor(HMONITOR hmon);  // defined below (shared cached verdict)
 
-// True if the target of this display path is a KTC monitor: PnP vendor ID "KTC"
-// or "SKG" (the M27P6 reports "SKG") in the target device path, or, failing that,
-// the cached verdict of IsKTCMonitor (vendor ID / DDC/CI dimming probe).
-static bool IsKTCDisplayPath(const DISPLAYCONFIG_PATH_INFO& pi)
+// True if the target of this display path is a supported monitor: PnP ID "KTC" or "SKG"
+// (the KTC M27P6 reports "SKG") or "AUSAA02" (ASUS ROG Strix XG27AQWMG) in the target device
+// path, or, failing that, the cached verdict of IsSupportedMonitor (vendor ID / DDC/CI probe).
+static bool IsSupportedDisplayPath(const DISPLAYCONFIG_PATH_INFO& pi)
 {
     DISPLAYCONFIG_TARGET_DEVICE_NAME tn = {};
     tn.header.type      = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
@@ -774,7 +890,8 @@ static bool IsKTCDisplayPath(const DISPLAYCONFIG_PATH_INFO& pi)
         std::wstring path = tn.monitorDevicePath;
         CharUpperW(&path[0]);
         if (path.find(L"DISPLAY#KTC") != std::wstring::npos ||
-            path.find(L"DISPLAY#SKG") != std::wstring::npos) return true;
+            path.find(L"DISPLAY#SKG") != std::wstring::npos ||
+            path.find(L"DISPLAY#AUSAA02") != std::wstring::npos) return true;
     }
 
     // Fallback: DDC/CI probe on the monitor attached to this path's source.
@@ -789,12 +906,12 @@ static bool IsKTCDisplayPath(const DISPLAYCONFIG_PATH_INFO& pi)
     EnumDisplayMonitors(nullptr, nullptr, FindMonitorByGdiNameProc, (LPARAM)&ctx);
     if (!ctx.hmon) return false;
 
-    return IsKTCMonitor(ctx.hmon);
+    return IsSupportedMonitor(ctx.hmon);
 }
 
-// Turns HDR on/off on KTC displays only; other monitors are never touched.
-// Returns true if at least one KTC HDR-capable display was switched.
-// *noDisplay (optional) is set to true when no active KTC display with HDR support
+// Turns HDR on/off on supported displays only (KTC / ASUS); other monitors are never touched.
+// Returns true if at least one supported HDR-capable display was switched.
+// *noDisplay (optional) is set to true when no active supported display with HDR support
 // was found at all (as opposed to a switch that failed); callers do the logging.
 static bool SetHDR(bool on, bool* noDisplay = nullptr)
 {
@@ -811,7 +928,7 @@ static bool SetHDR(bool on, bool* noDisplay = nullptr)
         info.h.adapterId = pi.targetInfo.adapterId;
         info.h.id        = pi.targetInfo.id;
         if (DisplayConfigGetDeviceInfo(&info.h) != ERROR_SUCCESS || !info.sup) continue;
-        if (!IsKTCDisplayPath(pi)) continue;
+        if (!IsSupportedDisplayPath(pi)) continue;
         ktcHdrSeen = true;
         ACS st = {};
         st.h.type      = kSetACS;
@@ -825,8 +942,8 @@ static bool SetHDR(bool on, bool* noDisplay = nullptr)
     return any;
 }
 
-// Returns true if any HDR-capable active KTC display currently has HDR enabled
-// (non-KTC displays are ignored).
+// Returns true if any HDR-capable active supported display currently has HDR enabled
+// (other displays are ignored).
 // Returns false on query failure (never act blindly); 'queried' tells both apart.
 static bool IsHDROn(bool* queried = nullptr)
 {
@@ -842,7 +959,7 @@ static bool IsHDROn(bool* queried = nullptr)
         info.h.adapterId = pi.targetInfo.adapterId;
         info.h.id        = pi.targetInfo.id;
         if (DisplayConfigGetDeviceInfo(&info.h) != ERROR_SUCCESS || !info.sup) continue;
-        if (!IsKTCDisplayPath(pi)) continue;
+        if (!IsSupportedDisplayPath(pi)) continue;
         if (info.en) return true;
     }
     return false;
@@ -850,7 +967,7 @@ static bool IsHDROn(bool* queried = nullptr)
 
 // Up to 3 attempts of SetHDR(on), 300 ms apart. When turning HDR off, a failed
 // attempt with HDR confirmed off (or no HDR display) counts as success.
-// When turning HDR on and there is no KTC HDR display at all, it gives up at once
+// When turning HDR on and there is no supported HDR display at all, it gives up at once
 // (*noDisplay = true): retrying cannot help.
 static bool SetHDRRetry(bool on, bool* noDisplay = nullptr)
 {
@@ -1108,90 +1225,156 @@ static bool SetNVAPIVCP(BYTE vcp, DWORD value)
     return anySuccess;
 }
 // =============================================================================
-// KTC DDC/CI VCP helpers
+// Supported monitors (KTC / ASUS) and DDC/CI VCP helpers
 // =============================================================================
-// True if the display behind this HMONITOR reports a known KTC PnP vendor ID.
-// KTC panels do not always use "KTC" (e.g. M27P6 reports "SKG").
-static bool IsKTCDeviceId(HMONITOR hmon)
+// Kind of supported monitor. Bit values: ConnectedMonitorKinds() ORs them together.
+enum MonKind { MON_NONE = 0, MON_KTC = 1, MON_ASUS = 2 };
+
+// Kind given by the PnP ID of the display behind this HMONITOR (MON_NONE if unknown).
+// KTC panels do not always use "KTC" (e.g. M27P6 reports "SKG"). The ASUS is recognised
+// only as the ROG Strix XG27AQWMG ("AUSAA02"): other ASUS models may use other VCP values.
+static MonKind DeviceIdKind(HMONITOR hmon)
 {
     MONITORINFOEXA mi = {};
     mi.cbSize = sizeof(mi);
-    if (!GetMonitorInfoA(hmon, (MONITORINFO*)&mi)) return false;
+    if (!GetMonitorInfoA(hmon, (MONITORINFO*)&mi)) return MON_NONE;
     DISPLAY_DEVICEA dd = {};
     dd.cb = sizeof(dd);
     for (DWORD i = 0; EnumDisplayDevicesA(mi.szDevice, i, &dd, 0); i++) {
         // DeviceID looks like "MONITOR\SKG2774\{guid}\0001"
         if (_strnicmp(dd.DeviceID, "MONITOR\\KTC", 11) == 0 ||
-            _strnicmp(dd.DeviceID, "MONITOR\\SKG", 11) == 0) return true;
+            _strnicmp(dd.DeviceID, "MONITOR\\SKG", 11) == 0) return MON_KTC;
+        if (_strnicmp(dd.DeviceID, "MONITOR\\AUSAA02", 15) == 0) return MON_ASUS;
     }
-    return false;
+    return MON_NONE;
 }
 
-// Shared "is this monitor a KTC panel" verdict: known PnP vendor ID, or failing that the
+// Shared "which supported monitor is this" verdict: known PnP ID, or failing that the KTC
 // DDC/CI dimming probe (slow, ~60 ms per physical monitor). Cached by GDI name + DeviceID
 // (not HMONITOR, which changes across display reconfigurations). Positives live until the
 // cache is invalidated (WM_DISPLAYCHANGE); negatives expire after 30 s because a DDC probe
 // can fail occasionally. Called from MonitorThread and from the UI thread.
-struct KTCCacheEntry { bool isKTC; ULONGLONG tick; };
-static CRITICAL_SECTION                     g_ktcCacheLock;
-static std::map<std::string, KTCCacheEntry> g_ktcCache;
-static unsigned                             g_ktcCacheGen = 0;  // bumped on invalidation
-static const ULONGLONG                      kKtcNegativeTtlMs = 30000;
+struct MonCacheEntry { MonKind kind; ULONGLONG tick; };
+static CRITICAL_SECTION                     g_monCacheLock;
+static std::map<std::string, MonCacheEntry> g_monCache;
+static unsigned                             g_monCacheGen = 0;  // bumped on invalidation
+static const ULONGLONG                      kMonNegativeTtlMs = 30000;
 
-static void InvalidateKTCMonitorCache()
+static void InvalidateMonitorCache()
 {
-    EnterCriticalSection(&g_ktcCacheLock);
-    g_ktcCache.clear();
-    g_ktcCacheGen++;
-    LeaveCriticalSection(&g_ktcCacheLock);
+    EnterCriticalSection(&g_monCacheLock);
+    g_monCache.clear();
+    g_monCacheGen++;
+    LeaveCriticalSection(&g_monCacheLock);
 }
 
-static bool IsKTCMonitor(HMONITOR hmon)
+static MonKind MonitorKindOf(HMONITOR hmon)
 {
     MONITORINFOEXA mi = {};
     mi.cbSize = sizeof(mi);
-    if (!GetMonitorInfoA(hmon, (MONITORINFO*)&mi)) return false;  // stale handle: not cached
+    if (!GetMonitorInfoA(hmon, (MONITORINFO*)&mi)) return MON_NONE;  // stale handle: not cached
     DISPLAY_DEVICEA dd = {};
     dd.cb = sizeof(dd);
     EnumDisplayDevicesA(mi.szDevice, 0, &dd, 0);
     std::string key = std::string(mi.szDevice) + "|" + dd.DeviceID;
 
     unsigned gen = 0;
-    EnterCriticalSection(&g_ktcCacheLock);
-    gen = g_ktcCacheGen;
-    auto it = g_ktcCache.find(key);
-    if (it != g_ktcCache.end() &&
-        (it->second.isKTC || GetTickCount64() - it->second.tick < kKtcNegativeTtlMs)) {
-        bool cached = it->second.isKTC;
-        LeaveCriticalSection(&g_ktcCacheLock);
+    EnterCriticalSection(&g_monCacheLock);
+    gen = g_monCacheGen;
+    auto it = g_monCache.find(key);
+    if (it != g_monCache.end() &&
+        (it->second.kind != MON_NONE || GetTickCount64() - it->second.tick < kMonNegativeTtlMs)) {
+        MonKind cached = it->second.kind;
+        LeaveCriticalSection(&g_monCacheLock);
         return cached;
     }
-    LeaveCriticalSection(&g_ktcCacheLock);
+    LeaveCriticalSection(&g_monCacheLock);
 
     // Probe outside the lock: DDC/CI is slow
-    bool isKTC = IsKTCDeviceId(hmon) || AnyPhysicalMonitorRespondsToKTCDimming(hmon);
+    MonKind kind = DeviceIdKind(hmon);
+    if (kind == MON_NONE && AnyPhysicalMonitorRespondsToKTCDimming(hmon)) kind = MON_KTC;
 
-    EnterCriticalSection(&g_ktcCacheLock);
-    if (gen == g_ktcCacheGen) {  // skip the store if the cache was invalidated meanwhile
-        KTCCacheEntry e = { isKTC, GetTickCount64() };
-        g_ktcCache[key] = e;
+    EnterCriticalSection(&g_monCacheLock);
+    if (gen == g_monCacheGen) {  // skip the store if the cache was invalidated meanwhile
+        MonCacheEntry e = { kind, GetTickCount64() };
+        g_monCache[key] = e;
     }
-    LeaveCriticalSection(&g_ktcCacheLock);
-    Log("KTC monitor check [%s]: %s", key.c_str(), isKTC ? "KTC" : "not KTC");
-    return isKTC;
+    LeaveCriticalSection(&g_monCacheLock);
+    Log("Monitor check [%s]: %s", key.c_str(),
+        kind == MON_KTC ? "KTC" : kind == MON_ASUS ? "ASUS" : "not supported");
+    return kind;
 }
 
-// Generic DDC/CI VCP setter — lParam = (vcp << 16) | value
-// Only KTC monitors are written to: brightness/sharpness are standard VCP codes
-// that any other brand would obey too.
-static BOOL CALLBACK KTCSetVCPProc(HMONITOR hmon, HDC, LPRECT, LPARAM lParam)
+static bool IsSupportedMonitor(HMONITOR hmon)
 {
-    BYTE  vcp  = (BYTE)((DWORD_PTR)lParam >> 16);
-    DWORD val  = (DWORD)((DWORD_PTR)lParam & 0xFFFF);
-    if (!IsKTCMonitor(hmon)) return TRUE;
+    return MonitorKindOf(hmon) != MON_NONE;
+}
+
+static BOOL CALLBACK CollectMonitorKindsProc(HMONITOR hmon, HDC, LPRECT, LPARAM lParam)
+{
+    *(int*)lParam |= MonitorKindOf(hmon);
+    return TRUE;
+}
+
+// Kinds of the supported monitors connected now (MON_KTC | MON_ASUS bits, 0 = none).
+// The menus and the profile dialog show the settings of these monitors.
+static int ConnectedMonitorKinds()
+{
+    int kinds = 0;
+    EnumDisplayMonitors(nullptr, nullptr, CollectMonitorKindsProc, (LPARAM)&kinds);
+    return kinds;
+}
+
+// Monitor settings the app sends. Each maps to a VCP code per monitor kind (MapFeature).
+enum MonFeature {
+    FEAT_DIMMING, FEAT_SHARPNESS, FEAT_BRIGHTNESS,
+    FEAT_PICMODE, FEAT_CONTRAST, FEAT_SATURATION, FEAT_GAMMA, FEAT_COLORTEMP
+};
+static const char* const kFeatureNames[] = {
+    "LocalDimming", "Sharpness", "Brightness",
+    "PictureMode", "Contrast", "Saturation", "Gamma", "ColorTemp"
+};
+
+// VCP code and raw value of a setting on a monitor kind. False when that monitor has no
+// such setting (nothing is sent to it).
+static bool MapFeature(MonKind kind, MonFeature f, int value, BYTE& vcp, DWORD& raw)
+{
+    switch (f) {
+    case FEAT_DIMMING:     // KTC-proprietary: 1=Auto 2=Low 3=Std 4=High
+        if (kind != MON_KTC) return false;
+        vcp = 0xF4; raw = (DWORD)value; return true;
+    case FEAT_SHARPNESS:   // 0-10 in the app; the ASUS takes 0-100 in steps of 10
+        vcp = 0x87; raw = (DWORD)(kind == MON_ASUS ? value * 10 : value); return true;
+    case FEAT_BRIGHTNESS:
+        vcp = 0x10; raw = (DWORD)value; return true;
+    default:
+        break;
+    }
+    if (kind != MON_ASUS) return false;
+    switch (f) {
+    case FEAT_PICMODE:    vcp = 0xDC; raw = (DWORD)value; return true;
+    case FEAT_CONTRAST:   vcp = 0x12; raw = (DWORD)value; return true;
+    case FEAT_SATURATION: vcp = 0x8A; raw = (DWORD)value; return true;
+    case FEAT_GAMMA:      vcp = 0x72; raw = (DWORD)(value * 10 - 100) << 8; return true;  // 22 -> 0x7800
+    case FEAT_COLORTEMP:  vcp = 0x14; raw = (DWORD)value; return true;
+    default:              return false;
+    }
+}
+
+struct SetVCPCtx { MonFeature feature; int value; bool sent; };
+
+// Writes one setting to every supported monitor that has it. Other monitors are never
+// written to: brightness, sharpness, etc. are standard codes any brand would obey.
+static BOOL CALLBACK SetMonVCPProc(HMONITOR hmon, HDC, LPRECT, LPARAM lParam)
+{
+    SetVCPCtx* ctx = (SetVCPCtx*)lParam;
+    MonKind kind = MonitorKindOf(hmon);
+    BYTE  vcp = 0;
+    DWORD val = 0;
+    if (kind == MON_NONE || !MapFeature(kind, ctx->feature, ctx->value, vcp, val)) return TRUE;
     DWORD count = 0;
     if (!GetNumberOfPhysicalMonitorsFromHMONITOR(hmon, &count) || count == 0) {
-        Log("  KTC DDC: no physical monitors for HMONITOR");
+        Log("  DDC: no physical monitors for HMONITOR");
         return TRUE;
     }
     std::vector<PHYSICAL_MONITOR> mons(count);
@@ -1201,6 +1384,7 @@ static BOOL CALLBACK KTCSetVCPProc(HMONITOR hmon, HDC, LPRECT, LPARAM lParam)
             WideCharToMultiByte(CP_UTF8, 0, mons[i].szPhysicalMonitorDescription, -1,
                                 desc, sizeof(desc) - 1, nullptr, nullptr);
             BOOL ok = SetVCPFeature(mons[i].hPhysicalMonitor, vcp, val);
+            ctx->sent = true;
             // The monitor silently drops a command sent right after another one (seen on the
             // KTC M27P6: dimming + brightness back-to-back left brightness unchanged).
             // DDC/CI asks for ~50 ms after a write; 120 ms was reliable in testing.
@@ -1208,8 +1392,8 @@ static BOOL CALLBACK KTCSetVCPProc(HMONITOR hmon, HDC, LPRECT, LPARAM lParam)
             DWORD vcpType = 0, curVal = 0, maxVal = 0;
             BOOL readOk = GetVCPFeatureAndVCPFeatureReply(
                 mons[i].hPhysicalMonitor, vcp, &vcpType, &curVal, &maxVal);
-            Log("  KTC DDC [%s]: VCP 0x%02X=%lu set=%s readback=%s cur=%lu max=%lu",
-                desc, (unsigned)vcp, val,
+            Log("  DDC [%s] %s %d: VCP 0x%02X=%lu set=%s readback=%s cur=%lu max=%lu",
+                desc, kFeatureNames[ctx->feature], ctx->value, (unsigned)vcp, val,
                 ok ? "OK" : "FAIL",
                 readOk ? "OK" : "FAIL",
                 curVal, maxVal);
@@ -1218,39 +1402,46 @@ static BOOL CALLBACK KTCSetVCPProc(HMONITOR hmon, HDC, LPRECT, LPARAM lParam)
     }
     return TRUE;
 }
-static void SetKTCVCP(BYTE vcp, int value)
+
+// Sends one setting (value < 0 = leave alone). True if it was written to some monitor.
+static bool SetMonFeature(MonFeature f, int value)
 {
-    if (value < 0) return;
-    EnumDisplayMonitors(nullptr, nullptr, KTCSetVCPProc,
-        (LPARAM)(((DWORD)vcp << 16) | (DWORD)value));
-}
-static void SetKTCLocalDimming(int level)
-{
-    if (level == 0) return;
-    Log("KTC LocalDimming -> %d (1=Auto,2=Low,3=Std,4=High)", level);
-    SetKTCVCP(0xF4, level);
-}
-static void SetKTCSharpness(int level)
-{
-    if (level < 0) return;
-    Log("KTC Sharpness -> %d (VCP 0x87)", level);
-    SetKTCVCP(0x87, level);
+    if (value < 0) return false;
+    SetVCPCtx ctx = { f, value, false };
+    EnumDisplayMonitors(nullptr, nullptr, SetMonVCPProc, (LPARAM)&ctx);
+    return ctx.sent;
 }
 
-static void SetKTCBrightness(int level)
+static void SetMonLocalDimming(int level)
 {
-    if (level < 0) return;
-    Log("KTC Brightness -> %d (VCP 0x10)", level);
-    SetKTCVCP(0x10, level);
+    if (level == 0) return;  // 0 = leave alone
+    SetMonFeature(FEAT_DIMMING, level);
 }
 
-static void RestoreKTCSharpnessAfterHdrTransition(int level)
+static void SetMonSharpness(int level)
+{
+    SetMonFeature(FEAT_SHARPNESS, level);
+}
+
+static void SetMonBrightness(int level)
+{
+    SetMonFeature(FEAT_BRIGHTNESS, level);
+}
+
+// ASUS picture mode. Switching reloads the mode's own brightness, gamma, etc.: give the
+// monitor time before the other values go out, or it overwrites them.
+static void SetMonPictureMode(int mode)
+{
+    if (SetMonFeature(FEAT_PICMODE, mode)) Sleep(400);
+}
+
+static void RestoreSharpnessAfterHdrTransition(int level)
 {
     if (level < 0) return;
     // Some monitors ignore the first DDC write while finishing the HDR -> SDR switch.
     for (int attempt = 0; attempt < 4; ++attempt) {
         if (attempt) Sleep(300);
-        SetKTCSharpness(level);
+        SetMonSharpness(level);
     }
 }
 
@@ -1478,7 +1669,7 @@ static bool FindProfile(const std::string& path, GameProfile& out)
 
 // Returns  1 = HDR game (profile with HDR enabled)
 //          0 = no profile: ignore
-//         -1 = SDR game (profile with HDR disabled: KTC dimming/sharpness/brightness only)
+//         -1 = SDR game (profile with HDR disabled: monitor values only)
 static int ClassifyProcess(const std::string& path)
 {
     GameProfile prof;
@@ -1506,35 +1697,156 @@ static bool IsBrowserExe(const std::string& path)
     return false;
 }
 
-// Returns true if a browser window is currently covering a full monitor
-// of a KTC display (fullscreen video on any other monitor is ignored)
-static bool CheckBrowserFullscreen()
+// AppUserModelID of a window, lowercase ("" if it has none). Store web apps (PWAs) hosted by
+// Edge run inside msedge.exe: this id (e.g. "amazonvideo.primevideo_pwbj9vvecjh7j!pwa") is what
+// tells their window apart from a normal browser window. Needs COM on the calling thread.
+static std::string WindowAppId(HWND h)
 {
-    HWND fg = GetForegroundWindow();
-    if (!fg) return false;
+    IPropertyStore* ps = nullptr;
+    if (FAILED(SHGetPropertyStoreForWindow(h, IID_PPV_ARGS(&ps))) || !ps) return "";
+    // PKEY_AppUserModel_ID
+    static const PROPERTYKEY kAppId =
+        { { 0x9F4C2855, 0x9F79, 0x4B39, { 0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3 } }, 5 };
+    PROPVARIANT v;
+    PropVariantInit(&v);
+    std::string id;
+    if (SUCCEEDED(ps->GetValue(kAppId, &v)) && v.vt == VT_LPWSTR && v.pwszVal) {
+        char buf[512] = {};
+        WideCharToMultiByte(CP_UTF8, 0, v.pwszVal, -1, buf, sizeof(buf) - 1, nullptr, nullptr);
+        id = ToLower(buf);
+    }
+    PropVariantClear(&v);
+    ps->Release();
+    return id;
+}
 
-    // Must have no caption/title bar (a real fullscreen window)
-    if (GetWindowLongA(fg, GWL_STYLE) & WS_CAPTION) return false;
+// True for an app id of a packaged (Store) app: "<package family>!<app id>"
+static bool IsWebAppId(const std::string& id)
+{
+    return id.find('!') != std::string::npos && id.find('\\') == std::string::npos;
+}
 
-    // Must belong to a known browser
+struct WebAppIdsCtx { std::set<std::string> ids; std::map<DWORD, bool> browserPid; };
+
+static BOOL CALLBACK OpenWebAppIdsProc(HWND h, LPARAM lParam)
+{
+    WebAppIdsCtx* ctx = (WebAppIdsCtx*)lParam;
+    if (!IsWindowVisible(h) || GetWindow(h, GW_OWNER)) return TRUE;
     DWORD pid = 0;
-    GetWindowThreadProcessId(fg, &pid);
-    if (!IsBrowserExe(GetProcessPath(pid))) return false;
+    GetWindowThreadProcessId(h, &pid);
+    auto it = ctx->browserPid.find(pid);
+    if (it == ctx->browserPid.end())
+        it = ctx->browserPid.insert(std::make_pair(pid, IsBrowserExe(GetProcessPath(pid)))).first;
+    if (!it->second) return TRUE;
+    std::string id = WindowAppId(h);
+    if (IsWebAppId(id)) ctx->ids.insert(id);
+    return TRUE;
+}
 
-    // Window must cover the entire monitor
+// App ids of the web app windows open now (top-level windows of browser processes)
+static std::set<std::string> OpenWebAppIds()
+{
+    WebAppIdsCtx ctx;
+    EnumWindows(OpenWebAppIdsProc, (LPARAM)&ctx);
+    return ctx.ids;
+}
+
+// For an .exe picked inside a Store package (C:\Program Files\WindowsApps\<package>\...):
+// if the package is a web app (its manifest has an Application with no Executable, as Prime
+// Video does), returns its app id "<family name>!<app id>" in lowercase, else "". The exe of
+// such a package only launches the app in Edge and exits, so the profile must use the window id.
+static std::string WebAppIdForExe(const std::string& exeLo)
+{
+    const std::string key = "\\windowsapps\\";
+    size_t k = exeLo.find(key);
+    if (k == std::string::npos) return "";
+    size_t start = k + key.size();
+    size_t end = exeLo.find('\\', start);
+    if (end == std::string::npos) return "";
+    std::string pkgDir = exeLo.substr(0, end + 1);
+    std::string pkgFull = exeLo.substr(start, end - start);  // name_version_arch_resource_publisher
+    size_t first = pkgFull.find('_'), last = pkgFull.rfind('_');
+    if (first == std::string::npos || last == first) return "";
+    std::string family = pkgFull.substr(0, first) + "_" + pkgFull.substr(last + 1);
+
+    FILE* f = fopen((pkgDir + "AppxManifest.xml").c_str(), "rb");
+    if (!f) return "";
+    std::string xml;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) xml.append(buf, n);
+    fclose(f);
+    for (size_t pos = xml.find("<Application "); pos != std::string::npos;
+         pos = xml.find("<Application ", pos + 1)) {
+        size_t close = xml.find('>', pos);
+        if (close == std::string::npos) break;
+        std::string tag = xml.substr(pos, close - pos);
+        if (tag.find("Executable=") != std::string::npos) continue;  // a real executable app
+        size_t idPos = tag.find("Id=\"");
+        if (idPos == std::string::npos) continue;
+        size_t idEnd = tag.find('"', idPos + 4);
+        if (idEnd == std::string::npos) continue;
+        return ToLower(family + "!" + tag.substr(idPos + 4, idEnd - idPos - 4));
+    }
+    return "";
+}
+
+// State of the window walk in CheckBrowserFullscreen
+struct BrowserFsCtx {
+    std::set<HMONITOR> decided;  // monitors whose top window has already been seen
+    bool found;                  // a fullscreen browser is on top of a supported monitor
+};
+
+static BOOL CALLBACK BrowserFsProc(HWND h, LPARAM lParam)
+{
+    BrowserFsCtx* ctx = (BrowserFsCtx*)lParam;
+    if (!IsWindowVisible(h) || IsIconic(h)) return TRUE;
+    // Cloaked windows (suspended Store apps, other virtual desktops) are not on screen
+    DWORD cloaked = 0;
+    if (SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked)
+        return TRUE;
     RECT wrc;
-    GetWindowRect(fg, &wrc);
-    HMONITOR hmon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+    if (!GetWindowRect(h, &wrc) || wrc.right - wrc.left < 50 || wrc.bottom - wrc.top < 50) return TRUE;
+    HMONITOR hmon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+    if (ctx->decided.count(hmon)) return TRUE;  // something above already decided this monitor
+
     MONITORINFO mi = {};  mi.cbSize = sizeof(mi);
     GetMonitorInfo(hmon, &mi);
+    bool coversMonitor = wrc.left  <= mi.rcMonitor.left  && wrc.top    <= mi.rcMonitor.top &&
+                         wrc.right >= mi.rcMonitor.right && wrc.bottom >= mi.rcMonitor.bottom;
+    // A real fullscreen window: no caption and the whole monitor (cheap checks before the process)
+    if (coversMonitor && !(GetWindowLongA(h, GWL_STYLE) & WS_CAPTION)) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(h, &pid);
+        if (IsBrowserExe(GetProcessPath(pid))) {
+            ctx->decided.insert(hmon);
+            // A web app with its own profile (e.g. Prime Video) is handled by MonitorThread
+            // like a game: browser HDR leaves it alone
+            std::string appId = WindowAppId(h);
+            GameProfile prof;
+            if (IsWebAppId(appId) && FindProfile(appId, prof)) return TRUE;
+            // Only a supported monitor counts (checked last: it may need a slow DDC/CI probe)
+            if (IsSupportedMonitor(hmon)) { ctx->found = true; return FALSE; }
+            return TRUE;
+        }
+    }
+    // Always-on-top and tool windows (taskbar, overlays, notifications) float over a fullscreen
+    // video and never decide. The first normal window that is not a fullscreen browser does:
+    // that monitor shows something else.
+    if (GetWindowLongA(h, GWL_EXSTYLE) & (WS_EX_TOPMOST | WS_EX_TOOLWINDOW)) return TRUE;
+    ctx->decided.insert(hmon);
+    return TRUE;
+}
 
-    if (!(wrc.left  <= mi.rcMonitor.left  &&
-          wrc.top   <= mi.rcMonitor.top   &&
-          wrc.right >= mi.rcMonitor.right &&
-          wrc.bottom>= mi.rcMonitor.bottom)) return false;
-
-    // Only a KTC monitor counts (checked last: it may need a slow DDC/CI probe)
-    return IsKTCMonitor(hmon);
+// Returns true if a fullscreen browser window is the top window of a supported display.
+// Not tied to keyboard focus: working on another monitor keeps the video's HDR on. It ends
+// when the browser leaves fullscreen or another window covers it on that monitor.
+static bool CheckBrowserFullscreen()
+{
+    BrowserFsCtx ctx;
+    ctx.found = false;
+    EnumWindows(BrowserFsProc, (LPARAM)&ctx);  // top-level windows in Z order, top first
+    return ctx.found;
 }
 
 // =============================================================================
@@ -1616,9 +1928,23 @@ static volatile LONG g_browserHdrOn = 0;
 // closing and handing off to the real game would otherwise toggle HDR off/on.
 static const DWORD kHdrOffGraceMs = 2000;
 
-// Full image path of a process through a handle MonitorThread already holds ("" if unavailable)
+// Web apps tracked by MonitorThread: their event handle (stands in for a process handle) ->
+// app id. Only MonitorThread uses it.
+static std::map<HANDLE, std::string> g_webAppIds;
+
+// Closes a tracked handle (process, or a web app's event)
+static void CloseTracked(HANDLE h)
+{
+    g_webAppIds.erase(h);
+    CloseHandle(h);
+}
+
+// Full image path of a process through a handle MonitorThread already holds ("" if unavailable).
+// For a web app it is its app id, which is also what its profile entry holds.
 static std::string HandlePath(HANDLE h)
 {
+    auto it = g_webAppIds.find(h);
+    if (it != g_webAppIds.end()) return it->second;
     char path[MAX_PATH] = {};  DWORD sz = MAX_PATH;
     if (!QueryFullProcessImageNameA(h, 0, path, &sz)) return "";
     return path;
@@ -1632,6 +1958,11 @@ static GameProfile DesktopProfile()
     p.localDimming = g_cfg.ktcDimmingDesktop;
     p.sharpness    = g_cfg.ktcSharpnessDesktop;
     p.brightness   = g_cfg.ktcBrightnessDesktop;
+    p.pictureMode  = g_cfg.pictureModeDesktop;
+    p.contrast     = g_cfg.contrastDesktop;
+    p.saturation   = g_cfg.saturationDesktop;
+    p.gamma        = g_cfg.gammaDesktop;
+    p.colorTemp    = g_cfg.colorTempDesktop;
     LeaveCriticalSection(&g_cfgLock);
     return p;
 }
@@ -1645,20 +1976,30 @@ static GameProfile ProfileOrDesktop(const std::string& path)
     return DesktopProfile();
 }
 
-// Sends a set of KTC values: dimming (0 = leave alone), brightness (only when asked: HDR
-// games are driven by the monitor itself) and sharpness (-1 = leave alone).
+// Sends a set of monitor values; each monitor only gets the settings it has (MapFeature).
+// Always: KTC dimming (0 = leave alone) and sharpness (-1 = leave alone).
+// sdrValues (SDR game / desktop; with HDR on the monitor drives the picture itself):
+// brightness and the ASUS picture mode, contrast, saturation, gamma and color temperature
+// (-1 = leave alone). The picture mode goes first: switching it reloads the other values.
 // afterHdrOff: an HDR -> SDR switch just happened, so wait for the monitor to settle and
 // send sharpness with retries (the switch resets VCP 0x87).
-static void ApplyProfileValues(const GameProfile& p, bool withBrightness, bool afterHdrOff)
+static void ApplyProfileValues(const GameProfile& p, bool sdrValues, bool afterHdrOff)
 {
     if (afterHdrOff) Sleep(500);
-    SetKTCLocalDimming(p.localDimming);
-    if (withBrightness) SetKTCBrightness(p.brightness);
-    if (afterHdrOff) RestoreKTCSharpnessAfterHdrTransition(p.sharpness);
-    else             SetKTCSharpness(p.sharpness);
+    if (sdrValues) SetMonPictureMode(p.pictureMode);
+    SetMonLocalDimming(p.localDimming);
+    if (sdrValues) {
+        SetMonBrightness(p.brightness);
+        SetMonFeature(FEAT_CONTRAST,   p.contrast);
+        SetMonFeature(FEAT_SATURATION, p.saturation);
+        SetMonFeature(FEAT_GAMMA,      p.gamma);
+        SetMonFeature(FEAT_COLORTEMP,  p.colorTemp);
+    }
+    if (afterHdrOff) RestoreSharpnessAfterHdrTransition(p.sharpness);
+    else             SetMonSharpness(p.sharpness);
 }
 
-// Back to the desktop: dimming, sharpness and brightness, always all three
+// Back to the desktop: every desktop value (SDR)
 static void ApplyDesktopValues(bool afterHdrOff)
 {
     ApplyProfileValues(DesktopProfile(), true, afterHdrOff);
@@ -1680,8 +2021,9 @@ static bool ApplyAfterHdrOff(const std::map<DWORD, HANDLE>& sdrGames)
 static DWORD WINAPI MonitorThread(LPVOID)
 {
     Log("Monitor started");
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);  // window app ids (web apps) need COM
     std::map<DWORD, HANDLE> games;     // HDR games (profile with hdr=1)
-    std::map<DWORD, HANDLE> sdrGames;  // SDR games (profile with hdr=0: KTC values only)
+    std::map<DWORD, HANDLE> sdrGames;  // SDR games (profile with hdr=0: monitor values only)
     bool hdrActive        = false;
     bool sdrDimmingActive = false;
     ULONGLONG hdrIdleSince = 0;     // tick when 'games' became empty (0 = not idle)
@@ -1699,17 +2041,82 @@ static DWORD WINAPI MonitorThread(LPVOID)
     bool startupChecked = false;  // one-time "HDR left on" check after the first full scan
     LONG profilesSeen = g_profilesGen;  // last profile-list generation this thread acted on
     LONG desktopSeen  = g_desktopGen;   // last desktop-settings generation this thread acted on
+    // Web apps with a profile (Store PWAs inside Edge, e.g. Prime Video): msedge.exe outlives
+    // them, so the "process" is the app window. Each is tracked like a game under a pseudo PID
+    // (odd, never a real one) with an event that is signalled when its window disappears.
+    struct WebApp { std::string id; HANDLE ev; };
+    std::map<DWORD, WebApp> webApps;
+    DWORD nextWebPid = 0xF0000001;
+    int   webTick    = 10;   // windows are scanned every 10 iterations (~1 s); 10 = now
+
+    // Starts tracking a program with a profile (cls 1 = HDR game, -1 = SDR game): a process,
+    // or a web app under its pseudo PID. 'path' is the exe path or the web app id.
+    auto track = [&](DWORD pid, HANDLE h, const std::string& path, int cls) {
+        const char* base = strrchr(path.c_str(), '\\');
+        const char* name = base ? base + 1 : path.c_str();
+        if (cls == 1) {
+            Log("Game detected: %s (PID %lu)", name, pid);
+            if (games.empty()) {
+                // The game's own values (the desktop's if its profile was removed since classification)
+                GameProfile prof = ProfileOrDesktop(path);
+                EnterCriticalSection(&g_cfgLock);
+                strncpy_s(g_hdrSource, name, _TRUNCATE);
+                LeaveCriticalSection(&g_cfgLock);
+
+                // Enable HDR
+                Log("Enabling HDR...");
+                bool noDisplay = false;
+                bool ok = SetHDRRetry(true, &noDisplay);
+                if (noDisplay) {
+                    // Monitor off or in a non-HDR mode: nothing to enable, nothing to restore later.
+                    // The game still goes into 'games' below so it is not classified again.
+                    Log("No supported HDR display active — HDR not enabled for this game");
+                } else {
+                    Log("HDR %s", ok ? "ENABLED" : "enable FAILED after retries");
+                    // On failure keep retrying from the main loop (see "late retry")
+                    hdrEnablePending     = !ok;
+                    hdrEnableLastTry     = GetTickCount64();
+                    hdrEnableTries       = 0;
+                    hdrSessionSharpness  = prof.sharpness;
+
+                    // Local dimming after HDR (KTC proprietary VCP — survives mode switch).
+                    // No brightness: in HDR mode the monitor drives it.
+                    SetMonLocalDimming(prof.localDimming);
+                    // Sharpness: VCP 0x87 gets reset by HDR mode switch.
+                    // Wait for monitor to stabilize, then send.
+                    if (prof.sharpness >= 0) {
+                        Sleep(500);
+                        SetMonSharpness(prof.sharpness);
+                    }
+
+                    sdrDimmingActive = false;  // HDR takes precedence
+                    hdrActive = true;
+                    // Orange icon only once HDR is really on; a pending enable sends it on late success
+                    if (ok && g_trayWnd) PostMessage(g_trayWnd, WM_HDRSTATUS, 1, 0);
+                }
+            }
+            games[pid] = h;
+        } else {
+            Log("SDR game detected: %s (PID %lu)", name, pid);
+            if (sdrGames.empty() && !hdrActive) {
+                // Browser HDR video on: track the game but leave the monitor to the video
+                // (patch until browser video and games are unified)
+                if (!g_browserHdrOn) ApplyProfileValues(ProfileOrDesktop(path), true, false);
+                sdrDimmingActive = true;
+            }
+            sdrGames[pid] = h;
+        }
+    };
 
     while (WaitForSingleObject(g_stopEvent, 100) == WAIT_TIMEOUT)
     {
         // --- Check for exited HDR games ---
         for (auto it = games.begin(); it != games.end(); ) {
             if (WaitForSingleObject(it->second, 0) == WAIT_OBJECT_0) {
-                char name[MAX_PATH] = {};  DWORD sz = MAX_PATH;
-                QueryFullProcessImageNameA(it->second, 0, name, &sz);
-                const char* base = strrchr(name, '\\');
-                Log("Game exited: %s (PID %lu)", base ? base + 1 : name, it->first);
-                CloseHandle(it->second);
+                std::string name = HandlePath(it->second);
+                const char* base = strrchr(name.c_str(), '\\');
+                Log("Game exited: %s (PID %lu)", base ? base + 1 : name.c_str(), it->first);
+                CloseTracked(it->second);
                 it = games.erase(it);
             } else ++it;
         }
@@ -1717,11 +2124,10 @@ static DWORD WINAPI MonitorThread(LPVOID)
         // --- Check for exited SDR games ---
         for (auto it = sdrGames.begin(); it != sdrGames.end(); ) {
             if (WaitForSingleObject(it->second, 0) == WAIT_OBJECT_0) {
-                char name[MAX_PATH] = {};  DWORD sz = MAX_PATH;
-                QueryFullProcessImageNameA(it->second, 0, name, &sz);
-                const char* base = strrchr(name, '\\');
-                Log("SDR game exited: %s (PID %lu)", base ? base + 1 : name, it->first);
-                CloseHandle(it->second);
+                std::string name = HandlePath(it->second);
+                const char* base = strrchr(name.c_str(), '\\');
+                Log("SDR game exited: %s (PID %lu)", base ? base + 1 : name.c_str(), it->first);
+                CloseTracked(it->second);
                 it = sdrGames.erase(it);
             } else ++it;
         }
@@ -1734,6 +2140,7 @@ static DWORD WINAPI MonitorThread(LPVOID)
                 // Programs that had no profile get classified again by this iteration's scan
                 seen.clear();
                 openFails.clear();
+                webTick = 10;  // web app windows too
                 // Tracked games whose class changed (to 0, or between HDR and SDR) are dropped
                 // WITHOUT going into 'seen': the scan below detects them again with their new
                 // class, and the "closed" blocks below do the HDR/SDR transitions.
@@ -1748,7 +2155,7 @@ static DWORD WINAPI MonitorThread(LPVOID)
                             const char* tb = strrchr(tp.c_str(), '\\');
                             Log("Profile changed: %s (PID %lu) is no longer an %s game — classifying again",
                                 tb ? tb + 1 : tp.c_str(), it->first, pass == 0 ? "HDR" : "SDR");
-                            CloseHandle(it->second);
+                            CloseTracked(it->second);
                             it = tracked.erase(it);
                         } else ++it;
                     }
@@ -1810,10 +2217,10 @@ static DWORD WINAPI MonitorThread(LPVOID)
                 // The mode switch resets sharpness (VCP 0x87): re-apply it
                 if (hdrSessionSharpness >= 0) {
                     Sleep(500);
-                    SetKTCSharpness(hdrSessionSharpness);
+                    SetMonSharpness(hdrSessionSharpness);
                 }
             } else if (++hdrEnableTries >= kMaxEnableTries) {
-                // Keep hdrActive so closing the game still restores the KTC values that were sent
+                // Keep hdrActive so closing the game still restores the monitor values that were sent
                 Log("HDR enable still failing — giving up for this session");
                 hdrEnablePending = false;
                 hdrEnableTries = 0;
@@ -1839,104 +2246,57 @@ static DWORD WINAPI MonitorThread(LPVOID)
                 if (cls == 0) { seen.insert(pid); continue; }      // not a game — remember
 
                 const char* base = strrchr(path.c_str(), '\\');
-
-                if (cls == 1) {
-                    // HDR game
-                    HANDLE hProc = OpenProcess(
-                        SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-                    DWORD openErr = GetLastError();
-                    if (!hProc) {
-                        // Retry next tick (don't burn into 'seen'), but give up if it never opens
-                        int fails = ++openFails[pid];
-                        if (fails == 1)
-                            Log("Cannot open process %s (PID %lu, err=%lu) — will retry",
-                                base ? base + 1 : path.c_str(), pid, openErr);
-                        if (fails >= kMaxOpenFails) {
-                            Log("Giving up on %s (PID %lu) after %d failed open attempts",
-                                base ? base + 1 : path.c_str(), pid, fails);
-                            seen.insert(pid);
-                            openFails.erase(pid);
-                        }
-                        continue;
+                HANDLE hProc = OpenProcess(
+                    SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+                DWORD openErr = GetLastError();
+                if (!hProc) {
+                    // Retry next tick (don't burn into 'seen'), but give up if it never opens
+                    int fails = ++openFails[pid];
+                    if (fails == 1)
+                        Log("Cannot open process %s (PID %lu, err=%lu) — will retry",
+                            base ? base + 1 : path.c_str(), pid, openErr);
+                    if (fails >= kMaxOpenFails) {
+                        Log("Giving up on %s (PID %lu) after %d failed open attempts",
+                            base ? base + 1 : path.c_str(), pid, fails);
+                        seen.insert(pid);
+                        openFails.erase(pid);
                     }
-                    openFails.erase(pid);
-                    Log("Game detected: %s (PID %lu)", base ? base + 1 : path.c_str(), pid);
-
-                    if (games.empty()) {
-                        // The game's own values (the desktop's if its profile was removed since classification)
-                        GameProfile prof = ProfileOrDesktop(path);
-                        EnterCriticalSection(&g_cfgLock);
-                        strncpy_s(g_hdrSource, base ? base + 1 : path.c_str(), _TRUNCATE);
-                        LeaveCriticalSection(&g_cfgLock);
-
-                        // Enable HDR
-                        Log("Enabling HDR...");
-                        bool noDisplay = false;
-                        bool ok = SetHDRRetry(true, &noDisplay);
-                        if (noDisplay) {
-                            // KTC off or in a non-HDR mode: nothing to enable, nothing to restore later.
-                            // The game still goes into 'games' below so it is not classified again.
-                            Log("No KTC HDR display active — HDR not enabled for this game");
-                        } else {
-                            Log("HDR %s", ok ? "ENABLED" : "enable FAILED after retries");
-                            // On failure keep retrying from the main loop (see "late retry")
-                            hdrEnablePending     = !ok;
-                            hdrEnableLastTry     = GetTickCount64();
-                            hdrEnableTries       = 0;
-                            hdrSessionSharpness  = prof.sharpness;
-
-                            // Local dimming after HDR (KTC proprietary VCP — survives mode switch).
-                            // No brightness: in HDR mode the monitor drives it.
-                            SetKTCLocalDimming(prof.localDimming);
-                            // Sharpness: VCP 0x87 gets reset by HDR mode switch.
-                            // Wait for monitor to stabilize, then send.
-                            if (prof.sharpness >= 0) {
-                                Sleep(500);
-                                SetKTCSharpness(prof.sharpness);
-                            }
-
-                            sdrDimmingActive = false;  // HDR takes precedence
-                            hdrActive = true;
-                            // Orange icon only once HDR is really on; a pending enable sends it on late success
-                            if (ok && g_trayWnd) PostMessage(g_trayWnd, WM_HDRSTATUS, 1, 0);
-                        }
-                    }
-                    games[pid] = hProc;
-
-                } else if (cls == -1) {
-                    // SDR game
-                    HANDLE hProc = OpenProcess(
-                        SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-                    DWORD openErr = GetLastError();
-                    if (!hProc) {
-                        // Retry next tick (don't burn into 'seen'), but give up if it never opens
-                        int fails = ++openFails[pid];
-                        if (fails == 1)
-                            Log("Cannot open process %s (PID %lu, err=%lu) — will retry",
-                                base ? base + 1 : path.c_str(), pid, openErr);
-                        if (fails >= kMaxOpenFails) {
-                            Log("Giving up on %s (PID %lu) after %d failed open attempts",
-                                base ? base + 1 : path.c_str(), pid, fails);
-                            seen.insert(pid);
-                            openFails.erase(pid);
-                        }
-                        continue;
-                    }
-                    openFails.erase(pid);
-                    Log("SDR game detected: %s (PID %lu)", base ? base + 1 : path.c_str(), pid);
-
-                    if (sdrGames.empty() && !hdrActive) {
-                        // Browser HDR video on: track the game but leave the monitor to the video
-                        // (patch until browser video and games are unified)
-                        if (!g_browserHdrOn) ApplyProfileValues(ProfileOrDesktop(path), true, false);
-                        sdrDimmingActive = true;
-                    }
-                    sdrGames[pid] = hProc;
+                    continue;
                 }
+                openFails.erase(pid);
+                track(pid, hProc, path, cls);
 
             } while (Process32Next(snap, &pe));
         }
         CloseHandle(snap);
+
+        // --- Web apps with a profile: their window plays the part of the process ---
+        if (++webTick >= 10) {
+            webTick = 0;
+            // Entries no longer tracked (window closed, or dropped by a profile change): forget them
+            for (auto it = webApps.begin(); it != webApps.end(); )
+                if (!games.count(it->first) && !sdrGames.count(it->first)) it = webApps.erase(it);
+                else ++it;
+            std::set<std::string> open = OpenWebAppIds();
+            // Window gone: signal its event, the "exited" checks above end it like a closed game
+            for (auto& w : webApps)
+                if (!open.count(w.second.id)) SetEvent(w.second.ev);
+            for (auto& id : open) {
+                bool tracked = false;
+                for (auto& w : webApps) if (w.second.id == id) { tracked = true; break; }
+                if (tracked) continue;
+                int cls = ClassifyProcess(id);
+                if (cls == 0) continue;
+                HANDLE ev = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+                if (!ev) continue;
+                DWORD pid = nextWebPid;
+                nextWebPid += 2;
+                WebApp w = { id, ev };
+                webApps[pid] = w;
+                g_webAppIds[ev] = id;
+                track(pid, ev, id, cls);
+            }
+        }
 
         // --- All SDR games closed ---
         // After the scan on purpose: a game whose profile just changed to HDR is detected above
@@ -1954,7 +2314,7 @@ static DWORD WINAPI MonitorThread(LPVOID)
         }
 
         // First completed scan: if HDR was left on by a previous run (app killed,
-        // shutdown) and no game is running, turn it off once. The KTC values of the SDR game that
+        // shutdown) and no game is running, turn it off once. The monitor values of the SDR game that
         // is open (or the desktop's) are sent afterwards, since the switch resets sharpness.
         if (!startupChecked) {
             startupChecked = true;
@@ -1984,7 +2344,7 @@ static DWORD WINAPI MonitorThread(LPVOID)
                     desktopSeen = dg;
                 }
                 // Otherwise (e.g. an HDR game is tracked but HDR never came on because there is no
-                // KTC HDR display) the change stays pending and goes out as soon as nothing is
+                // supported HDR display) the change stays pending and goes out as soon as nothing is
                 // tracked. No DDC traffic meanwhile: the send condition above is simply false.
             }
         }
@@ -2005,8 +2365,9 @@ static DWORD WINAPI MonitorThread(LPVOID)
     } else if (sdrDimmingActive) {
         ApplyDesktopValues(false);
     }
-    for (auto& kv : games)    CloseHandle(kv.second);
-    for (auto& kv : sdrGames) CloseHandle(kv.second);
+    for (auto& kv : games)    CloseTracked(kv.second);
+    for (auto& kv : sdrGames) CloseTracked(kv.second);
+    CoUninitialize();
     Log("Monitor stopped");
     return 0;
 }
@@ -2212,6 +2573,11 @@ cleanup:
 #define ID_VIDEO_SHARP    325
 #define ID_DESK_DIM_0     330   // 330-334: desktop Local Dimming Don't change/Auto/Low/Std/High
 #define ID_VIDEO_DIM_0    340   // 340-344: same for HDR video in a browser
+#define ID_DESK_CONTRAST  326   // ASUS desktop settings
+#define ID_DESK_SAT       327
+#define ID_DESK_PIC_0     350   // 350-359: picture mode Don't change + kAsusPicModes
+#define ID_DESK_GAMMA_0   360   // 360-365: gamma Don't change + kAsusGammas
+#define ID_DESK_CT_0      370   // 370-378: color temperature Don't change + kAsusColorTemps
 
 #define ID_VIDEO_BROWSER  314
 
@@ -2301,9 +2667,9 @@ static void CheckBrowserHDR()
             return;
         }
         // Local dimming after HDR (KTC proprietary VCP — survives mode switch)
-        SetKTCLocalDimming(dimming);
+        SetMonLocalDimming(dimming);
         // Sharpness: VCP 0x87 gets reset by HDR mode switch; wait then send
-        if (sharpVideo >= 0) { Sleep(500); SetKTCSharpness(sharpVideo); }
+        if (sharpVideo >= 0) { Sleep(500); SetMonSharpness(sharpVideo); }
         EnterCriticalSection(&g_cfgLock);
         strncpy_s(g_hdrSource, "Browser", _TRUNCATE);
         LeaveCriticalSection(&g_cfgLock);
@@ -2447,6 +2813,75 @@ static void ShowSharpnessDialog(const char* title, int* value, bool desktop = fa
 }
 
 // =============================================================================
+// Value combos shared by the dialogs
+// =============================================================================
+// Editable combo for a 0..maxV value that may also be "Don't change" (-1): the list offers
+// "Don't change" and 0, 10 ... maxV, and any other number can be typed in
+static HWND CreateKeepValueCombo(HWND parent, int id, int x, int y, int w, int listH,
+                                 int value, int maxV, HFONT font)
+{
+    HWND h = CreateWindowExA(0, "COMBOBOX", nullptr,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWN | WS_VSCROLL,
+        x, y, w, listH, parent, (HMENU)(INT_PTR)id, nullptr, nullptr);
+    SendMessageA(h, WM_SETFONT, (WPARAM)font, FALSE);
+    SendMessageA(h, CB_ADDSTRING, 0, (LPARAM)L->ktcKeep);
+    for (int v = 0; v <= maxV; v += 10) {
+        char b[8]; snprintf(b, sizeof(b), "%d", v);
+        SendMessageA(h, CB_ADDSTRING, 0, (LPARAM)b);
+    }
+    char b[64];
+    if (value < 0) snprintf(b, sizeof(b), "%s", L->ktcKeep);
+    else           snprintf(b, sizeof(b), "%d", value);
+    SetWindowTextA(h, b);
+    return h;
+}
+
+// Value of a CreateKeepValueCombo: -1 for "Don't change" (or an empty field), otherwise the
+// number clamped to 0..maxV. False if the text is not a number.
+static bool ReadKeepValueCombo(HWND h, int maxV, int& out)
+{
+    char b[64] = {};
+    GetWindowTextA(h, b, sizeof(b));
+    const char* t = b;
+    while (*t == ' ' || *t == '\t') t++;
+    if (!*t || !strcmp(t, L->ktcKeep)) { out = -1; return true; }
+    int v = 0;
+    if (!ParseIntField(t, v)) return false;
+    if (v < 0)    v = 0;
+    if (v > maxV) v = maxV;
+    out = v;
+    return true;
+}
+
+// Drop-down list with "Don't change" (-1) and the values of a table
+static HWND CreateTableCombo(HWND parent, int id, int x, int y, int w, int listH,
+                             const NamedValue* t, size_t n, int value, HFONT font)
+{
+    HWND h = CreateWindowExA(0, "COMBOBOX", nullptr,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+        x, y, w, listH, parent, (HMENU)(INT_PTR)id, nullptr, nullptr);
+    SendMessageA(h, WM_SETFONT, (WPARAM)font, FALSE);
+    int idx = (int)SendMessageA(h, CB_ADDSTRING, 0, (LPARAM)L->ktcKeep);
+    SendMessageA(h, CB_SETITEMDATA, idx, (LPARAM)(DWORD)-1);
+    int sel = idx;
+    for (size_t i = 0; i < n; i++) {
+        idx = (int)SendMessageA(h, CB_ADDSTRING, 0, (LPARAM)(L == &kES ? t[i].es : t[i].en));
+        SendMessageA(h, CB_SETITEMDATA, idx, (LPARAM)(DWORD)t[i].value);
+        if (t[i].value == value) sel = idx;
+    }
+    SendMessageA(h, CB_SETCURSEL, sel, 0);
+    return h;
+}
+
+// Value selected in a CreateTableCombo (-1 = "Don't change"); 'keep' if nothing is selected
+static int ReadTableCombo(HWND h, int keep)
+{
+    int sel = (int)SendMessageA(h, CB_GETCURSEL, 0, 0);
+    if (sel == CB_ERR) return keep;
+    return (int)(DWORD)SendMessageA(h, CB_GETITEMDATA, sel, 0);
+}
+
+// =============================================================================
 // Numeric input dialog (generic, e.g. brightness 0-100)
 // =============================================================================
 #define IDC_NUM_EDIT   430
@@ -2454,7 +2889,8 @@ static void ShowSharpnessDialog(const char* title, int* value, bool desktop = fa
 #define IDC_NUM_OK     432
 #define IDC_NUM_CANCEL 433
 
-struct NumDlgData { int* value; int minV; int maxV; bool desktop; HFONT hFont; };
+// allowKeep: the value may also be "Don't change" (-1); an editable combo replaces the spin box
+struct NumDlgData { int* value; int minV; int maxV; bool desktop; bool allowKeep; HFONT hFont; };
 
 static LRESULT CALLBACK NumDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
@@ -2481,19 +2917,24 @@ static LRESULT CALLBACK NumDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             WS_CHILD | WS_VISIBLE, gap, gap + S(4), lw, S(20), hwnd, nullptr, nullptr, nullptr);
         SendMessageA(hLbl, WM_SETFONT, (WPARAM)d->hFont, FALSE);
 
-        HWND hEdit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", nullptr,
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER,
-            gap + lw + gap, gap, ew, S(22), hwnd, (HMENU)IDC_NUM_EDIT, nullptr, nullptr);
-        SendMessageA(hEdit, WM_SETFONT, (WPARAM)d->hFont, FALSE);
-        char buf[8]; snprintf(buf, sizeof(buf), "%d", *d->value);
-        SetWindowTextA(hEdit, buf);
+        if (d->allowKeep) {
+            CreateKeepValueCombo(hwnd, IDC_NUM_EDIT, gap + lw + gap, gap, S(110), S(220),
+                                 *d->value, d->maxV, d->hFont);
+        } else {
+            HWND hEdit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", nullptr,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER,
+                gap + lw + gap, gap, ew, S(22), hwnd, (HMENU)IDC_NUM_EDIT, nullptr, nullptr);
+            SendMessageA(hEdit, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+            char buf[8]; snprintf(buf, sizeof(buf), "%d", *d->value);
+            SetWindowTextA(hEdit, buf);
 
-        HWND hSpin = CreateWindowExA(0, UPDOWN_CLASSA, nullptr,
-            WS_CHILD | WS_VISIBLE | UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS,
-            0, 0, sw, S(22), hwnd, (HMENU)IDC_NUM_SPIN, nullptr, nullptr);
-        SendMessageA(hSpin, UDM_SETBUDDY,  (WPARAM)hEdit, 0);
-        SendMessageA(hSpin, UDM_SETRANGE32, d->minV, d->maxV);
-        SendMessageA(hSpin, UDM_SETPOS32,   0, *d->value);
+            HWND hSpin = CreateWindowExA(0, UPDOWN_CLASSA, nullptr,
+                WS_CHILD | WS_VISIBLE | UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS,
+                0, 0, sw, S(22), hwnd, (HMENU)IDC_NUM_SPIN, nullptr, nullptr);
+            SendMessageA(hSpin, UDM_SETBUDDY,  (WPARAM)hEdit, 0);
+            SendMessageA(hSpin, UDM_SETRANGE32, d->minV, d->maxV);
+            SendMessageA(hSpin, UDM_SETPOS32,   0, *d->value);
+        }
 
         int y2 = gap + S(36);
         HWND hOk  = CreateWindowA("BUTTON", L->btnOk, WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
@@ -2506,6 +2947,21 @@ static LRESULT CALLBACK NumDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     case WM_COMMAND:
         if (LOWORD(wp) == IDC_NUM_OK) {
+            if (d->allowKeep) {
+                int v = -1;
+                if (!ReadKeepValueCombo(GetDlgItem(hwnd, IDC_NUM_EDIT), d->maxV, v)) {
+                    MessageBeep(MB_ICONWARNING);  // not a number: let the user fix it
+                    SetFocus(GetDlgItem(hwnd, IDC_NUM_EDIT));
+                    return 0;
+                }
+                EnterCriticalSection(&g_cfgLock);
+                *d->value = v;
+                LeaveCriticalSection(&g_cfgLock);
+                SaveConfig();
+                if (d->desktop) DesktopSettingsChanged();
+                DestroyWindow(hwnd);
+                return 0;
+            }
             char buf[16] = {};
             GetWindowTextA(GetDlgItem(hwnd, IDC_NUM_EDIT), buf, sizeof(buf));
             if (buf[0]) {  // empty field: keep the current value (atoi("") would store 0)
@@ -2532,15 +2988,16 @@ static LRESULT CALLBACK NumDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcA(hwnd, msg, wp, lp);
 }
 
-static void ShowNumDialog(const char* title, int* value, int minV, int maxV, bool desktop = false)
+static void ShowNumDialog(const char* title, int* value, int minV, int maxV, bool desktop = false,
+                          bool allowKeep = false)
 {
-    NumDlgData* data = new NumDlgData{value, minV, maxV, desktop, nullptr};
+    NumDlgData* data = new NumDlgData{value, minV, maxV, desktop, allowKeep, nullptr};
     HINSTANCE hInst = (HINSTANCE)GetModuleHandleA(nullptr);
 
     typedef UINT(WINAPI* PFN_GetDpiForSystem)();
     static auto pfnDpiSys = (PFN_GetDpiForSystem)GetProcAddress(GetModuleHandleA("user32.dll"), "GetDpiForSystem");
     UINT dpi = pfnDpiSys ? pfnDpiSys() : 96;
-    int W = MulDiv(280, (int)dpi, 96);
+    int W = MulDiv(allowKeep ? 300 : 280, (int)dpi, 96);
     int H = MulDiv(110, (int)dpi, 96);
 
     HWND hw = CreateWindowExA(
@@ -2564,23 +3021,53 @@ static void ShowNumDialog(const char* title, int* value, int minV, int maxV, boo
 #define IDC_PROF_BRIGHT_LABEL  415
 #define IDC_PROF_BRIGHT_EDIT   416
 #define IDC_PROF_BRIGHT_SPIN   417
+#define IDC_PROF_PIC_LABEL     440   // ASUS rows: label + combo each
+#define IDC_PROF_PIC_COMBO     441
+#define IDC_PROF_CON_LABEL     442
+#define IDC_PROF_CON_COMBO     443
+#define IDC_PROF_SAT_LABEL     444
+#define IDC_PROF_SAT_COMBO     445
+#define IDC_PROF_GAM_LABEL     446
+#define IDC_PROF_GAM_COMBO     447
+#define IDC_PROF_CT_LABEL      448
+#define IDC_PROF_CT_COMBO      449
+#define IDC_PROF_BYNAME_CHECK  452
 
 struct ProfEditData {
-    int  dimming;
-    int  sharpness;
-    int  brightness;
-    bool hdr;
-    bool ok;
+    GameProfile p;      // values being edited
+    int   kinds;        // ConnectedMonitorKinds(): which settings the dialog shows
+    int   entryKind;    // 0 = full path (can switch to name), 1 = name only, 2 = folder (no option)
+    bool  byName;       // "by executable name only" box
+    bool  ok;
     HFONT hFont;
 };
 
-// Brightness only matters to SDR games: grey the field out while the HDR box is checked
-static void ProfEditUpdateBrightness(HWND hwnd)
+// Settings shown for the connected monitors. With no supported monitor connected the dialog
+// and the menus show the KTC ones (the original model).
+static bool ShowsKtcSettings(int kinds)  { return (kinds & MON_KTC) != 0 || kinds == 0; }
+static bool ShowsAsusSettings(int kinds) { return (kinds & MON_ASUS) != 0; }
+
+// Rows under the HDR box: sharpness and brightness always, KTC dimming, five ASUS settings
+static int ProfEditRows(int kinds)
+{
+    return 2 + (ShowsKtcSettings(kinds) ? 1 : 0) + (ShowsAsusSettings(kinds) ? 5 : 0);
+}
+
+// SDR-only settings (brightness and the ASUS ones) are greyed out while the HDR box is
+// checked: with HDR on only dimming and sharpness are sent
+static void ProfEditUpdateSdrFields(HWND hwnd)
 {
     BOOL on = SendDlgItemMessageA(hwnd, IDC_PROF_HDR_CHECK, BM_GETCHECK, 0, 0) != BST_CHECKED;
-    EnableWindow(GetDlgItem(hwnd, IDC_PROF_BRIGHT_LABEL), on);
-    EnableWindow(GetDlgItem(hwnd, IDC_PROF_BRIGHT_EDIT),  on);
-    EnableWindow(GetDlgItem(hwnd, IDC_PROF_BRIGHT_SPIN),  on);
+    static const int kSdrIds[] = {
+        IDC_PROF_BRIGHT_LABEL, IDC_PROF_BRIGHT_EDIT, IDC_PROF_BRIGHT_SPIN,
+        IDC_PROF_PIC_LABEL, IDC_PROF_PIC_COMBO, IDC_PROF_CON_LABEL, IDC_PROF_CON_COMBO,
+        IDC_PROF_SAT_LABEL, IDC_PROF_SAT_COMBO, IDC_PROF_GAM_LABEL, IDC_PROF_GAM_COMBO,
+        IDC_PROF_CT_LABEL, IDC_PROF_CT_COMBO
+    };
+    for (int id : kSdrIds) {
+        HWND h = GetDlgItem(hwnd, id);
+        if (h) EnableWindow(h, on);
+    }
 }
 
 static LRESULT CALLBACK ProfEditDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -2600,7 +3087,8 @@ static LRESULT CALLBACK ProfEditDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         SystemParametersInfoA(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
         d->hFont = CreateFontIndirectA(&ncm.lfMessageFont);
 
-        int gap = S(8), bw = S(80), bh = S(26), lw = S(130), cw = S(150), ew = S(60), sw = S(18);
+        int gap = S(8), bw = S(80), bh = S(26), lw = S(150), cw = S(150), ew = S(60), sw = S(18);
+        const int cx = gap + lw + gap;  // x of the value controls
 
         // Row 0 — HDR on/off for this game
         RECT rc; GetClientRect(hwnd, &rc);
@@ -2608,38 +3096,52 @@ static LRESULT CALLBACK ProfEditDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
             gap, gap, rc.right - gap * 2, S(22), hwnd, (HMENU)IDC_PROF_HDR_CHECK, nullptr, nullptr);
         SendMessageA(hHdr, WM_SETFONT, (WPARAM)d->hFont, FALSE);
-        SendMessageA(hHdr, BM_SETCHECK, d->hdr ? BST_CHECKED : BST_UNCHECKED, 0);
+        SendMessageA(hHdr, BM_SETCHECK, d->p.hdr ? BST_CHECKED : BST_UNCHECKED, 0);
 
-        // Row 1 — Local Dimming
-        int row1 = gap + S(30);
-        HWND hL1 = CreateWindowA("STATIC", L->profDimField,
-            WS_CHILD | WS_VISIBLE, gap, row1 + S(4), lw, S(20), hwnd, nullptr, nullptr, nullptr);
-        SendMessageA(hL1, WM_SETFONT, (WPARAM)d->hFont, FALSE);
-        HWND hC1 = CreateWindowExA(0, "COMBOBOX", nullptr,
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
-            gap + lw + gap, row1, cw, S(160), hwnd, (HMENU)IDC_PROF_DIM_COMBO, nullptr, nullptr);
-        SendMessageA(hC1, WM_SETFONT, (WPARAM)d->hFont, FALSE);
-        {
+        int y = gap + S(30);
+        // Row 0b — match by executable name only. A name profile has no path to go back to
+        // (box checked and locked); folder profiles (only from the .ini) do not get the box.
+        if (d->entryKind != 2) {
+            HWND hBn = CreateWindowA("BUTTON", L->profByName,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                gap, y, rc.right - gap * 2, S(22), hwnd, (HMENU)IDC_PROF_BYNAME_CHECK, nullptr, nullptr);
+            SendMessageA(hBn, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+            SendMessageA(hBn, BM_SETCHECK, d->byName ? BST_CHECKED : BST_UNCHECKED, 0);
+            if (d->entryKind == 1) EnableWindow(hBn, FALSE);
+            y += S(30);
+        }
+        auto label = [&](const char* text, int id) {
+            HWND h = CreateWindowA("STATIC", text, WS_CHILD | WS_VISIBLE,
+                gap, y + S(4), lw, S(20), hwnd, (HMENU)(INT_PTR)id, nullptr, nullptr);
+            SendMessageA(h, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+        };
+        char lbl[96];
+
+        // Local Dimming (KTC)
+        if (ShowsKtcSettings(d->kinds)) {
+            label(L->profDimField, 0);
+            HWND hC1 = CreateWindowExA(0, "COMBOBOX", nullptr,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+                cx, y, cw, S(160), hwnd, (HMENU)IDC_PROF_DIM_COMBO, nullptr, nullptr);
+            SendMessageA(hC1, WM_SETFONT, (WPARAM)d->hFont, FALSE);
             const char* const dimLabels[] = { L->ktcKeep, L->ktcAuto, L->ktcLow, L->ktcStd, L->ktcHigh };
             int selDim = 1;  // Auto
             for (int i = 0; i < 5; i++) {
                 int idx = (int)SendMessageA(hC1, CB_ADDSTRING, 0, (LPARAM)dimLabels[i]);
                 SendMessageA(hC1, CB_SETITEMDATA, idx, (LPARAM)(DWORD)i);
-                if (i == d->dimming) selDim = idx;
+                if (i == d->p.localDimming) selDim = idx;
             }
             SendMessageA(hC1, CB_SETCURSEL, selDim, 0);
+            y += S(36);
         }
 
-        // Row 2 — Sharpness
-        int row2 = row1 + S(36);
-        HWND hL2 = CreateWindowA("STATIC", L->profSharpShort,
-            WS_CHILD | WS_VISIBLE, gap, row2 + S(4), lw, S(20), hwnd, nullptr, nullptr, nullptr);
-        SendMessageA(hL2, WM_SETFONT, (WPARAM)d->hFont, FALSE);
-        HWND hC2 = CreateWindowExA(0, "COMBOBOX", nullptr,
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
-            gap + lw + gap, row2, cw, S(220), hwnd, (HMENU)IDC_PROF_SHARP_COMBO, nullptr, nullptr);
-        SendMessageA(hC2, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+        // Sharpness (both monitors, also with HDR)
         {
+            label(L->profSharpShort, 0);
+            HWND hC2 = CreateWindowExA(0, "COMBOBOX", nullptr,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+                cx, y, cw, S(220), hwnd, (HMENU)IDC_PROF_SHARP_COMBO, nullptr, nullptr);
+            SendMessageA(hC2, WM_SETFONT, (WPARAM)d->hFont, FALSE);
             // "Don't change" (-1: send nothing to the monitor), then 0 .. 10
             int idxOff = (int)SendMessageA(hC2, CB_ADDSTRING, 0, (LPARAM)L->ktcKeep);
             SendMessageA(hC2, CB_SETITEMDATA, idxOff, (LPARAM)(DWORD)-1);
@@ -2648,49 +3150,85 @@ static LRESULT CALLBACK ProfEditDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
                 char buf[8]; snprintf(buf, sizeof(buf), "%d", v);
                 int idx = (int)SendMessageA(hC2, CB_ADDSTRING, 0, (LPARAM)buf);
                 SendMessageA(hC2, CB_SETITEMDATA, idx, (LPARAM)(DWORD)v);
-                if (v == d->sharpness) selSharp = idx;
+                if (v == d->p.sharpness) selSharp = idx;
             }
             SendMessageA(hC2, CB_SETCURSEL, selSharp, 0);
+            y += S(36);
         }
 
-        // Row 3 — Brightness (SDR games only)
-        int row3 = row2 + S(36);
-        HWND hL3 = CreateWindowA("STATIC", L->profBrightField,
-            WS_CHILD | WS_VISIBLE, gap, row3 + S(4), lw, S(20), hwnd, (HMENU)IDC_PROF_BRIGHT_LABEL, nullptr, nullptr);
-        SendMessageA(hL3, WM_SETFONT, (WPARAM)d->hFont, FALSE);
-        HWND hE3 = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", nullptr,
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER,
-            gap + lw + gap, row3, ew, S(22), hwnd, (HMENU)IDC_PROF_BRIGHT_EDIT, nullptr, nullptr);
-        SendMessageA(hE3, WM_SETFONT, (WPARAM)d->hFont, FALSE);
-        SendMessageA(hE3, EM_LIMITTEXT, 3, 0);
-        HWND hSp = CreateWindowExA(0, UPDOWN_CLASSA, nullptr,
-            WS_CHILD | WS_VISIBLE | UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS,
-            0, 0, sw, S(22), hwnd, (HMENU)IDC_PROF_BRIGHT_SPIN, nullptr, nullptr);
-        SendMessageA(hSp, UDM_SETBUDDY,   (WPARAM)hE3, 0);
-        SendMessageA(hSp, UDM_SETRANGE32, 0, 100);
-        SendMessageA(hSp, UDM_SETPOS32,   0, d->brightness);
+        // Picture mode (ASUS, SDR only) — before the values it reloads
+        if (ShowsAsusSettings(d->kinds)) {
+            snprintf(lbl, sizeof(lbl), "%s:", L->menuPicMode);
+            label(lbl, IDC_PROF_PIC_LABEL);
+            CreateTableCombo(hwnd, IDC_PROF_PIC_COMBO, cx, y, cw, S(260),
+                             kAsusPicModes, COUNT_OF(kAsusPicModes), d->p.pictureMode, d->hFont);
+            y += S(36);
+        }
 
-        int y4 = row3 + S(36);
+        // Brightness (SDR only)
+        {
+            label(L->profBrightField, IDC_PROF_BRIGHT_LABEL);
+            HWND hE3 = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", nullptr,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER,
+                cx, y, ew, S(22), hwnd, (HMENU)IDC_PROF_BRIGHT_EDIT, nullptr, nullptr);
+            SendMessageA(hE3, WM_SETFONT, (WPARAM)d->hFont, FALSE);
+            SendMessageA(hE3, EM_LIMITTEXT, 3, 0);
+            HWND hSp = CreateWindowExA(0, UPDOWN_CLASSA, nullptr,
+                WS_CHILD | WS_VISIBLE | UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS,
+                0, 0, sw, S(22), hwnd, (HMENU)IDC_PROF_BRIGHT_SPIN, nullptr, nullptr);
+            SendMessageA(hSp, UDM_SETBUDDY,   (WPARAM)hE3, 0);
+            SendMessageA(hSp, UDM_SETRANGE32, 0, 100);
+            SendMessageA(hSp, UDM_SETPOS32,   0, d->p.brightness);
+            y += S(36);
+        }
+
+        // Contrast, saturation, gamma, color temperature (ASUS, SDR only)
+        if (ShowsAsusSettings(d->kinds)) {
+            snprintf(lbl, sizeof(lbl), "%s (0-100):", L->menuContrast);
+            label(lbl, IDC_PROF_CON_LABEL);
+            CreateKeepValueCombo(hwnd, IDC_PROF_CON_COMBO, cx, y, cw, S(220), d->p.contrast, 100, d->hFont);
+            y += S(36);
+            snprintf(lbl, sizeof(lbl), "%s (0-100):", L->menuSaturation);
+            label(lbl, IDC_PROF_SAT_LABEL);
+            CreateKeepValueCombo(hwnd, IDC_PROF_SAT_COMBO, cx, y, cw, S(220), d->p.saturation, 100, d->hFont);
+            y += S(36);
+            snprintf(lbl, sizeof(lbl), "%s:", L->menuGamma);
+            label(lbl, IDC_PROF_GAM_LABEL);
+            CreateTableCombo(hwnd, IDC_PROF_GAM_COMBO, cx, y, cw, S(180),
+                             kAsusGammas, COUNT_OF(kAsusGammas), d->p.gamma, d->hFont);
+            y += S(36);
+            snprintf(lbl, sizeof(lbl), "%s:", L->menuColorTemp);
+            label(lbl, IDC_PROF_CT_LABEL);
+            CreateTableCombo(hwnd, IDC_PROF_CT_COMBO, cx, y, cw, S(240),
+                             kAsusColorTemps, COUNT_OF(kAsusColorTemps), d->p.colorTemp, d->hFont);
+            y += S(36);
+        }
+
         HWND hOk  = CreateWindowA("BUTTON", L->btnOk, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-            gap,              y4, bw, bh, hwnd, (HMENU)IDC_PROF_OK,     nullptr, nullptr);
+            gap,              y, bw, bh, hwnd, (HMENU)IDC_PROF_OK,     nullptr, nullptr);
         HWND hCan = CreateWindowA("BUTTON", L->btnCancel, WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            gap + bw + gap,   y4, bw, bh, hwnd, (HMENU)IDC_PROF_CANCEL, nullptr, nullptr);
+            gap + bw + gap,   y, bw, bh, hwnd, (HMENU)IDC_PROF_CANCEL, nullptr, nullptr);
         SendMessageA(hOk,  WM_SETFONT, (WPARAM)d->hFont, FALSE);
         SendMessageA(hCan, WM_SETFONT, (WPARAM)d->hFont, FALSE);
 
-        ProfEditUpdateBrightness(hwnd);
+        ProfEditUpdateSdrFields(hwnd);
         return 0;
     }
     case WM_COMMAND:
         if (LOWORD(wp) == IDC_PROF_HDR_CHECK) {
-            ProfEditUpdateBrightness(hwnd);
+            ProfEditUpdateSdrFields(hwnd);
         } else if (LOWORD(wp) == IDC_PROF_OK || LOWORD(wp) == IDOK) {  // IDOK: Enter via IsDialogMessage
-            HWND hC1 = GetDlgItem(hwnd, IDC_PROF_DIM_COMBO);
-            HWND hC2 = GetDlgItem(hwnd, IDC_PROF_SHARP_COMBO);
-            int s1 = (int)SendMessageA(hC1, CB_GETCURSEL, 0, 0);
-            int s2 = (int)SendMessageA(hC2, CB_GETCURSEL, 0, 0);
+            GameProfile np = d->p;
             bool hdr = SendDlgItemMessageA(hwnd, IDC_PROF_HDR_CHECK, BM_GETCHECK, 0, 0) == BST_CHECKED;
-            int bright = d->brightness;  // HDR profile: brightness is not used, keep what it had
+            HWND hC1 = GetDlgItem(hwnd, IDC_PROF_DIM_COMBO);   // absent when no KTC is shown
+            if (hC1) {
+                int s1 = (int)SendMessageA(hC1, CB_GETCURSEL, 0, 0);
+                if (s1 != CB_ERR) np.localDimming = (int)(DWORD)SendMessageA(hC1, CB_GETITEMDATA, s1, 0);
+            }
+            HWND hC2 = GetDlgItem(hwnd, IDC_PROF_SHARP_COMBO);
+            int s2 = (int)SendMessageA(hC2, CB_GETCURSEL, 0, 0);
+            if (s2 != CB_ERR) np.sharpness = (int)(DWORD)SendMessageA(hC2, CB_GETITEMDATA, s2, 0);
+            // HDR profile: the SDR-only values are not used, keep what they had
             if (!hdr) {
                 char buf[16] = {};
                 GetWindowTextA(GetDlgItem(hwnd, IDC_PROF_BRIGHT_EDIT), buf, sizeof(buf));
@@ -2699,17 +3237,31 @@ static LRESULT CALLBACK ProfEditDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
                     SetFocus(GetDlgItem(hwnd, IDC_PROF_BRIGHT_EDIT));
                     return 0;
                 }
-                bright = atoi(buf);
+                int bright = atoi(buf);
                 if (bright < 0)   bright = 0;
                 if (bright > 100) bright = 100;
+                np.brightness = bright;
+                if (ShowsAsusSettings(d->kinds)) {
+                    const int keepIds[] = { IDC_PROF_CON_COMBO, IDC_PROF_SAT_COMBO };
+                    int* const keepVals[] = { &np.contrast, &np.saturation };
+                    for (int k = 0; k < 2; k++) {
+                        HWND h = GetDlgItem(hwnd, keepIds[k]);
+                        if (!ReadKeepValueCombo(h, 100, *keepVals[k])) {
+                            MessageBeep(MB_ICONWARNING);  // not a number: let the user fix it
+                            SetFocus(h);
+                            return 0;
+                        }
+                    }
+                    np.pictureMode = ReadTableCombo(GetDlgItem(hwnd, IDC_PROF_PIC_COMBO), np.pictureMode);
+                    np.gamma       = ReadTableCombo(GetDlgItem(hwnd, IDC_PROF_GAM_COMBO), np.gamma);
+                    np.colorTemp   = ReadTableCombo(GetDlgItem(hwnd, IDC_PROF_CT_COMBO),  np.colorTemp);
+                }
             }
-            if (s1 != CB_ERR && s2 != CB_ERR) {
-                d->dimming    = (int)(DWORD)SendMessageA(hC1, CB_GETITEMDATA, s1, 0);
-                d->sharpness  = (int)(DWORD)SendMessageA(hC2, CB_GETITEMDATA, s2, 0);
-                d->brightness = bright;
-                d->hdr        = hdr;
-                d->ok         = true;
-            }
+            HWND hBn = GetDlgItem(hwnd, IDC_PROF_BYNAME_CHECK);
+            if (hBn) d->byName = SendMessageA(hBn, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            np.hdr = hdr;
+            d->p   = np;
+            d->ok  = true;
             DestroyWindow(hwnd);
         } else if (LOWORD(wp) == IDC_PROF_CANCEL || LOWORD(wp) == IDCANCEL) {
             DestroyWindow(hwnd);
@@ -2723,23 +3275,29 @@ static LRESULT CALLBACK ProfEditDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
     return DefWindowProcA(hwnd, msg, wp, lp);
 }
 
-// Run ProfEditDlg modally (spin message loop until destroyed)
-static bool RunProfEditDialog(HWND parent, int& dimming, int& sharpness, int& brightness, bool& hdr)
+// Run ProfEditDlg modally (spin message loop until destroyed). 'prof' holds the starting
+// values and gets the edited ones on OK. Its exe stays as it was, except a full path whose
+// "by executable name only" box was checked: it becomes the bare executable name.
+// byName: initial state of that box for a full-path entry.
+static bool RunProfEditDialog(HWND parent, GameProfile& prof, int kinds, bool byName = false)
 {
     ProfEditData data;
-    data.dimming    = dimming;
-    data.sharpness  = sharpness;
-    data.brightness = brightness;
-    data.hdr        = hdr;
-    data.ok         = false;
-    data.hFont      = nullptr;
+    data.p     = prof;
+    data.kinds = kinds;
+    data.ok    = false;
+    data.hFont = nullptr;
+    if (!prof.exe.empty() && prof.exe.back() == '\\')        data.entryKind = 2;  // folder
+    else if (IsWebAppId(prof.exe))                           data.entryKind = 2;  // web app id
+    else if (prof.exe.find('\\') == std::string::npos)       data.entryKind = 1;  // name
+    else                                                     data.entryKind = 0;  // full path
+    data.byName = data.entryKind == 1 || (data.entryKind == 0 && byName);
 
     HINSTANCE hInst = (HINSTANCE)GetModuleHandleA(nullptr);
     typedef UINT(WINAPI* PFN_GetDpiForSystem)();
     static auto pfnDpiSys = (PFN_GetDpiForSystem)GetProcAddress(GetModuleHandleA("user32.dll"), "GetDpiForSystem");
     UINT dpi = pfnDpiSys ? pfnDpiSys() : 96;
-    int W = MulDiv(330, (int)dpi, 96);
-    int H = MulDiv(225, (int)dpi, 96);
+    int W = MulDiv(350, (int)dpi, 96);
+    int H = MulDiv(225 + (ProfEditRows(kinds) - 3) * 36 + (data.entryKind != 2 ? 30 : 0), (int)dpi, 96);
 
     HWND hw = CreateWindowExA(
         WS_EX_TOPMOST,
@@ -2768,7 +3326,11 @@ static bool RunProfEditDialog(HWND parent, int& dimming, int& sharpness, int& br
     }
     EnableWindow(parent, TRUE);
     SetForegroundWindow(parent);
-    if (data.ok) { dimming = data.dimming; sharpness = data.sharpness; brightness = data.brightness; hdr = data.hdr; }
+    if (data.ok) {
+        std::string exe = prof.exe;
+        prof = data.p;
+        prof.exe = (data.entryKind == 0 && data.byName) ? PathBase(exe) : exe;
+    }
     return data.ok;
 }
 
@@ -2800,31 +3362,57 @@ static void PopulateProfilesList(HWND lb)
 {
     SendMessageA(lb, LB_RESETCONTENT, 0, 0);
     const char* const dimNames[] = { L->ktcKeep, L->ktcAuto, L->ktcLow, L->ktcStd, L->ktcHigh };
+    const int kinds = ConnectedMonitorKinds();  // before the lock: it may need a DDC/CI probe
     EnterCriticalSection(&g_cfgLock);
     for (auto& p : g_cfg.profiles) {
         // Three entry kinds, each shown differently so two profiles never look alike:
         //   full path -> "name.exe  (c:\...\folder\)"   name only -> "name.exe  (any folder)"
         //   folder    -> "[folder] c:\games\"
         std::string name;
-        if (!p.exe.empty() && p.exe.back() == '\\') {
+        if (IsWebAppId(p.exe)) {
+            name = "[app] " + p.exe;
+        } else if (!p.exe.empty() && p.exe.back() == '\\') {
             name = std::string(L->profTagFolder) + " " + p.exe;
         } else if (p.exe.find('\\') == std::string::npos) {
             name = p.exe + "  " + L->profTagName;
         } else {
             name = PathBase(p.exe) + "  (" + AbbrevFolder(p.exe.substr(0, p.exe.size() - PathBase(p.exe).size())) + ")";
         }
-        char sharp_str[16];
-        if (p.sharpness < 0) snprintf(sharp_str, sizeof(sharp_str), "%s", L->ktcKeep);
-        else                 snprintf(sharp_str, sizeof(sharp_str), "%d", p.sharpness);
-        char entry[MAX_PATH + 256];
-        int len = snprintf(entry, sizeof(entry), "%s  [%s]  %s %s  %s %s", name.c_str(),
-                           p.hdr ? "HDR" : "SDR", L->profDimLabel,
-                           dimNames[p.localDimming >= 0 && p.localDimming <= 4 ? p.localDimming : 0],
-                           L->profSharpShort, sharp_str);
-        // Brightness only applies to SDR games
-        if (!p.hdr && len > 0 && len < (int)sizeof(entry))
-            snprintf(entry + len, sizeof(entry) - len, "  %s %d", L->profBrightShort, p.brightness);
-        SendMessageA(lb, LB_ADDSTRING, 0, (LPARAM)entry);
+        // Only the settings of the connected monitors are listed
+        char buf[96];
+        std::string entry = name + "  [" + (p.hdr ? "HDR" : "SDR") + "]";
+        if (ShowsKtcSettings(kinds))
+            entry += std::string("  ") + L->profDimLabel + " " +
+                     dimNames[p.localDimming >= 0 && p.localDimming <= 4 ? p.localDimming : 0];
+        if (p.sharpness < 0) snprintf(buf, sizeof(buf), "%s", L->ktcKeep);
+        else                 snprintf(buf, sizeof(buf), "%d", p.sharpness);
+        entry += std::string("  ") + L->profSharpShort + " " + buf;
+        // Brightness and the ASUS settings only apply to SDR games (ASUS ones only when set)
+        if (!p.hdr) {
+            snprintf(buf, sizeof(buf), "  %s %d", L->profBrightShort, p.brightness);
+            entry += buf;
+        }
+        if (!p.hdr && ShowsAsusSettings(kinds)) {
+            char num[16];
+            if (p.pictureMode >= 0)
+                entry += std::string("  ") + L->menuPicMode + ": " +
+                         NamedLabel(kAsusPicModes, COUNT_OF(kAsusPicModes), p.pictureMode, num, sizeof(num));
+            if (p.contrast >= 0) {
+                snprintf(buf, sizeof(buf), "  %s: %d", L->menuContrast, p.contrast);
+                entry += buf;
+            }
+            if (p.saturation >= 0) {
+                snprintf(buf, sizeof(buf), "  %s: %d", L->menuSaturation, p.saturation);
+                entry += buf;
+            }
+            if (p.gamma >= 0)
+                entry += std::string("  ") + L->menuGamma + ": " +
+                         NamedLabel(kAsusGammas, COUNT_OF(kAsusGammas), p.gamma, num, sizeof(num));
+            if (p.colorTemp >= 0)
+                entry += std::string("  ") + L->menuColorTemp + ": " +
+                         NamedLabel(kAsusColorTemps, COUNT_OF(kAsusColorTemps), p.colorTemp, num, sizeof(num));
+        }
+        SendMessageA(lb, LB_ADDSTRING, 0, (LPARAM)entry.c_str());
     }
     LeaveCriticalSection(&g_cfgLock);
 }
@@ -2888,46 +3476,54 @@ static LRESULT CALLBACK ProfilesDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             if (GetOpenFileNameA(&ofn)) {
                 // A profile for this exe already exists: edit it instead of adding a duplicate
                 std::string exe = ToLower(std::string(path));
-                // New profiles start with HDR on and inherit the desktop (general) monitor
-                // values as a base: dimming, sharpness and brightness. The user edits from there.
-                int dimming = 1, sharpness = 6, brightness = 100;
-                bool hdr = true;
-                bool sameExe = false;
-                EnterCriticalSection(&g_cfgLock);
-                dimming    = g_cfg.ktcDimmingDesktop;
-                sharpness  = g_cfg.ktcSharpnessDesktop;
-                brightness = g_cfg.ktcBrightnessDesktop;
-                for (auto& q : g_cfg.profiles)
-                    if (q.exe == exe) {
-                        dimming = q.localDimming; sharpness = q.sharpness; brightness = q.brightness;
-                        hdr = q.hdr; sameExe = true; break;
-                    }
-                LeaveCriticalSection(&g_cfgLock);
-                if (!sameExe) {
-                    // No profile for this exact path, but a name or folder profile already covers it:
-                    // start from its values (OK creates a new, more specific full-path profile)
-                    GameProfile cover;
-                    if (FindProfile(exe, cover)) {
-                        dimming = cover.localDimming; sharpness = cover.sharpness;
-                        brightness = cover.brightness; hdr = cover.hdr;
+                // A Store web app (e.g. Prime Video): its exe only launches it inside Edge, so the
+                // profile goes by the app's window id instead
+                {
+                    std::string appId = WebAppIdForExe(exe);
+                    if (!appId.empty()) {
+                        Log("Profiles: %s is a web app — profile by window id %s", exe.c_str(), appId.c_str());
+                        exe = appId;
                     }
                 }
-                if (RunProfEditDialog(hwnd, dimming, sharpness, brightness, hdr)) {
+                // New profiles start with HDR on and inherit the desktop (general) monitor
+                // values as a base (all of them). The user edits from there.
+                GameProfile edit = DesktopProfile();
+                edit.hdr = true;
+                bool sameExe = false;
+                EnterCriticalSection(&g_cfgLock);
+                for (auto& q : g_cfg.profiles)
+                    if (q.exe == exe) { edit = q; sameExe = true; break; }
+                LeaveCriticalSection(&g_cfgLock);
+                bool coverByName = false;
+                if (!sameExe) {
+                    // No profile for this exact path, but a name or folder profile already covers it:
+                    // start from its values (OK creates a new, more specific full-path profile, or
+                    // edits the name profile if the "by name" box stays checked)
+                    GameProfile cover;
+                    if (FindProfile(exe, cover)) {
+                        edit = cover;
+                        coverByName = cover.exe.find('\\') == std::string::npos;
+                    }
+                }
+                edit.exe = exe;
+                // On OK edit.exe is the full path, or the bare executable name ("by name" checked)
+                if (RunProfEditDialog(hwnd, edit, ConnectedMonitorKinds(), coverByName)) {
                     int idx = -1;
                     EnterCriticalSection(&g_cfgLock);
+                    // Switched to "by name": a full-path profile for this exe would win over the
+                    // name one, so the name profile replaces it
+                    if (edit.exe != exe)
+                        for (size_t i = 0; i < g_cfg.profiles.size(); i++)
+                            if (g_cfg.profiles[i].exe == exe) { g_cfg.profiles.erase(g_cfg.profiles.begin() + i); break; }
                     // Look again: the list may have changed while the dialog was open
                     for (size_t i = 0; i < g_cfg.profiles.size(); i++)
-                        if (g_cfg.profiles[i].exe == exe) { idx = (int)i; break; }
+                        if (g_cfg.profiles[i].exe == edit.exe) { idx = (int)i; break; }
                     if (idx < 0) {
-                        GameProfile gp;
-                        gp.exe = exe;
-                        g_cfg.profiles.push_back(gp);
+                        g_cfg.profiles.push_back(edit);
                         idx = (int)g_cfg.profiles.size() - 1;
+                    } else {
+                        g_cfg.profiles[idx] = edit;
                     }
-                    g_cfg.profiles[idx].localDimming = dimming;
-                    g_cfg.profiles[idx].sharpness    = sharpness;
-                    g_cfg.profiles[idx].brightness   = brightness;
-                    g_cfg.profiles[idx].hdr          = hdr;
                     LeaveCriticalSection(&g_cfgLock);
                     InterlockedIncrement(&g_profilesGen);
                     SaveConfig();
@@ -2941,21 +3537,25 @@ static LRESULT CALLBACK ProfilesDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             if (sel != LB_ERR) {
                 EnterCriticalSection(&g_cfgLock);
                 bool valid = sel < (int)g_cfg.profiles.size();
-                int dimming   = valid ? g_cfg.profiles[sel].localDimming : 1;
-                int sharpness = valid ? g_cfg.profiles[sel].sharpness    : -1;
-                int brightness = valid ? g_cfg.profiles[sel].brightness  : 100;
-                bool hdr      = valid ? g_cfg.profiles[sel].hdr          : true;
-                std::string exe = valid ? g_cfg.profiles[sel].exe        : std::string();
+                GameProfile edit;
+                if (valid) edit = g_cfg.profiles[sel];
                 LeaveCriticalSection(&g_cfgLock);
-                if (valid && RunProfEditDialog(hwnd, dimming, sharpness, brightness, hdr)) {
+                const std::string oldExe = edit.exe;
+                // Settings of monitors that are not connected are kept as they were
+                if (valid && RunProfEditDialog(hwnd, edit, ConnectedMonitorKinds())) {
                     EnterCriticalSection(&g_cfgLock);
                     // The list may have changed while the dialog was open (second
                     // Profiles window): only write if this is still the same entry.
-                    if (sel < (int)g_cfg.profiles.size() && g_cfg.profiles[sel].exe == exe) {
-                        g_cfg.profiles[sel].localDimming = dimming;
-                        g_cfg.profiles[sel].sharpness    = sharpness;
-                        g_cfg.profiles[sel].brightness   = brightness;
-                        g_cfg.profiles[sel].hdr          = hdr;
+                    if (sel < (int)g_cfg.profiles.size() && g_cfg.profiles[sel].exe == oldExe) {
+                        g_cfg.profiles[sel] = edit;
+                        // Switched to "by name": an older profile with that name is now a duplicate
+                        if (edit.exe != oldExe)
+                            for (size_t j = 0; j < g_cfg.profiles.size(); j++)
+                                if ((int)j != sel && g_cfg.profiles[j].exe == edit.exe) {
+                                    g_cfg.profiles.erase(g_cfg.profiles.begin() + j);
+                                    if ((int)j < sel) sel--;
+                                    break;
+                                }
                     }
                     LeaveCriticalSection(&g_cfgLock);
                     InterlockedIncrement(&g_profilesGen);
@@ -3028,6 +3628,28 @@ static HMENU BuildDimMenu(int current, int baseId)
     AppendMenuA(sub, MF_STRING | (current == 3 ? MF_CHECKED : 0u), baseId + 3, L->ktcStd);
     AppendMenuA(sub, MF_STRING | (current == 4 ? MF_CHECKED : 0u), baseId + 4, L->ktcHigh);
     return sub;
+}
+
+// Submenu for a table setting: "Don't change" (id baseId), then the table values (baseId + 1 + i)
+static HMENU BuildTableMenu(const NamedValue* t, size_t n, int current, int baseId)
+{
+    HMENU sub = CreatePopupMenu();
+    AppendMenuA(sub, MF_STRING | (current < 0 ? MF_CHECKED : 0u), baseId, L->ktcKeep);
+    AppendMenuA(sub, MF_SEPARATOR, 0, nullptr);
+    for (size_t i = 0; i < n; i++)
+        AppendMenuA(sub, MF_STRING | (t[i].value == current ? MF_CHECKED : 0u),
+                    baseId + 1 + (UINT)i, L == &kES ? t[i].es : t[i].en);
+    return sub;
+}
+
+// A table submenu item was picked (index 0 = "Don't change"): store it as a desktop value
+static void SetDesktopTableValue(int* field, const NamedValue* t, int index)
+{
+    EnterCriticalSection(&g_cfgLock);
+    *field = index == 0 ? -1 : t[index - 1].value;
+    LeaveCriticalSection(&g_cfgLock);
+    SaveConfig();
+    DesktopSettingsChanged();
 }
 
 // Sharpness value for a menu label: the number, or "Don't change" for -1 (nothing is sent)
@@ -3120,33 +3742,68 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             AppendMenuA(m, MF_SEPARATOR, 0, nullptr);
 
             int deskDim, deskSharp, deskBright, vidDim, vidSharp;
+            int deskPic, deskCon, deskSat, deskGamma, deskCt;
             bool browserHdrOn;
             EnterCriticalSection(&g_cfgLock);
             deskDim      = g_cfg.ktcDimmingDesktop;
             deskSharp    = g_cfg.ktcSharpnessDesktop;
             deskBright   = g_cfg.ktcBrightnessDesktop;
+            deskPic      = g_cfg.pictureModeDesktop;
+            deskCon      = g_cfg.contrastDesktop;
+            deskSat      = g_cfg.saturationDesktop;
+            deskGamma    = g_cfg.gammaDesktop;
+            deskCt       = g_cfg.colorTempDesktop;
             vidDim       = g_cfg.videoDimming;
             vidSharp     = g_cfg.videoSharpness;
             browserHdrOn = g_cfg.browserHdrEnabled;
             LeaveCriticalSection(&g_cfgLock);
 
-            char sharpTxt[16], lbl[96];
+            // The menus show the settings of the monitors connected now (KTC and/or ASUS)
+            const int  kinds    = ConnectedMonitorKinds();
+            const bool showKtc  = ShowsKtcSettings(kinds);
+            const bool showAsus = ShowsAsusSettings(kinds);
+
+            char sharpTxt[64], lbl[128];
 
             // Desktop submenu: what the monitor returns to when no game is running
             HMENU deskMenu = CreatePopupMenu();
-            AppendMenuA(deskMenu, MF_POPUP, (UINT_PTR)BuildDimMenu(deskDim, ID_DESK_DIM_0), L->menuLocalDimming);
+            if (showKtc)
+                AppendMenuA(deskMenu, MF_POPUP, (UINT_PTR)BuildDimMenu(deskDim, ID_DESK_DIM_0), L->menuLocalDimming);
+            if (showAsus)
+                AppendMenuA(deskMenu, MF_POPUP, (UINT_PTR)BuildTableMenu(kAsusPicModes, COUNT_OF(kAsusPicModes),
+                            deskPic, ID_DESK_PIC_0), L->menuPicMode);
+            snprintf(lbl, sizeof(lbl), "%s: %d...", L->menuBrightness, deskBright);
+            AppendMenuA(deskMenu, MF_STRING, ID_DESK_BRIGHT, lbl);
+            if (showAsus) {
+                SharpnessText(sharpTxt, sizeof(sharpTxt), deskCon);
+                snprintf(lbl, sizeof(lbl), "%s: %s...", L->menuContrast, sharpTxt);
+                AppendMenuA(deskMenu, MF_STRING, ID_DESK_CONTRAST, lbl);
+                SharpnessText(sharpTxt, sizeof(sharpTxt), deskSat);
+                snprintf(lbl, sizeof(lbl), "%s: %s...", L->menuSaturation, sharpTxt);
+                AppendMenuA(deskMenu, MF_STRING, ID_DESK_SAT, lbl);
+            }
             SharpnessText(sharpTxt, sizeof(sharpTxt), deskSharp);
             snprintf(lbl, sizeof(lbl), "%s: %s...", L->menuSharpness, sharpTxt);
             AppendMenuA(deskMenu, MF_STRING, ID_DESK_SHARP, lbl);
-            snprintf(lbl, sizeof(lbl), "%s: %d...", L->menuBrightness, deskBright);
-            AppendMenuA(deskMenu, MF_STRING, ID_DESK_BRIGHT, lbl);
-            AppendMenuA(m, MF_POPUP, (UINT_PTR)deskMenu, L->menuDesktop);
+            if (showAsus) {
+                AppendMenuA(deskMenu, MF_POPUP, (UINT_PTR)BuildTableMenu(kAsusGammas, COUNT_OF(kAsusGammas),
+                            deskGamma, ID_DESK_GAMMA_0), L->menuGamma);
+                AppendMenuA(deskMenu, MF_POPUP, (UINT_PTR)BuildTableMenu(kAsusColorTemps, COUNT_OF(kAsusColorTemps),
+                            deskCt, ID_DESK_CT_0), L->menuColorTemp);
+            }
+            // "Desktop (KTC)", "Desktop (ASUS)", "Desktop (KTC + ASUS)"; plain with none connected
+            if (kinds == (MON_KTC | MON_ASUS)) snprintf(lbl, sizeof(lbl), "%s (KTC + ASUS)", L->menuDesktop);
+            else if (kinds == MON_ASUS)        snprintf(lbl, sizeof(lbl), "%s (ASUS)", L->menuDesktop);
+            else if (kinds == MON_KTC)         snprintf(lbl, sizeof(lbl), "%s (KTC)", L->menuDesktop);
+            else                               snprintf(lbl, sizeof(lbl), "%s", L->menuDesktop);
+            AppendMenuA(m, MF_POPUP, (UINT_PTR)deskMenu, lbl);
 
             // Video submenu: HDR for fullscreen browser video and the values it uses
             HMENU videoMenu = CreatePopupMenu();
             AppendMenuA(videoMenu, MF_STRING | (browserHdrOn ? MF_CHECKED : 0u),
                         ID_VIDEO_BROWSER, L->menuVideoBrowser);
-            AppendMenuA(videoMenu, MF_POPUP, (UINT_PTR)BuildDimMenu(vidDim, ID_VIDEO_DIM_0), L->menuLocalDimming);
+            if (showKtc)
+                AppendMenuA(videoMenu, MF_POPUP, (UINT_PTR)BuildDimMenu(vidDim, ID_VIDEO_DIM_0), L->menuLocalDimming);
             SharpnessText(sharpTxt, sizeof(sharpTxt), vidSharp);
             snprintf(lbl, sizeof(lbl), "%s: %s...", L->menuSharpness, sharpTxt);
             AppendMenuA(videoMenu, MF_STRING, ID_VIDEO_SHARP, lbl);
@@ -3182,6 +3839,18 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             char title[96];
             snprintf(title, sizeof(title), "%s - %s", L->menuBrightness, L->menuDesktop);
             ShowNumDialog(title, &g_cfg.ktcBrightnessDesktop, 0, 100, true);
+            break;
+        }
+        case ID_DESK_CONTRAST: {
+            char title[96];
+            snprintf(title, sizeof(title), "%s - %s", L->menuContrast, L->menuDesktop);
+            ShowNumDialog(title, &g_cfg.contrastDesktop, 0, 100, true, true);
+            break;
+        }
+        case ID_DESK_SAT: {
+            char title[96];
+            snprintf(title, sizeof(title), "%s - %s", L->menuSaturation, L->menuDesktop);
+            ShowNumDialog(title, &g_cfg.saturationDesktop, 0, 100, true, true);
             break;
         }
         case ID_VIDEO_SHARP: {
@@ -3228,6 +3897,12 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 g_cfg.videoDimming = id - ID_VIDEO_DIM_0;
                 LeaveCriticalSection(&g_cfgLock);
                 SaveConfig();
+            } else if (id >= ID_DESK_PIC_0 && id <= ID_DESK_PIC_0 + (int)COUNT_OF(kAsusPicModes)) {
+                SetDesktopTableValue(&g_cfg.pictureModeDesktop, kAsusPicModes, id - ID_DESK_PIC_0);
+            } else if (id >= ID_DESK_GAMMA_0 && id <= ID_DESK_GAMMA_0 + (int)COUNT_OF(kAsusGammas)) {
+                SetDesktopTableValue(&g_cfg.gammaDesktop, kAsusGammas, id - ID_DESK_GAMMA_0);
+            } else if (id >= ID_DESK_CT_0 && id <= ID_DESK_CT_0 + (int)COUNT_OF(kAsusColorTemps)) {
+                SetDesktopTableValue(&g_cfg.colorTempDesktop, kAsusColorTemps, id - ID_DESK_CT_0);
             }
             break;
         }
@@ -3235,8 +3910,8 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_DISPLAYCHANGE:
-        // Monitors added/removed/reconfigured: re-evaluate which ones are KTC
-        InvalidateKTCMonitorCache();
+        // Monitors added/removed/reconfigured: re-evaluate which ones are supported (KTC / ASUS)
+        InvalidateMonitorCache();
         break;  // fall through to DefWindowProcA below
 
     case WM_DESTROY:
@@ -3277,7 +3952,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     CoInitialize(nullptr);
     DetectLang();
     InitializeCriticalSection(&g_cfgLock);
-    InitializeCriticalSection(&g_ktcCacheLock);
+    InitializeCriticalSection(&g_monCacheLock);
     OpenLog();  // before LoadConfig so the config migration can be logged
     Log("=== HDRAutostart started ===");
     LoadConfig();
@@ -3362,7 +4037,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     if (g_icoOff) DestroyIcon(g_icoOff);
     if (g_icoOn)  DestroyIcon(g_icoOn);
     ShutdownNVAPI();
-    DeleteCriticalSection(&g_ktcCacheLock);
+    DeleteCriticalSection(&g_monCacheLock);
     DeleteCriticalSection(&g_cfgLock);
     if (g_log) fclose(g_log);
     CoUninitialize();
