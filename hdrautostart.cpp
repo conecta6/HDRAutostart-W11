@@ -1273,6 +1273,48 @@ static void RestorePrimaryDisplay()
     g_othersOff       = false;
 }
 
+// Freezes / thaws every thread of a process (ntdll's NtSuspendProcess / NtResumeProcess,
+// exported since Windows XP; what Process Explorer uses)
+typedef LONG (NTAPI* NtProcessFn)(HANDLE);
+static bool SuspendResumeProcess(HANDLE h, bool suspend)
+{
+    static NtProcessFn sus = (NtProcessFn)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSuspendProcess");
+    static NtProcessFn res = (NtProcessFn)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtResumeProcess");
+    NtProcessFn f = suspend ? sus : res;
+    return f && f(h) >= 0;
+}
+
+// A game whose profile moves the primary display is frozen until the switch is done: games
+// pick their resolution from the primary display at start-up, and an HDR game is switched
+// ~2 s after it starts (HDR and monitor values first), so it opened at the old primary's
+// resolution (laptop 1080p instead of the QHD monitor). Only a process created in the last
+// few seconds: one found running at start or after a profile edit is left alone. 'h' is the
+// tracking handle (a web app's is an event: GetProcessTimes fails and nothing is frozen).
+// Returns the handle to thaw it with (SuspendResumeProcess + CloseHandle), or null.
+static HANDLE FreezeNewProcess(DWORD pid, HANDLE h, const char* name)
+{
+    FILETIME created, x1, x2, x3, now;
+    if (!GetProcessTimes(h, &created, &x1, &x2, &x3)) return nullptr;
+    GetSystemTimeAsFileTime(&now);
+    ULARGE_INTEGER c, n;
+    c.LowPart = created.dwLowDateTime; c.HighPart = created.dwHighDateTime;
+    n.LowPart = now.dwLowDateTime;     n.HighPart = now.dwHighDateTime;
+    if (n.QuadPart < c.QuadPart || n.QuadPart - c.QuadPart > 10ULL * 10000000ULL) return nullptr;  // > 10 s old
+    HANDLE s = OpenProcess(PROCESS_SUSPEND_RESUME, FALSE, pid);
+    if (!s) {
+        Log("Primary display: cannot freeze %s while switching (err=%lu) — it may start at the old resolution",
+            name, GetLastError());
+        return nullptr;
+    }
+    if (!SuspendResumeProcess(s, true)) {
+        Log("Primary display: freezing %s FAILED — it may start at the old resolution", name);
+        CloseHandle(s);
+        return nullptr;
+    }
+    Log("Primary display: %s frozen until the switch is done", name);
+    return s;
+}
+
 // At start: the app died while a game had switched the primary display. The switch was never
 // saved to the Windows display database, so re-applying the stored configuration undoes it.
 static void RecoverPrimaryDisplay()
@@ -2375,6 +2417,15 @@ static DWORD WINAPI MonitorThread(LPVOID)
         // Primary display. An HDR game switches it only after HDR is on (below): turning HDR on
         // re-applies the stored configuration and would undo a switch made before it.
         bool wantPrimary = false, wantOthersOff = false;
+        HANDLE frozen = nullptr;  // the game, frozen until the switch is done
+        auto thaw = [&]() {
+            if (!frozen) return;
+            if (g_primarySwitched) EnsureDisplayOverride();  // in case the HDR switch undid it meanwhile
+            bool ok = SuspendResumeProcess(frozen, false);
+            CloseHandle(frozen);
+            frozen = nullptr;
+            Log("Primary display: %s %s", name, ok ? "thawed" : "could NOT be thawed");
+        };
         {
             GameProfile pp;
             if (FindProfile(path, pp) && (pp.primary || pp.othersOff)) {
@@ -2382,8 +2433,10 @@ static DWORD WINAPI MonitorThread(LPVOID)
                 wantOthersOff = pp.othersOff;
                 primaryHolders.insert(pid);
                 primaryIdleSince = 0;
-                if (cls != 1 && (!g_primarySwitched || (wantOthersOff && !g_othersOff)))
-                    ApplyDisplayOverride(wantOthersOff);
+                if (!g_primarySwitched || (wantOthersOff && !g_othersOff)) {
+                    frozen = FreezeNewProcess(pid, h, name);
+                    if (cls != 1) { ApplyDisplayOverride(wantOthersOff); thaw(); }
+                }
             }
         }
         if (cls == 1) {
@@ -2429,6 +2482,7 @@ static DWORD WINAPI MonitorThread(LPVOID)
             }
             if (wantPrimary && (!g_primarySwitched || (wantOthersOff && !g_othersOff)))
                 ApplyDisplayOverride(wantOthersOff);
+            thaw();
             games[pid] = h;
         } else {
             Log("SDR game detected: %s (PID %lu)", name, pid);
@@ -2440,6 +2494,7 @@ static DWORD WINAPI MonitorThread(LPVOID)
             }
             sdrGames[pid] = h;
         }
+        thaw();  // never leave it frozen
     };
 
     while (WaitForSingleObject(g_stopEvent, 100) == WAIT_TIMEOUT)
@@ -3182,14 +3237,14 @@ static void ShowSharpnessDialog(const char* title, int* value, bool desktop = fa
 // Editable combo for a 0..maxV value that may also be "Don't change" (-1): the list offers
 // "Don't change" and 0, 10 ... maxV, and any other number can be typed in
 static HWND CreateKeepValueCombo(HWND parent, int id, int x, int y, int w, int listH,
-                                 int value, int maxV, HFONT font)
+                                 int value, int maxV, HFONT font, int step = 10)
 {
     HWND h = CreateWindowExA(0, "COMBOBOX", nullptr,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWN | WS_VSCROLL,
         x, y, w, listH, parent, (HMENU)(INT_PTR)id, nullptr, nullptr);
     SendMessageA(h, WM_SETFONT, (WPARAM)font, FALSE);
     SendMessageA(h, CB_ADDSTRING, 0, (LPARAM)L->ktcKeep);
-    for (int v = 0; v <= maxV; v += 10) {
+    for (int v = 0; v <= maxV; v += step) {
         char b[8]; snprintf(b, sizeof(b), "%d", v);
         SendMessageA(h, CB_ADDSTRING, 0, (LPARAM)b);
     }
@@ -3254,7 +3309,8 @@ static int ReadTableCombo(HWND h, int keep)
 #define IDC_NUM_CANCEL 433
 
 // allowKeep: the value may also be "Don't change" (-1); an editable combo replaces the spin box
-struct NumDlgData { int* value; int minV; int maxV; bool desktop; bool allowKeep; HFONT hFont; };
+// step: distance between the values listed in that combo
+struct NumDlgData { int* value; int minV; int maxV; bool desktop; bool allowKeep; HFONT hFont; int step; };
 
 static LRESULT CALLBACK NumDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
@@ -3283,7 +3339,7 @@ static LRESULT CALLBACK NumDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         if (d->allowKeep) {
             CreateKeepValueCombo(hwnd, IDC_NUM_EDIT, gap + lw + gap, gap, S(110), S(220),
-                                 *d->value, d->maxV, d->hFont);
+                                 *d->value, d->maxV, d->hFont, d->step);
         } else {
             HWND hEdit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", nullptr,
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER,
@@ -3353,9 +3409,9 @@ static LRESULT CALLBACK NumDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 }
 
 static void ShowNumDialog(const char* title, int* value, int minV, int maxV, bool desktop = false,
-                          bool allowKeep = false)
+                          bool allowKeep = false, int step = 10)
 {
-    NumDlgData* data = new NumDlgData{value, minV, maxV, desktop, allowKeep, nullptr};
+    NumDlgData* data = new NumDlgData{value, minV, maxV, desktop, allowKeep, nullptr, step};
     HINSTANCE hInst = (HINSTANCE)GetModuleHandleA(nullptr);
 
     typedef UINT(WINAPI* PFN_GetDpiForSystem)();
@@ -3572,7 +3628,7 @@ static LRESULT CALLBACK ProfEditDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             y += S(36);
             snprintf(lbl, sizeof(lbl), "%s (0-100):", L->menuSaturation);
             label(lbl, IDC_PROF_SAT_LABEL);
-            CreateKeepValueCombo(hwnd, IDC_PROF_SAT_COMBO, cx, y, cw, S(220), d->p.saturation, 100, d->hFont);
+            CreateKeepValueCombo(hwnd, IDC_PROF_SAT_COMBO, cx, y, cw, S(220), d->p.saturation, 100, d->hFont, 5);
             y += S(36);
             snprintf(lbl, sizeof(lbl), "%s:", L->menuGamma);
             label(lbl, IDC_PROF_GAM_LABEL);
@@ -4236,7 +4292,7 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case ID_DESK_SAT: {
             char title[96];
             snprintf(title, sizeof(title), "%s - %s", L->menuSaturation, L->menuDesktop);
-            ShowNumDialog(title, &g_cfg.saturationDesktop, 0, 100, true, true);
+            ShowNumDialog(title, &g_cfg.saturationDesktop, 0, 100, true, true, 5);
             break;
         }
         case ID_VIDEO_SHARP: {
